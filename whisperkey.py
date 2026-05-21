@@ -36,6 +36,7 @@ recording_data = []
 model          = None
 processing     = False
 last_text_context = ""  # Буфер для хранения контекста предыдущей фразы
+last_inserted_text = "" # Буфер для повторной вставки по горячей клавише
 
 # ─── Утилиты ──────────────────────────────────────────────────────────────────
 
@@ -177,7 +178,10 @@ def process_audio(audio_snapshot: list):
             # Сохраняем контекст для следующей фразы (последние 100 символов)
             last_text_context = text[-100:]
             
-            direct_insert(text + " ")
+            # Сохраняем полный текст для повторной вставки
+            last_inserted_text = text + " "
+            
+            direct_insert(last_inserted_text)
             notify("WhisperKey ✓", "Текст вставлен")
         else:
             print("[skip] Пустой результат")
@@ -190,6 +194,9 @@ def process_audio(audio_snapshot: list):
 
 # ─── Обработка клавиш ─────────────────────────────────────────────────────────
 
+# Множество для отслеживания нажатых клавиш (нужно для комбинаций)
+current_keys = set()
+
 def is_trigger(key):
     if key == TRIGGER_KEY:
         return True
@@ -201,7 +208,30 @@ def is_trigger(key):
     return False
 
 def on_press(key):
-    global is_recording, recording_data, processing
+    global is_recording, recording_data, processing, current_keys
+    
+    # Добавляем клавишу в текущий набор
+    current_keys.add(key)
+    
+    # ПРОВЕРКА КОМБИНАЦИИ: Правый Option (alt_r) + Правый Command (cmd_r)
+    # Используем vk коды для надежности на Mac: 61 (Alt_R), 54 (Cmd_R)
+    is_alt_r = (key == keyboard.Key.alt_r) or (hasattr(key, 'vk') and key.vk == 61)
+    is_cmd_r = (key == keyboard.Key.cmd_r) or (hasattr(key, 'vk') and key.vk == 54)
+    
+    # Если нажаты обе клавиши одновременно
+    has_alt = any((k == keyboard.Key.alt_r or (hasattr(k, 'vk') and k.vk == 61)) for k in current_keys)
+    has_cmd = any((k == keyboard.Key.cmd_r or (hasattr(k, 'vk') and k.vk == 54)) for k in current_keys)
+    
+    if has_alt and has_cmd:
+        if last_inserted_text:
+            print(f"[repeat] Re-inserting: {last_inserted_text[:20]}...")
+            direct_insert(last_inserted_text)
+            notify("WhisperKey", "Повторная вставка")
+            # Очищаем набор, чтобы не срабатывало повторно слишком быстро
+            current_keys.clear()
+            return
+
+    # ОБЫЧНАЯ ЗАПИСЬ
     if is_trigger(key) and not is_recording and not processing:
         is_recording = True
         recording_data = []
@@ -209,7 +239,12 @@ def on_press(key):
         print("[rec] Начата")
 
 def on_release(key):
-    global is_recording, processing
+    global is_recording, processing, current_keys
+    
+    # Удаляем клавишу из набора
+    if key in current_keys:
+        current_keys.remove(key)
+        
     if is_trigger(key) and is_recording:
         audio_snapshot = list(recording_data)
         is_recording = False
@@ -237,7 +272,7 @@ def main():
     except Exception:
         pass
 
-    print(f"WhisperKey v10.8 CEO Architect Edition | High-Performance...")
+    print(f"WhisperKey v11.1 CEO Architect Edition | High-Performance...")
     try:
         model = WhisperModel(
             MODEL_PATH, 
