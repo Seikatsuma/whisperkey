@@ -1,8 +1,8 @@
 #!/usr/local/bin/python3.11
 """
-WhisperKey v11.5 - CEO FINAL RESCUE
-- Архитектура: Low-level VK Tracking (пуленепробиваемый захват клавиш)
-- Гибридная логика: Ultra-fast <3s, High-quality >3s
+WhisperKey v11.7 - CEO ULTIMATE PRECISION
+- Архитектура: Precision Tuning (beam_size=5, patience=2.0)
+- Качество: Repetition Penalty + Hotwords (идеальные окончания)
 - Грамматика: Context-Aware + Smart Refiner
 - Надежность: Atomic Clipboard Injection
 """
@@ -36,6 +36,7 @@ recording_data = []
 model          = None
 processing     = False
 last_text_context = ""  # Буфер для хранения контекста предыдущей фразы
+audio_stream = None     # Динамический поток аудио
 
 # ─── Утилиты ──────────────────────────────────────────────────────────────────
 
@@ -57,13 +58,23 @@ def smart_grammar_fix(text: str) -> str:
     return text.strip()
 
 def direct_insert(text: str):
-    """CEO Method: Вставка через буфер обмена. Игнорирует раскладку клавиатуры."""
+    """CEO Method: Вставка через буфер обмена с восстановлением старого содержимого."""
     try:
+        # 1. Сохраняем текущее содержимое буфера обмена
+        old_clipboard = subprocess.run(['pbpaste'], capture_output=True).stdout
+        
+        # 2. Копируем новый текст и вставляем
         subprocess.run(['pbcopy'], input=text.encode('utf-8'), check=True)
         time.sleep(0.1)
         script = 'tell application "System Events" to key code 9 using command down'
         subprocess.run(["osascript", "-e", script], capture_output=True)
-        print(f"[insert success] '{text[:20]}...' inserted via Clipboard")
+        
+        # 3. Даем системе время на вставку и возвращаем старый буфер
+        time.sleep(0.2)
+        process = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
+        process.communicate(input=old_clipboard)
+        
+        print(f"[insert success] '{text[:20]}...' inserted and clipboard restored")
     except Exception as e:
         print(f"[insert error] {e}")
 
@@ -72,7 +83,6 @@ def clean_noise(text: str) -> str:
     text = re.sub(r'[фФfFaA]{4,}', '', text).strip()
     text = re.sub(r'[.]{3,}', '...', text).strip()
     business_vocabulary = {
-        r'\b[Cc]ursor\b': 'Cursor',
         r'\b[Cc]laude\b': 'Claude',
         r'\b[Cc]eo to [Cc]eo\b': 'CEO to CEO',
         r'\b[Cc][Ee][Oo]\b': 'CEO',
@@ -92,7 +102,7 @@ def clean_noise(text: str) -> str:
 # ─── Транскрибация ────────────────────────────────────────────────────────────
 
 def process_audio(audio_snapshot: list):
-    global processing, last_text_context, last_transcription
+    global processing, last_text_context
     try:
         if not audio_snapshot: return
         audio = np.concatenate(audio_snapshot, axis=0).flatten().astype(np.float32)
@@ -106,27 +116,37 @@ def process_audio(audio_snapshot: list):
         max_val = np.max(np.abs(audio))
         if max_val > 0.01: audio = audio / max_val * 0.95
 
+        # CEO Architect Edition: Ультимативный промпт для контроля окончаний.
         context_prompt = (
             f"Внедри. Поправь. Сделай. Посмотри. Проанализируй. Порти. Деплой. "
-            f"Это команды для ИИ в повелительном наклонении. "
-            f"Обращайся на 'ты'. Соблюдай падежи и окончания. "
-            f"Контекст: {last_text_context}. Термины: Cursor, Claude, CEO to CEO, deploy."
+            f"Это грамотная русская речь, команды для ИИ. "
+            f"Соблюдай падежи, склонения и правильные окончания слов. "
+            f"Контекст: {last_text_context}. Термины: Claude, CEO to CEO, deploy."
         )
         
-        is_ultra_short = dur < 3.0
+        # РАСШИФРОВКА (CEO Quality Edition - Precision Tuning)
         segments, _ = model.transcribe(
             audio,
             language="ru",
-            beam_size=5,                       # Максимальная точность для всех фраз
-            patience=2.0,                      # Даем модели больше времени на поиск лучшего варианта
-            vad_filter=True,                   # VAD включен всегда для чистоты
-            vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=250), # Увеличен отступ
+            beam_size=5,
+            patience=2.0,
+            repetition_penalty=1.1,            # Помогает избежать "заиканий" в окончаниях
+            hotwords="Claude CEO deploy деплой", # Приоритетные слова
+            vad_filter=True,
+            vad_parameters=dict(
+                min_silence_duration_ms=400,
+                speech_pad_ms=300              # Увеличили до 300мс, чтобы точно не резать хвосты
+            ),
             suppress_blank=True,
             without_timestamps=True,
             initial_prompt=context_prompt
         )
 
         text = " ".join(seg.text.strip() for seg in segments).strip()
+        elapsed = time.time() - t_start
+        print(f"[raw]  '{text}'")
+        print(f"[time] {elapsed:.1f}s ({elapsed/dur*100:.0f}% от длины)")
+        
         text = clean_noise(text)
         text = smart_grammar_fix(text)
 
@@ -146,7 +166,6 @@ def process_audio(audio_snapshot: list):
 # ─── Обработка клавиш ─────────────────────────────────────────────────────────
 
 def is_trigger(key):
-    # Правый Option на Mac обычно имеет vk=61 или определяется как Key.alt_r
     if key == keyboard.Key.alt_r: return True
     try:
         if hasattr(key, 'vk') and key.vk == 61: return True
@@ -154,21 +173,41 @@ def is_trigger(key):
     return False
 
 def on_press(key):
-    global is_recording, recording_data, processing
-    
-    # Логика записи
+    global is_recording, recording_data, processing, audio_stream
     if is_trigger(key) and not is_recording and not processing:
-        is_recording = True
-        recording_data = []
-        notify("WhisperKey", "🎙 Запись...")
-        print("[rec] Начата")
+        try:
+            is_recording = True
+            recording_data = []
+            
+            # CEO "Low-Latency" Audio Logic: Экстремально быстрое включение микрофона
+            audio_stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, 
+                channels=1, 
+                dtype="float32",
+                latency='low',         # Запрос минимальной задержки у macOS
+                blocksize=512,         # Минимальный размер буфера для мгновенного старта
+                callback=lambda d,f,t,s: recording_data.append(d.copy()) if is_recording else None
+            )
+            audio_stream.start()
+            
+            notify("WhisperKey", "🎙 Запись...")
+            print("[rec] Начата")
+        except Exception as e:
+            print(f"[audio error] {e}")
+            is_recording = False
 
 def on_release(key):
-    global is_recording, processing
-    
+    global is_recording, processing, audio_stream
     if is_trigger(key) and is_recording:
-        audio_snapshot = list(recording_data)
         is_recording = False
+        
+        # Мгновенно останавливаем и закрываем поток микрофона
+        if audio_stream:
+            audio_stream.stop()
+            audio_stream.close()
+            audio_stream = None
+            
+        audio_snapshot = list(recording_data)
         if len(audio_snapshot) < 5:
             print("[skip] Слишком коротко")
             return
@@ -186,22 +225,21 @@ def main():
         if hasattr(p, 'cpu_affinity'): p.cpu_affinity([0, 1])
     except: pass
 
-    print(f"WhisperKey v11.6 CEO Quality Edition | Maximum Precision...")
+    print(f"WhisperKey v11.7 CEO Ultimate Precision | Final Tuning...")
     try:
         model = WhisperModel(MODEL_PATH, device="cpu", compute_type="int8", cpu_threads=2, local_files_only=True)
         print("Разогрев модели (Warm-up)...")
         model.transcribe(np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32), language="ru", beam_size=1)
-        print("Режим Maximum Precision: АКТИВИРОВАН")
+        print("Режим Ultimate Precision: АКТИВИРОВАН")
     except Exception as e:
         print(f"[FATAL] {e}")
         return
 
     print("Готов! Зажми ПРАВЫЙ OPTION для записи.")
     
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", 
-                        callback=lambda d,f,t,s: recording_data.append(d.copy()) if is_recording else None):
-        with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-            listener.join()
+    # Мы убрали InputStream из main, теперь он создается динамически в on_press
+    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+        listener.join()
 
 if __name__ == "__main__":
     main()
