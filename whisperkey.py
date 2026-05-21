@@ -36,6 +36,7 @@ recording_data = []
 model          = None
 processing     = False
 last_text_context = ""  # Буфер для хранения контекста предыдущей фразы
+last_transcription = "" # Хранилище последнего результата для повторной вставки
 
 # ─── Утилиты ──────────────────────────────────────────────────────────────────
 
@@ -178,8 +179,10 @@ def process_audio(audio_snapshot: list):
             
             # Сохраняем контекст для следующей фразы (последние 100 символов)
             last_text_context = text[-100:]
+            # CEO Feature: Сохраняем полную транскрипцию для повторной вставки
+            last_transcription = text + " "
             
-            direct_insert(text + " ")
+            direct_insert(last_transcription)
             notify("WhisperKey ✓", "Текст вставлен")
         else:
             print("[skip] Пустой результат")
@@ -192,6 +195,9 @@ def process_audio(audio_snapshot: list):
 
 # ─── Обработка клавиш ─────────────────────────────────────────────────────────
 
+# Состояние для отслеживания комбинации FN + Alt_L
+current_keys = set()
+
 def is_trigger(key):
     if key == TRIGGER_KEY:
         return True
@@ -203,7 +209,24 @@ def is_trigger(key):
     return False
 
 def on_press(key):
-    global is_recording, recording_data, processing
+    global is_recording, recording_data, processing, current_keys
+    
+    # Отслеживание зажатых клавиш для комбинации FN + Alt_L
+    if key == keyboard.Key.alt_l:
+        current_keys.add('alt_l')
+    try:
+        if hasattr(key, 'vk') and key.vk == 63: # VK код для клавиши FN на Mac
+            current_keys.add('fn')
+    except: pass
+
+    # Проверка комбинации FN + Alt_L для повторной вставки
+    if 'fn' in current_keys and 'alt_l' in current_keys:
+        if last_transcription:
+            print("[re-insert] Повторная вставка последнего текста")
+            threading.Thread(target=direct_insert, args=(last_transcription,), daemon=True).start()
+            # Очищаем, чтобы не срабатывало повторно при удержании
+            current_keys.remove('alt_l') 
+
     if is_trigger(key) and not is_recording and not processing:
         is_recording = True
         recording_data = []
@@ -211,7 +234,15 @@ def on_press(key):
         print("[rec] Начата")
 
 def on_release(key):
-    global is_recording, processing
+    global is_recording, processing, current_keys
+    
+    if key == keyboard.Key.alt_l:
+        current_keys.discard('alt_l')
+    try:
+        if hasattr(key, 'vk') and key.vk == 63:
+            current_keys.discard('fn')
+    except: pass
+
     if is_trigger(key) and is_recording:
         audio_snapshot = list(recording_data)
         is_recording = False
@@ -261,6 +292,7 @@ def main():
         return
 
     print("Готов! Зажми ПРАВЫЙ OPTION для записи.")
+    print("Повторная вставка: FN + ЛЕВЫЙ ALT.")
     notify("WhisperKey", "Готов к работе!")
 
     with sd.InputStream(
