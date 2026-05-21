@@ -213,17 +213,18 @@ def on_press(key):
     # Добавляем клавишу в текущий набор
     current_keys.add(key)
     
-    # ПРОВЕРКА КОМБИНАЦИИ: Правый Command (cmd_r) + Стрелка влево (left)
+    # ПРОВЕРКА КОМБИНАЦИИ: Правый Command (cmd_r) + Клавиша '[' (русская 'х')
+    # Используем vk коды для независимости от раскладки: 54 (Cmd_R), 33 ('[' / 'х')
     is_cmd_r = (key == keyboard.Key.cmd_r) or (hasattr(key, 'vk') and key.vk == 54)
-    is_left = (key == keyboard.Key.left) or (hasattr(key, 'vk') and key.vk == 123)
+    is_bracket = (hasattr(key, 'char') and key.char in ['[', '{', 'х', 'Х']) or (hasattr(key, 'vk') and key.vk == 33)
     
     # Если нажаты обе клавиши одновременно
     has_cmd = any((k == keyboard.Key.cmd_r or (hasattr(k, 'vk') and k.vk == 54)) for k in current_keys)
-    has_left = any((k == keyboard.Key.left or (hasattr(k, 'vk') and k.vk == 123)) for k in current_keys)
+    has_bracket = any(((hasattr(k, 'char') and k.char in ['[', '{', 'х', 'Х']) or (hasattr(k, 'vk') and k.vk == 33)) for k in current_keys)
     
-    if has_cmd and has_left:
+    if has_cmd and has_bracket:
         if last_inserted_text:
-            print(f"[repeat] Re-inserting: {last_inserted_text[:20]}...")
+            print(f"[repeat] Re-inserting from internal buffer: {last_inserted_text[:20]}...")
             direct_insert(last_inserted_text)
             notify("WhisperKey", "Повторная вставка")
             # Очищаем набор, чтобы не срабатывало повторно слишком быстро
