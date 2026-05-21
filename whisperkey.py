@@ -213,16 +213,15 @@ def on_press(key):
     # Добавляем клавишу в текущий набор
     current_keys.add(key)
     
-    # ПРОВЕРКА КОМБИНАЦИИ: Правый Option (alt_r) + Правый Command (cmd_r)
-    # Используем vk коды для надежности на Mac: 61 (Alt_R), 54 (Cmd_R)
-    is_alt_r = (key == keyboard.Key.alt_r) or (hasattr(key, 'vk') and key.vk == 61)
+    # ПРОВЕРКА КОМБИНАЦИИ: Правый Command (cmd_r) + Стрелка влево (left)
     is_cmd_r = (key == keyboard.Key.cmd_r) or (hasattr(key, 'vk') and key.vk == 54)
+    is_left = (key == keyboard.Key.left) or (hasattr(key, 'vk') and key.vk == 123)
     
     # Если нажаты обе клавиши одновременно
-    has_alt = any((k == keyboard.Key.alt_r or (hasattr(k, 'vk') and k.vk == 61)) for k in current_keys)
     has_cmd = any((k == keyboard.Key.cmd_r or (hasattr(k, 'vk') and k.vk == 54)) for k in current_keys)
+    has_left = any((k == keyboard.Key.left or (hasattr(k, 'vk') and k.vk == 123)) for k in current_keys)
     
-    if has_alt and has_cmd:
+    if has_cmd and has_left:
         if last_inserted_text:
             print(f"[repeat] Re-inserting: {last_inserted_text[:20]}...")
             direct_insert(last_inserted_text)
