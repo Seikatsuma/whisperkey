@@ -1,9 +1,9 @@
 #!/usr/local/bin/python3.11
 """
-WhisperKey v10.3 - CEO ARCHITECT EDITION
-- Архитектура: Context-Aware Buffer (улучшает грамматику и связность)
-- Оптимизация: Thread Affinity (минимизация context switching)
-- Качество: Smart Grammar Refiner (пост-процессинг текста)
+WhisperKey v11.1 - CEO HYBRID EDITION
+- Архитектура: Hybrid Logic (Ultra-fast <3s, High-quality >3s)
+- Скорость: Обработка коротких фраз быстрее их длины
+- Качество: Context-Aware Buffer + Smart Grammar Refiner
 - Надежность: Atomic Clipboard Injection
 """
 
@@ -36,7 +36,6 @@ recording_data = []
 model          = None
 processing     = False
 last_text_context = ""  # Буфер для хранения контекста предыдущей фразы
-last_inserted_text = "" # Буфер для повторной вставки по горячей клавише
 
 # ─── Утилиты ──────────────────────────────────────────────────────────────────
 
@@ -142,19 +141,21 @@ def process_audio(audio_snapshot: list):
             f"Контекст: {last_text_context}. Термины: Cursor, Claude, CEO to CEO, deploy."
         )
         
-        # 3. РАСШИФРОВКА (CEO Architect Edition - Unified Logic)
-        # Мы унифицировали логику для всех фраз, так как качество важнее микро-ускорения.
-        # Использование beam_size=2 для всех фраз значительно улучшает окончания.
+        # 3. РАСШИФРОВКА (CEO Architect Edition - Hybrid Logic)
+        # Для аудио < 3 секунд мы используем "Fast Track" (beam_size=1, без VAD),
+        # чтобы скорость была выше длины самого аудио.
+        # Для аудио >= 3 секунд сохраняем максимальное качество (beam_size=2, VAD).
+        is_ultra_short = dur < 3.0
         
         segments, _ = model.transcribe(
             audio,
             language="ru",
-            beam_size=2,                       # Повышенная точность окончаний для всех фраз
-            vad_filter=True,                   # VAD включен всегда для чистоты результата
+            beam_size=1 if is_ultra_short else 2,
+            vad_filter=not is_ultra_short,     # Отключаем VAD для ультра-коротких фраз
             vad_parameters=dict(
                 min_silence_duration_ms=400,
                 speech_pad_ms=200
-            ),
+            ) if not is_ultra_short else None,
             suppress_blank=True,
             without_timestamps=True,
             initial_prompt=context_prompt
@@ -178,10 +179,7 @@ def process_audio(audio_snapshot: list):
             # Сохраняем контекст для следующей фразы (последние 100 символов)
             last_text_context = text[-100:]
             
-            # Сохраняем полный текст для повторной вставки
-            last_inserted_text = text + " "
-            
-            direct_insert(last_inserted_text)
+            direct_insert(text + " ")
             notify("WhisperKey ✓", "Текст вставлен")
         else:
             print("[skip] Пустой результат")
@@ -194,9 +192,6 @@ def process_audio(audio_snapshot: list):
 
 # ─── Обработка клавиш ─────────────────────────────────────────────────────────
 
-# Множество для отслеживания нажатых клавиш (нужно для комбинаций)
-current_keys = set()
-
 def is_trigger(key):
     if key == TRIGGER_KEY:
         return True
@@ -208,30 +203,7 @@ def is_trigger(key):
     return False
 
 def on_press(key):
-    global is_recording, recording_data, processing, current_keys
-    
-    # Добавляем клавишу в текущий набор
-    current_keys.add(key)
-    
-    # ПРОВЕРКА КОМБИНАЦИИ: Правый Command (cmd_r) + Русская 'Б' / Запятая (vk: 43)
-    # На Mac клавиша с русской 'Б' / английской ',' / скобкой '<' имеет vk код 43.
-    is_cmd_r = (key == keyboard.Key.cmd_r) or (hasattr(key, 'vk') and key.vk == 54)
-    is_comma_key = (hasattr(key, 'vk') and key.vk == 43)
-    
-    # Если нажаты обе клавиши одновременно
-    has_cmd = any((k == keyboard.Key.cmd_r or (hasattr(k, 'vk') and k.vk == 54)) for k in current_keys)
-    has_comma = any((hasattr(k, 'vk') and k.vk == 43) for k in current_keys)
-    
-    if has_cmd and has_comma:
-        if last_inserted_text:
-            print(f"[repeat] Re-inserting from internal buffer: {last_inserted_text[:20]}...")
-            direct_insert(last_inserted_text)
-            notify("WhisperKey", "Повторная вставка (из памяти)")
-            # Очищаем набор, чтобы не срабатывало повторно слишком быстро
-            current_keys.clear()
-            return
-
-    # ОБЫЧНАЯ ЗАПИСЬ
+    global is_recording, recording_data, processing
     if is_trigger(key) and not is_recording and not processing:
         is_recording = True
         recording_data = []
@@ -239,12 +211,7 @@ def on_press(key):
         print("[rec] Начата")
 
 def on_release(key):
-    global is_recording, processing, current_keys
-    
-    # Удаляем клавишу из набора
-    if key in current_keys:
-        current_keys.remove(key)
-        
+    global is_recording, processing
     if is_trigger(key) and is_recording:
         audio_snapshot = list(recording_data)
         is_recording = False
@@ -272,7 +239,7 @@ def main():
     except Exception:
         pass
 
-    print(f"WhisperKey v11.1 CEO Architect Edition | High-Performance...")
+    print(f"WhisperKey v11.1 CEO Architect Edition | Hybrid-Performance...")
     try:
         model = WhisperModel(
             MODEL_PATH, 
@@ -287,7 +254,7 @@ def main():
         dummy_audio = np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32)
         model.transcribe(dummy_audio, language="ru", beam_size=1)
         
-        print("Режим Ultra-Performance: АКТИВИРОВАН")
+        print("Режим Hybrid Ultra-Performance: АКТИВИРОВАН")
     except Exception as e:
         print(f"[FATAL] {e}")
         notify("WhisperKey", f"Ошибка: {e}")
