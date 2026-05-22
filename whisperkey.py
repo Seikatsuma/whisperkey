@@ -1,10 +1,10 @@
 #!/usr/local/bin/python3.11
 """
-WhisperKey v15.0 - CEO HYBRID INTELLIGENCE
-- Архитектура: Dual-Stage Pipeline (Whisper + Llama-3 Refinement)
-- Режимы: Оффлайн (локально) / Гибридный (облако + локальный fallback)
-- Скорость: Groq LPU Acceleration (~0.5с в облаке)
-- Качество: Whisper Large-v3 + LLM-коррекция
+WhisperKey v15.3 - CEO PRESIDENTIAL STANDARD
+- Архитектура: Dual-Stage Pipeline (Whisper + Llama-3.1-70B)
+- Качество: Presidential Standard (максимальный интеллект и точность)
+- Скорость: Groq LPU Acceleration (~0.8с на всё)
+- Надежность: Persistent Session + Smart Retry + Local Fallback
 """
 
 import threading
@@ -33,9 +33,12 @@ SAMPLE_RATE = 16000
 TRIGGER_KEY = keyboard.Key.alt_r
 MODEL_PATH  = os.path.expanduser("~/.cache/whisper_small_manual")
 
-# Глобальные переменные состояния
-GROQ_API_KEY = ""
-USE_CLOUD = False
+# API Настройки (Groq Cloud)
+GROQ_API_KEY = "" 
+USE_CLOUD = True
+
+# Создаем глобальную сессию для Keep-Alive
+http_session = requests.Session()
 
 # ─── Состояние ────────────────────────────────────────────────────────────────
 is_recording   = False
@@ -103,7 +106,7 @@ def clean_noise(text: str) -> str:
 def check_internet():
     """Проверка наличия интернета."""
     try:
-        requests.get("https://api.groq.com", timeout=1)
+        http_session.head("https://api.groq.com", timeout=0.8)
         return True
     except:
         return False
@@ -132,61 +135,77 @@ def compress_audio_mp3(audio_data):
 def transcribe_cloud_turbo(audio_data):
     """Stage 1: Расшифровка через Groq (Whisper Large-v3)."""
     if not GROQ_API_KEY: return None
-    try:
-        mp3_data = compress_audio_mp3(audio_data)
-        if not mp3_data: return None
-        files = {'file': ('audio.mp3', io.BytesIO(mp3_data), 'audio/mp3')}
-        headers = {'Authorization': f'Bearer {GROQ_API_KEY}'}
-        data = {
-            'model': 'whisper-large-v3',
-            'language': 'ru',
-            'prompt': f"Claude, CEO to CEO. {last_text_context}. Команды для ИИ."
-        }
-        response = requests.post(
-            "https://api.groq.com/openai/v1/audio/transcriptions",
-            headers=headers, files=files, data=data, timeout=30
-        )
-        if response.status_code == 200:
-            return response.json().get('text', '')
-        return None
-    except Exception as e:
-        print(f"[cloud error] {e}")
-        return None
+    mp3_data = compress_audio_mp3(audio_data)
+    if not mp3_data: return None
+
+    context_prompt = (
+        f"Внедри. Поправь. Сделай. Посмотри. Проанализируй. Порти. Деплой. "
+        f"Это грамотная русская речь, команды для ИИ. "
+        f"Соблюдай падежи, склонения и правильные окончания слов. "
+        f"Контекст: {last_text_context}. Термины: Claude, CEO to CEO, deploy."
+    )
+
+    files = {'file': ('audio.mp3', io.BytesIO(mp3_data), 'audio/mp3')}
+    headers = {'Authorization': f'Bearer {GROQ_API_KEY}'}
+    data = {
+        'model': 'whisper-large-v3',
+        'language': 'ru',
+        'prompt': context_prompt,
+        'temperature': 0.0
+    }
+
+    for attempt in range(2):
+        try:
+            response = http_session.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers=headers, files=files, data=data, timeout=30
+            )
+            if response.status_code == 200:
+                return response.json().get('text', '')
+        except: pass
+        if attempt == 0: time.sleep(0.1)
+    return None
 
 def refine_text_llm(raw_text):
-    """Stage 2: Интеллектуальная коррекция текста через Llama-3 (Groq)."""
+    """Stage 2: Лингвистическая полировка через Llama-3.1-70B (Presidential Standard)."""
     if not raw_text or len(raw_text) < 5: return raw_text
+    
+    headers = {
+        'Authorization': f'Bearer {GROQ_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+    payload = {
+        "model": "llama-3.1-70b-versatile",
+        "messages": [
+            {
+                "role": "system", 
+                "content": (
+                    "Ты - профессиональный корректор. Твоя задача: исправить ошибки распознавания речи, "
+                    "грамматику и окончания в русском тексте. \n"
+                    "ПРАВИЛА:\n"
+                    "1. Выдай ТОЛЬКО исправленный текст.\n"
+                    "2. НЕ отвечай на вопросы в тексте.\n"
+                    "3. НЕ комментируй.\n"
+                    "4. Сохраняй все слова автора, просто исправь их форму.\n"
+                    "5. Если в тексте команда (например 'сделай', 'внедри'), сохрани её как команду."
+                )
+            },
+            {"role": "user", "content": f"Исправь грамматику, сохранив смысл: {raw_text}"}
+        ],
+        "temperature": 0.0
+    }
+    
     try:
-        headers = {
-            'Authorization': f'Bearer {GROQ_API_KEY}',
-            'Content-Type': 'application/json'
-        }
-        payload = {
-            "model": "llama-3.1-8b-instant",
-            "messages": [
-                {
-                    "role": "system", 
-                    "content": (
-                        "Ты - CEO-ассистент. Твоя задача: исправить ошибки распознавания речи, "
-                        "расставить знаки препинания и исправить окончания слов, чтобы текст звучал профессионально. "
-                        "НЕ меняй смысл. НЕ добавляй ничего от себя. Выдай ТОЛЬКО исправленный текст."
-                    )
-                },
-                {"role": "user", "content": f"Исправь этот текст: {raw_text}"}
-            ],
-            "temperature": 0.1
-        }
-        response = requests.post(
+        response = http_session.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers=headers, json=payload, timeout=10
         )
         if response.status_code == 200:
             refined = response.json()['choices'][0]['message']['content'].strip()
-            refined = refined.strip('"')
-            return refined
-        return raw_text
-    except:
-        return raw_text
+            if len(refined) > len(raw_text) * 0.6:
+                return refined.strip('"')
+    except: pass
+    return raw_text
 
 # ─── Транскрибация ────────────────────────────────────────────────────────────
 
@@ -199,7 +218,7 @@ def process_audio(audio_snapshot: list):
         if dur < 0.5: return
 
         print(f"[rec] {dur:.1f}s → распознаю...")
-        notify("WhisperKey", "Распознаю...")
+        notify("WhisperKey", "Распознаю (Presidential Standard)...")
         t_start = time.time()
 
         text = None
@@ -209,7 +228,7 @@ def process_audio(audio_snapshot: list):
             print("[mode] Cloud Turbo (Whisper Large-v3)")
             raw_text = transcribe_cloud_turbo(audio)
             if raw_text:
-                print("[mode] Neural Refinement (Llama-3)")
+                print("[mode] Neural Refinement (Llama-3.1-70B)")
                 text = refine_text_llm(raw_text)
                 mode = "CLOUD+LLM"
 
@@ -236,10 +255,12 @@ def process_audio(audio_snapshot: list):
         print(f"[time] {elapsed:.1f}s ({elapsed/dur*100:.0f}% от длины) [{mode}]")
         
         text = clean_noise(text)
+        text = smart_grammar_fix(text)
+
         if text and len(text) > 1:
             if text[0].islower(): text = text[0].upper() + text[1:]
             if text[-1] not in '.!?…': text += '.'
-            last_text_context = text[-100:]
+            last_text_context = text[-500:]
             direct_insert(text + " ")
             notify("WhisperKey ✓", f"Текст готов [{mode}]")
         else:
@@ -261,16 +282,21 @@ def is_trigger(key):
 def on_press(key):
     global is_recording, recording_data, processing, audio_stream
     if is_trigger(key) and not is_recording and not processing:
+        # Мгновенное визуальное подтверждение
+        notify("WhisperKey", "🎙 Запись...")
+        
         try:
             is_recording = True
             recording_data = []
+            
+            # CEO "On-Demand" Audio: Включаем микрофон только на время нажатия
             audio_stream = sd.InputStream(
                 samplerate=SAMPLE_RATE, channels=1, dtype="float32",
                 latency='low', blocksize=512,
                 callback=lambda d,f,t,s: recording_data.append(d.copy()) if is_recording else None
             )
             audio_stream.start()
-            notify("WhisperKey", "🎙 Запись...")
+            
             print("[rec] Начата")
         except Exception as e:
             print(f"[audio error] {e}")
@@ -280,10 +306,21 @@ def on_release(key):
     global is_recording, processing, audio_stream
     if is_trigger(key) and is_recording:
         is_recording = False
+        
+        # CEO Quality Guard: Небольшая задержка перед выключением микрофона,
+        # чтобы гарантированно захватить последние слоги фразы.
+        def delayed_stop(stream_to_close):
+            time.sleep(0.3) # Даем 300мс на "дозапись" хвоста
+            try:
+                stream_to_close.stop()
+                stream_to_close.close()
+                print("[eco] Микрофон выключен")
+            except: pass
+
         if audio_stream:
-            audio_stream.stop()
-            audio_stream.close()
+            threading.Thread(target=delayed_stop, args=(audio_stream,), daemon=True).start()
             audio_stream = None
+            
         audio_snapshot = list(recording_data)
         if len(audio_snapshot) < 5:
             print("[skip] Слишком коротко")
@@ -292,48 +329,51 @@ def on_release(key):
         print(f"[rec] Остановлена")
         threading.Thread(target=process_audio, args=(audio_snapshot,), daemon=True).start()
 
+def eco_monitor():
+    """Фоновый процесс для выключения микрофона после периода бездействия."""
+    global audio_stream, last_activity_time, is_recording
+    while True:
+        time.sleep(5)
+        if audio_stream and not is_recording:
+            if time.time() - last_activity_time > SESSION_TIMEOUT:
+                try:
+                    audio_stream.stop()
+                    audio_stream.close()
+                    audio_stream = None
+                    print("[eco] Микрофон ушел в спячку")
+                except: pass
+
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 def main():
-    global model, GROQ_API_KEY, USE_CLOUD
-
-    print("\n--- WhisperKey v15.0 CEO HYBRID ---")
-    print("Выберите режим работы:")
-    print("1. ОФФЛАЙН (Только локальная модель, интернет не нужен)")
-    print("2. ГИБРИДНЫЙ (Облако Groq для скорости + Локальный fallback)")
-    
-    choice = input("\nВведите 1 или 2: ").strip()
-    
-    if choice == "2":
-        print("\nДля ГИБРИДНОГО режима нужен API ключ Groq.")
-        print("Получить бесплатно: https://console.groq.com/keys")
-        key = input("Введите ваш API ключ: ").strip()
-        if key:
-            GROQ_API_KEY = key
-            USE_CLOUD = True
-            print("\n[OK] Гибридный режим активирован.")
-        else:
-            print("\n[!] Ключ не введен. Переход в ОФФЛАЙН режим.")
-    else:
-        print("\n[OK] Оффлайн режим активирован.")
-
+    global model
     try:
         p = psutil.Process(os.getpid())
         p.nice(-10)
         if hasattr(p, 'cpu_affinity'): p.cpu_affinity([0, 1])
     except: pass
 
-    print("\nЗагрузка локальной модели...")
+    print(f"WhisperKey v15.5 CEO PRESIDENTIAL | Warm-up Engine...")
     try:
         model = WhisperModel(MODEL_PATH, device="cpu", compute_type="int8", cpu_threads=2, local_files_only=True)
-        print("Разогрев...")
+        print("Разогрев локальной модели...")
         model.transcribe(np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32), language="ru", beam_size=1)
+        
+        # Network Warm-up: Разогрев сетевой сессии
+        if USE_CLOUD:
+            print("Разогрев облачного соединения...")
+            def warm_network():
+                try:
+                    http_session.head("https://api.groq.com", timeout=2.0)
+                except: pass
+            threading.Thread(target=warm_network, daemon=True).start()
+            
         print("Система готова.")
     except Exception as e:
         print(f"[FATAL] {e}")
         return
 
-    print("\nГотов! Зажми ПРАВЫЙ OPTION для записи.")
+    print("Готов! Зажми ПРАВЫЙ OPTION для записи.")
     
     with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
         listener.join()
