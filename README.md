@@ -1,72 +1,45 @@
-# WhisperKey 🎙️
+# 🎙️ WhisperKey: Presidential Speech-to-Text for Mac/PC
 
-Глобальный голосовой ввод для macOS, Windows и Linux. Зажми **Right Option**, скажи фразу и отпусти — текст вставится сам.
+WhisperKey — это профессиональный инструмент для мгновенной диктовки текста с использованием нейросетей Whisper (локально) и Groq Cloud (облако). Система автоматически переключается между режимами в зависимости от наличия интернета и VPN.
 
-## Особенности
-- **100% Offline**: Работает без интернета.
-- **Turbo Speed**: Оптимизировано для слабых процессоров (Intel i5 и выше).
-- **International**: Идеально понимает русский и английский одновременно.
-- **Direct Insert**: Вставляет текст напрямую, не портит ваш буфер обмена.
+## ✨ Основные возможности
+- **Hybrid Intelligence**: Использует облако Groq (Whisper Large-v3) для максимальной скорости и локальный Faster-Whisper для полной автономности.
+- **Neural Refinement**: Автоматическая коррекция грамматики и пунктуации через Llama-3.1-70B.
+- **Stealth Mode**: Обход блокировок Cloudflare через маскировку под браузер.
+- **Business Dictionary**: Идеальное написание терминов (Claude, CEO, deploy и др.).
+- **Zero Latency**: Мгновенная вставка текста в любое приложение через буфер обмена.
 
----
+## 🚀 Быстрый старт
 
-## Установка (macOS)
+### 1. Подготовка (macOS)
+Убедитесь, что у вас установлены `python 3.10+` и `ffmpeg`:
+```bash
+brew install ffmpeg
+```
 
-1. **Установите зависимости**:
-   ```bash
-   brew install python@3.11 portaudio
-   ```
-2. **Клонируйте и установите пакеты**:
-   ```bash
-   git clone https://github.com/ekaterinabobrovnikova/whisperkey.git
-   cd whisperkey
-   pip install -r requirements.txt
-   ```
-3. **Выдайте права**:
-   Системные настройки → Защита и безопасность → Конфиденциальность:
-   - **Микрофон**: Добавить Terminal
-   - **Универсальный доступ**: Добавить Terminal
+### 2. Установка
+Клонируйте репозиторий и установите зависимости:
+```bash
+git clone https://github.com/KatyaBobr/Whisper-MAC.git
+cd Whisper-MAC
+pip install -r requirements.txt
+```
 
-4. **Запуск**:
-   ```bash
-   python3 whisperkey.py
-   ```
+### 3. Настройка
+Откройте `whisperkey.py` и вставьте ваш API ключ Groq:
+```python
+GROQ_API_KEY = "ваш_ключ_здесь"
+```
 
----
+### 4. Запуск
+```bash
+python whisperkey.py
+```
+**Управление:** Зажмите **ПРАВЫЙ OPTION** (или настроенную клавишу), продиктуйте текст и отпустите. Текст мгновенно появится там, где стоит курсор.
 
-## Установка (Windows)
+## ⚙️ Настройка для других ОС
+- **Windows**: Измените `TRIGGER_KEY` в коде на удобную клавишу (например, `keyboard.Key.alt_l`).
+- **Linux**: Убедитесь, что установлены `xclip` или `xsel` для работы с буфером обмена.
 
-1. Установите [Python 3.11+](https://www.python.org/).
-2. Скачайте [FFmpeg](https://ffmpeg.org/download.html) и добавьте его в PATH.
-3. Установите зависимости:
-   ```cmd
-   pip install -r requirements.txt
-   ```
-4. Запустите:
-   ```cmd
-   python whisperkey.py
-   ```
-
----
-
-## Установка (Linux)
-
-1. Установите системные зависимости:
-   ```bash
-   sudo apt install python3-pip portaudio19-dev ffmpeg
-   ```
-2. Установите пакеты:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Запустите:
-   ```bash
-   python3 whisperkey.py
-   ```
-
----
-
-## Управление
-- **Удерживать Right Option**: Запись.
-- **Отпустить**: Транскрибация и вставка.
-- **Ctrl+C**: Выход.
+## 🛡️ Безопасность
+Ваш API ключ Groq используется только для отправки аудио на транскрибацию. В локальном режиме данные не покидают ваш компьютер.

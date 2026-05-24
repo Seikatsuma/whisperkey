@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+.cache/
+whisper_small_manual/
+*.mp3
+*.wav

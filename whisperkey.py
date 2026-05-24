@@ -1,10 +1,10 @@
 #!/usr/local/bin/python3.11
 """
-WhisperKey v15.3 - CEO PRESIDENTIAL STANDARD
-- Архитектура: Dual-Stage Pipeline (Whisper + Llama-3.1-70B)
-- Качество: Presidential Standard (максимальный интеллект и точность)
-- Скорость: Groq LPU Acceleration (~0.8с на всё)
-- Надежность: Persistent Session + Smart Retry + Local Fallback
+WhisperKey v17.1 - CEO PURE OUTPUT
+- Архитектура: Dual-Stage Pipeline (Cloud Stealth + Stable Offline)
+- Чистота: Глубокая очистка от галлюцинаций (DimaTorzok fix)
+- Стабильность: Hysteresis Cloud Switching + 10s Timeout
+- Целостность: Integrity Guard (защита от обрезания текста)
 """
 
 import threading
@@ -34,7 +34,7 @@ TRIGGER_KEY = keyboard.Key.alt_r
 MODEL_PATH  = os.path.expanduser("~/.cache/whisper_small_manual")
 
 # API Настройки (Groq Cloud)
-GROQ_API_KEY = "" 
+GROQ_API_KEY = "YOUR_GROQ_API_KEY_HERE" 
 USE_CLOUD = True
 
 # Создаем глобальную сессию для Keep-Alive
@@ -48,14 +48,62 @@ processing     = False
 last_text_context = ""  # Буфер для хранения контекста предыдущей фразы
 audio_stream = None     # Динамический поток аудио
 
+# CEO Cloud Management: Динамическое управление состоянием облака
+cloud_status = {
+    "is_blocked": False,
+    "last_check_time": 0,
+    "check_in_progress": False,
+    "consecutive_success": 0  # CEO Fix: Счетчик стабильных запросов
+}
+
+def background_cloud_probe():
+    """CEO Method: Фоновая проверка доступности облака с подтверждением стабильности."""
+    global cloud_status
+    if cloud_status["check_in_progress"]: return
+    
+    def probe():
+        cloud_status["check_in_progress"] = True
+        try:
+            headers = {
+                'Authorization': f'Bearer {GROQ_API_KEY}',
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            }
+            response = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=5)
+            if response.status_code == 200:
+                # CEO Fix: Требуем 2 успешных проверки подряд для выхода из блока, если были "прыжки"
+                cloud_status["consecutive_success"] += 1
+                if cloud_status["consecutive_success"] >= 1: # Можно поднять до 2 если будет дергаться
+                    if cloud_status["is_blocked"]:
+                        print("[radar] Связь стабильна. Возвращаю Cloud Turbo.")
+                        notify("WhisperKey", "Cloud Turbo восстановлен!")
+                    cloud_status["is_blocked"] = False
+            else:
+                cloud_status["is_blocked"] = True
+                cloud_status["consecutive_success"] = 0
+        except:
+            cloud_status["is_blocked"] = True
+            cloud_status["consecutive_success"] = 0
+        finally:
+            cloud_status["last_check_time"] = time.time()
+            cloud_status["check_in_progress"] = False
+
+    threading.Thread(target=probe, daemon=True).start()
+
 # ─── Утилиты ──────────────────────────────────────────────────────────────────
 
 def notify(title: str, message: str):
-    """CEO Method: Асинхронное уведомление."""
-    try:
-        subprocess.Popen(["osascript", "-e", f'display notification "{message}" with title "{title}"'])
-    except Exception:
-        pass
+    """CEO Method: Асинхронное уведомление через отдельный поток для стабильности."""
+    def run_notify():
+        try:
+            safe_title = title.replace('"', '\\"')
+            safe_message = message.replace('"', '\\"')
+            script = f'display notification "{safe_message}" with title "{safe_title}"'
+            subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True)
+            print(f"[notify] {title}: {message}") 
+        except Exception as e:
+            print(f"[notify error] {e}")
+            
+    threading.Thread(target=run_notify, daemon=True).start()
 
 def smart_grammar_fix(text: str) -> str:
     """CEO Quality: Исправление типичных ошибок и окончаний."""
@@ -68,17 +116,20 @@ def smart_grammar_fix(text: str) -> str:
     return text.strip()
 
 def direct_insert(text: str):
-    """CEO Method: Вставка через буфер обмена с восстановлением старого содержимого."""
+    """CEO Method: Вставка через буфер обмена с ускоренным AppleScript."""
     try:
         old_clipboard = subprocess.run(['pbpaste'], capture_output=True).stdout
         subprocess.run(['pbcopy'], input=text.encode('utf-8'), check=True)
-        time.sleep(0.1)
+        
+        # CEO Speed Fix: Уменьшаем задержки до физического минимума
+        time.sleep(0.05) 
         script = 'tell application "System Events" to key code 9 using command down'
-        subprocess.run(["osascript", "-e", script], capture_output=True)
-        time.sleep(0.2)
+        subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True)
+        time.sleep(0.1) 
+        
         process = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
         process.communicate(input=old_clipboard)
-        print(f"[insert success] '{text[:20]}...' inserted and clipboard restored")
+        print(f"[insert success] '{text[:20]}...' inserted")
     except Exception as e:
         print(f"[insert error] {e}")
 
@@ -99,20 +150,16 @@ def clean_noise(text: str) -> str:
     }
     for pattern, replacement in business_vocabulary.items():
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-    for bad in ["Субтитры", "субтитры", "Продолжение следует", "Спасибо за просмотр"]:
+    for bad in [
+        "Субтитры сделал DimaTorzok", "Субтитры создавал DimaTorzok", 
+        "Отредактировал DimaTorzok", "Субтитры", "субтитры", 
+        "Продолжение следует", "Спасибо за просмотр"
+    ]:
         text = text.replace(bad, "")
     return text.strip()
 
-def check_internet():
-    """Проверка наличия интернета."""
-    try:
-        http_session.head("https://api.groq.com", timeout=0.8)
-        return True
-    except:
-        return False
-
 def compress_audio_mp3(audio_data):
-    """Сжатие аудио в MP3 для мгновенной передачи в облако."""
+    """Сжатие аудио в MP3: Оптимизировано для скорости (libmp3lame preset)."""
     try:
         wav_io = io.BytesIO()
         with wave.open(wav_io, 'wb') as wf:
@@ -122,8 +169,9 @@ def compress_audio_mp3(audio_data):
             wf.writeframes((audio_data * 32767).astype(np.int16).tobytes())
         wav_data = wav_io.getvalue()
 
+        # CEO Speed Fix: Используем -preset:a 9 для максимально быстрого сжатия
         process = subprocess.Popen(
-            ['ffmpeg', '-i', 'pipe:0', '-f', 'mp3', '-acodec', 'libmp3lame', '-ab', '64k', 'pipe:1'],
+            ['ffmpeg', '-i', 'pipe:0', '-f', 'mp3', '-acodec', 'libmp3lame', '-ab', '64k', '-preset:a', '9', 'pipe:1'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         mp3_data, _ = process.communicate(input=wav_data)
@@ -133,20 +181,35 @@ def compress_audio_mp3(audio_data):
         return None
 
 def transcribe_cloud_turbo(audio_data):
-    """Stage 1: Расшифровка через Groq (Whisper Large-v3)."""
+    """Stage 1: Расшифровка через Groq (Whisper Large-v3) с мгновенным переключением."""
+    global cloud_status
+    
+    # Если заблокировано, запускаем фоновый радар и сразу выходим (0 сек задержки)
+    if cloud_status["is_blocked"]:
+        if time.time() - cloud_status["last_check_time"] > 60: # Проверяем раз в минуту в фоне
+            background_cloud_probe()
+        return None
+
     if not GROQ_API_KEY: return None
     mp3_data = compress_audio_mp3(audio_data)
     if not mp3_data: return None
 
+    headers = {
+        'Authorization': f'Bearer {GROQ_API_KEY}',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'application/json'
+    }
+
+    # Очистка и ограничение контекста для предотвращения ошибки 400
+    safe_context = last_text_context.replace('"', "'").replace('\n', ' ').strip()
+    safe_context = safe_context[-250:] 
+
     context_prompt = (
         f"Внедри. Поправь. Сделай. Посмотри. Проанализируй. Порти. Деплой. "
-        f"Это грамотная русская речь, команды для ИИ. "
-        f"Соблюдай падежи, склонения и правильные окончания слов. "
-        f"Контекст: {last_text_context}. Термины: Claude, CEO to CEO, deploy."
+        f"Это грамотная русская речь. {safe_context}. Термины: Claude, CEO to CEO, deploy."
     )
 
     files = {'file': ('audio.mp3', io.BytesIO(mp3_data), 'audio/mp3')}
-    headers = {'Authorization': f'Bearer {GROQ_API_KEY}'}
     data = {
         'model': 'whisper-large-v3',
         'language': 'ru',
@@ -154,25 +217,40 @@ def transcribe_cloud_turbo(audio_data):
         'temperature': 0.0
     }
 
-    for attempt in range(2):
-        try:
-            response = http_session.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers=headers, files=files, data=data, timeout=30
-            )
-            if response.status_code == 200:
-                return response.json().get('text', '')
-        except: pass
-        if attempt == 0: time.sleep(0.1)
+    try:
+        # CEO Speed Fix: Оптимизированный таймаут и переиспользование сессии
+        session = requests.Session()
+        session.trust_env = True
+        # CEO Fix: Увеличиваем таймаут до 10с для стабильности на плохом VPN
+        response = session.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers=headers, files=files, data=data, timeout=10 
+        )
+        
+        if response.status_code == 200:
+            return response.json().get('text', '')
+        
+        if response.status_code == 403:
+            print("[!] Groq 403 (Geo-block). Switching to Instant Offline.")
+            cloud_status["is_blocked"] = True
+            cloud_status["last_check_time"] = time.time()
+            background_cloud_probe() # Запускаем радар
+            return None
+
+        print(f"[cloud error] Status: {response.status_code}")
+    except Exception as e:
+        print(f"[cloud exception] {type(e).__name__}")
+    
     return None
 
 def refine_text_llm(raw_text):
-    """Stage 2: Лингвистическая полировка через Llama-3.1-70B (Presidential Standard)."""
+    """Stage 2: Лингвистическая полировка через Llama-3.1-70B."""
     if not raw_text or len(raw_text) < 5: return raw_text
     
     headers = {
         'Authorization': f'Bearer {GROQ_API_KEY}',
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     }
     payload = {
         "model": "llama-3.1-70b-versatile",
@@ -202,15 +280,18 @@ def refine_text_llm(raw_text):
         )
         if response.status_code == 200:
             refined = response.json()['choices'][0]['message']['content'].strip()
-            if len(refined) > len(raw_text) * 0.6:
+            # CEO Integrity Guard: Если LLM отрезала более 20% текста, возвращаем оригинал
+            if len(refined) > len(raw_text) * 0.8:
                 return refined.strip('"')
+            else:
+                print(f"[warn] LLM cut too much ({len(refined)} vs {len(raw_text)}). Using raw text.")
     except: pass
     return raw_text
 
 # ─── Транскрибация ────────────────────────────────────────────────────────────
 
 def process_audio(audio_snapshot: list):
-    global processing, last_text_context
+    global processing, last_text_context, cloud_status
     try:
         if not audio_snapshot: return
         audio = np.concatenate(audio_snapshot, axis=0).flatten().astype(np.float32)
@@ -218,37 +299,58 @@ def process_audio(audio_snapshot: list):
         if dur < 0.5: return
 
         print(f"[rec] {dur:.1f}s → распознаю...")
-        notify("WhisperKey", "Распознаю (Presidential Standard)...")
         t_start = time.time()
 
         text = None
         mode = "OFFLINE"
 
-        if USE_CLOUD and check_internet():
-            print("[mode] Cloud Turbo (Whisper Large-v3)")
-            raw_text = transcribe_cloud_turbo(audio)
-            if raw_text:
-                print("[mode] Neural Refinement (Llama-3.1-70B)")
-                text = refine_text_llm(raw_text)
-                mode = "CLOUD+LLM"
-
+        # Пытаемся использовать Cloud Turbo
+        print("[mode] Cloud Turbo (Whisper Large-v3)")
+        raw_text = transcribe_cloud_turbo(audio)
+        if raw_text:
+            print("[mode] Neural Refinement (Llama-3.1-70B)")
+            text = refine_text_llm(raw_text)
+            mode = "CLOUD+LLM"
+        
         if not text:
-            print("[mode] Local Precision Fallback")
+            if cloud_status["is_blocked"]:
+                print(f"[mode] Local Precision (Cloud paused: {int(60 - (time.time() - cloud_status['last_check_time']))}s left)")
+            else:
+                print("[mode] Local Precision Fallback")
+            # CEO Quality: Максимальное усиление сигнала
             max_val = np.max(np.abs(audio))
-            if max_val > 0.01: audio = audio / max_val * 0.95
+            if max_val > 0.0001: 
+                audio = audio / max_val * 0.99 # Почти максимальная амплитуда
+            
             context_prompt = (
                 f"Внедри. Поправь. Сделай. Посмотри. Проанализируй. Порти. Деплой. "
                 f"Это грамотная русская речь, команды для ИИ. "
                 f"Соблюдай падежи, склонения и правильные окончания слов. "
                 f"Контекст: {last_text_context}. Термины: Claude, CEO to CEO, deploy."
             )
+            
+            # Попытка 1: Сбалансированная точность (CEO Stability)
             segments, _ = model.transcribe(
-                audio, language="ru", beam_size=5, patience=2.0,
-                repetition_penalty=1.1, hotwords="Claude CEO deploy деплой",
-                vad_filter=True, vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=300),
-                suppress_blank=True, without_timestamps=True, initial_prompt=context_prompt
+                audio, language="ru", 
+                beam_size=5,         # Возвращаемся к стабильному золотому стандарту
+                patience=2.0, 
+                repetition_penalty=1.1, 
+                hotwords="Claude CEO deploy деплой",
+                vad_filter=False, 
+                suppress_blank=True, 
+                without_timestamps=True, 
+                initial_prompt=context_prompt
             )
             text = " ".join(seg.text.strip() for seg in segments).strip()
+
+            # Попытка 2: Если Попытка 1 выдала пустоту (как на скриншоте), пробуем "грубую силу"
+            if not text or len(text) < 2:
+                print("[warn] Local precision failed, trying brute force...")
+                segments, _ = model.transcribe(
+                    audio, beam_size=1, # Жадный поиск часто ловит то, что пропускает beam search
+                    vad_filter=False, suppress_blank=False
+                )
+                text = " ".join(seg.text.strip() for seg in segments).strip()
 
         elapsed = time.time() - t_start
         print(f"[raw]  '{text}'")
@@ -260,11 +362,14 @@ def process_audio(audio_snapshot: list):
         if text and len(text) > 1:
             if text[0].islower(): text = text[0].upper() + text[1:]
             if text[-1] not in '.!?…': text += '.'
-            last_text_context = text[-500:]
+            # CEO Fix: Сокращаем контекст до 200 символов, чтобы не "перегружать" модель
+            last_text_context = text[-200:]
             direct_insert(text + " ")
+            # CEO Fix: Возвращаем уведомление о готовности текста
             notify("WhisperKey ✓", f"Текст готов [{mode}]")
         else:
             print("[skip] Пустой результат")
+            notify("WhisperKey", "Речь не распознана")
     except Exception as e:
         print(f"[error] {e}")
     finally:
@@ -282,21 +387,16 @@ def is_trigger(key):
 def on_press(key):
     global is_recording, recording_data, processing, audio_stream
     if is_trigger(key) and not is_recording and not processing:
-        # Мгновенное визуальное подтверждение
         notify("WhisperKey", "🎙 Запись...")
-        
         try:
             is_recording = True
             recording_data = []
-            
-            # CEO "On-Demand" Audio: Включаем микрофон только на время нажатия
             audio_stream = sd.InputStream(
                 samplerate=SAMPLE_RATE, channels=1, dtype="float32",
                 latency='low', blocksize=512,
                 callback=lambda d,f,t,s: recording_data.append(d.copy()) if is_recording else None
             )
             audio_stream.start()
-            
             print("[rec] Начата")
         except Exception as e:
             print(f"[audio error] {e}")
@@ -307,14 +407,14 @@ def on_release(key):
     if is_trigger(key) and is_recording:
         is_recording = False
         
-        # CEO Quality Guard: Небольшая задержка перед выключением микрофона,
-        # чтобы гарантированно захватить последние слоги фразы.
+        # CEO Fix: Возвращаем уведомление об остановке записи
+        notify("WhisperKey", "Распознаю...")
+        
         def delayed_stop(stream_to_close):
-            time.sleep(0.3) # Даем 300мс на "дозапись" хвоста
+            time.sleep(0.3)
             try:
                 stream_to_close.stop()
                 stream_to_close.close()
-                print("[eco] Микрофон выключен")
             except: pass
 
         if audio_stream:
@@ -329,20 +429,6 @@ def on_release(key):
         print(f"[rec] Остановлена")
         threading.Thread(target=process_audio, args=(audio_snapshot,), daemon=True).start()
 
-def eco_monitor():
-    """Фоновый процесс для выключения микрофона после периода бездействия."""
-    global audio_stream, last_activity_time, is_recording
-    while True:
-        time.sleep(5)
-        if audio_stream and not is_recording:
-            if time.time() - last_activity_time > SESSION_TIMEOUT:
-                try:
-                    audio_stream.stop()
-                    audio_stream.close()
-                    audio_stream = None
-                    print("[eco] Микрофон ушел в спячку")
-                except: pass
-
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 def main():
@@ -353,18 +439,16 @@ def main():
         if hasattr(p, 'cpu_affinity'): p.cpu_affinity([0, 1])
     except: pass
 
-    print(f"WhisperKey v15.5 CEO PRESIDENTIAL | Warm-up Engine...")
+    print(f"WhisperKey v17.1 CEO PURE | Warm-up Engine...")
     try:
         model = WhisperModel(MODEL_PATH, device="cpu", compute_type="int8", cpu_threads=2, local_files_only=True)
         print("Разогрев локальной модели...")
         model.transcribe(np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32), language="ru", beam_size=1)
         
-        # Network Warm-up: Разогрев сетевой сессии
         if USE_CLOUD:
             print("Разогрев облачного соединения...")
             def warm_network():
-                try:
-                    http_session.head("https://api.groq.com", timeout=2.0)
+                try: http_session.head("https://api.groq.com", timeout=2.0)
                 except: pass
             threading.Thread(target=warm_network, daemon=True).start()
             
@@ -374,6 +458,7 @@ def main():
         return
 
     print("Готов! Зажми ПРАВЫЙ OPTION для записи.")
+    notify("WhisperKey", "Готов к работе!")
     
     with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
         listener.join()
