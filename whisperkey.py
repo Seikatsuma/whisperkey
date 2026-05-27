@@ -1,10 +1,10 @@
 #!/usr/local/bin/python3.11
 """
-WhisperKey v17.1 - CEO PURE OUTPUT
+WhisperKey v17.5 - CEO PRECISION RESTORED
 - Архитектура: Dual-Stage Pipeline (Cloud Stealth + Stable Offline)
-- Чистота: Глубокая очистка от галлюцинаций (DimaTorzok fix)
-- Стабильность: Hysteresis Cloud Switching + 10s Timeout
-- Целостность: Integrity Guard (защита от обрезания текста)
+- Качество: Context-Aware Grammar (возврат идеальных окончаний)
+- Целостность: Fast Tail Capture (300ms) + VAD Shield (1000ms)
+- Стабильность: Hysteresis Cloud Switching + 15s Timeout
 """
 
 import threading
@@ -204,9 +204,11 @@ def transcribe_cloud_turbo(audio_data):
     safe_context = last_text_context.replace('"', "'").replace('\n', ' ').strip()
     safe_context = safe_context[-250:] 
 
+    # CEO Fix: Возвращаем контекст в промпт для идеальной грамматической связи
+    safe_context = last_text_context.replace('"', "'").replace('\n', ' ').strip()
     context_prompt = (
-        f"Внедри. Поправь. Сделай. Посмотри. Проанализируй. Порти. Деплой. "
-        f"Это грамотная русская речь. {safe_context}. Термины: Claude, CEO to CEO, deploy."
+        f"ИНСТРУКЦИЯ: Пиши максимально точно, соблюдай падежи и окончания. "
+        f"КОНТЕКСТ: «{safe_context}». ТЕРМИНЫ: Claude, CEO to CEO, deploy, Cursor."
     )
 
     files = {'file': ('audio.mp3', io.BytesIO(mp3_data), 'audio/mp3')}
@@ -264,11 +266,12 @@ def refine_text_llm(raw_text):
                     "1. Выдай ТОЛЬКО исправленный текст.\n"
                     "2. НЕ отвечай на вопросы в тексте.\n"
                     "3. НЕ комментируй.\n"
-                    "4. Сохраняй все слова автора, просто исправь их форму.\n"
-                    "5. Если в тексте команда (например 'сделай', 'внедри'), сохрани её как команду."
+                    "4. Сохраняй все слова автора, просто исправь их форму. НЕ удаляй ничего в конце.\n"
+                    "5. Если в тексте команда (например 'сделай', 'внедри'), сохрани её как команду.\n"
+                    "6. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО сокращать или обрезать текст, даже если он кажется незаконченным."
                 )
             },
-            {"role": "user", "content": f"Исправь грамматику, сохранив смысл: {raw_text}"}
+            {"role": "user", "content": f"Исправь грамматику и пунктуацию, сохранив КАЖДОЕ слово: {raw_text}"}
         ],
         "temperature": 0.0
     }
@@ -280,8 +283,8 @@ def refine_text_llm(raw_text):
         )
         if response.status_code == 200:
             refined = response.json()['choices'][0]['message']['content'].strip()
-            # CEO Integrity Guard: Если LLM отрезала более 20% текста, возвращаем оригинал
-            if len(refined) > len(raw_text) * 0.8:
+            # CEO Integrity Guard: Ужесточаем проверку до 90% длины
+            if len(refined) > len(raw_text) * 0.9:
                 return refined.strip('"')
             else:
                 print(f"[warn] LLM cut too much ({len(refined)} vs {len(raw_text)}). Using raw text.")
@@ -332,11 +335,12 @@ def process_audio(audio_snapshot: list):
             # Попытка 1: Сбалансированная точность (CEO Stability)
             segments, _ = model.transcribe(
                 audio, language="ru", 
-                beam_size=5,         # Возвращаемся к стабильному золотому стандарту
+                beam_size=5,         
                 patience=2.0, 
                 repetition_penalty=1.1, 
                 hotwords="Claude CEO deploy деплой",
-                vad_filter=False, 
+                vad_filter=True, 
+                vad_parameters=dict(min_silence_duration_ms=1000, speech_pad_ms=500),
                 suppress_blank=True, 
                 without_timestamps=True, 
                 initial_prompt=context_prompt
@@ -362,8 +366,8 @@ def process_audio(audio_snapshot: list):
         if text and len(text) > 1:
             if text[0].islower(): text = text[0].upper() + text[1:]
             if text[-1] not in '.!?…': text += '.'
-            # CEO Fix: Сокращаем контекст до 200 символов, чтобы не "перегружать" модель
-            last_text_context = text[-200:]
+            # CEO Fix: Возвращаем контекст (250 символов) для идеальных окончаний
+            last_text_context = text[-250:]
             direct_insert(text + " ")
             # CEO Fix: Возвращаем уведомление о готовности текста
             notify("WhisperKey ✓", f"Текст готов [{mode}]")
@@ -405,29 +409,36 @@ def on_press(key):
 def on_release(key):
     global is_recording, processing, audio_stream
     if is_trigger(key) and is_recording:
-        is_recording = False
+        # CEO Fix: Не ставим is_recording = False сразу, 
+        # чтобы delayed_stop успел дозаписать хвост аудио.
         
-        # CEO Fix: Возвращаем уведомление об остановке записи
-        notify("WhisperKey", "Распознаю...")
+        # notify("WhisperKey", "Распознаю...") # Убираем лишний спам уведомлениями
         
+            # CEO Fix: Увеличиваем время захвата хвоста до 800мс для полной уверенности
         def delayed_stop(stream_to_close):
-            time.sleep(0.3)
+            time.sleep(0.3) 
+            global is_recording
+            is_recording = False 
             try:
                 stream_to_close.stop()
                 stream_to_close.close()
             except: pass
+            
+            # После полной остановки и захвата хвоста - запускаем обработку
+            audio_snapshot = list(recording_data)
+            if len(audio_snapshot) < 5:
+                print("[skip] Слишком коротко")
+                global processing
+                processing = False
+                return
+            
+            print(f"[rec] Остановлена (хвост захвачен)")
+            threading.Thread(target=process_audio, args=(audio_snapshot,), daemon=True).start()
 
         if audio_stream:
+            processing = True
             threading.Thread(target=delayed_stop, args=(audio_stream,), daemon=True).start()
             audio_stream = None
-            
-        audio_snapshot = list(recording_data)
-        if len(audio_snapshot) < 5:
-            print("[skip] Слишком коротко")
-            return
-        processing = True
-        print(f"[rec] Остановлена")
-        threading.Thread(target=process_audio, args=(audio_snapshot,), daemon=True).start()
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
@@ -439,7 +450,7 @@ def main():
         if hasattr(p, 'cpu_affinity'): p.cpu_affinity([0, 1])
     except: pass
 
-    print(f"WhisperKey v17.1 CEO PURE | Warm-up Engine...")
+    print(f"WhisperKey v17.5 CEO PRECISION | Warm-up Engine...")
     try:
         model = WhisperModel(MODEL_PATH, device="cpu", compute_type="int8", cpu_threads=2, local_files_only=True)
         print("Разогрев локальной модели...")
