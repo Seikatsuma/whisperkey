@@ -5,3 +5,4 @@ __pycache__/
 whisper_small_manual/
 *.mp3
 *.wav
+.env
