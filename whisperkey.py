@@ -262,9 +262,16 @@ def clean_noise(text: str) -> str:
     """Удаляет галлюцинации и применяет бизнес-словарь."""
     if not text: return ""
     
-    # CEO Fix: Если Whisper выдает одно слово-заглушку типа "КОНЕЦ", "Конец", "Конец связи"
-    # при наличии аудио - это явная галлюцинация на тишине.
-    hallucination_words = ["КОНЕЦ", "Конец", "Конец связи", "Продолжение следует", "Спасибо за просмотр", "Cursor", "Python", "CEO to CEO"]
+    # CEO Fix: Расширенный список жестких галлюцинаций для удаления
+    hallucination_phrases = [
+        r"Спикер говорит", r"Голос за кадром", r"Продолжение следует", 
+        r"Спасибо за просмотр", r"Подписывайтесь на канал"
+    ]
+    for phrase in hallucination_phrases:
+        text = re.sub(phrase + r".*?([.!?]|$)", "", text, flags=re.IGNORECASE).strip()
+
+    # Если Whisper выдает одно слово-заглушку
+    hallucination_words = ["КОНЕЦ", "Конец", "Конец связи", "Cursor", "Python", "CEO to CEO"]
     if text.strip() in hallucination_words:
         print(f"[hallucination detected] '{text.strip()}' -> skipping")
         return ""
@@ -311,9 +318,52 @@ def clean_noise(text: str) -> str:
             
     return text.strip()
 
-def create_audio_wav(audio_data):
-    """Создание WAV в памяти с защитным интервалом тишины."""
+def compress_silence(audio_data, threshold=0.01, min_pause=1.5, keep_pause=0.5):
+    """CEO Method: Сжатие длинных пауз до фиксированной длины."""
     try:
+        if len(audio_data) == 0: return audio_data
+        
+        # Анализируем энергию звука в окнах по 100мс
+        window_size = int(SAMPLE_RATE * 0.1)
+        output_audio = []
+        
+        i = 0
+        while i < len(audio_data):
+            chunk = audio_data[i:i+window_size]
+            if len(chunk) == 0: break
+            
+            # Если это тишина
+            if np.max(np.abs(chunk)) < threshold:
+                # Считаем длительность тишины
+                silence_start = i
+                while i < len(audio_data) and np.max(np.abs(audio_data[i:i+window_size])) < threshold:
+                    i += window_size
+                
+                silence_duration = (i - silence_start) / SAMPLE_RATE
+                
+                # Если пауза длинная - сжимаем её
+                if silence_duration > min_pause:
+                    # Оставляем только keep_pause секунд тишины
+                    output_audio.append(np.zeros(int(SAMPLE_RATE * keep_pause), dtype=np.float32))
+                else:
+                    # Оставляем паузу как есть
+                    output_audio.append(audio_data[silence_start:i])
+            else:
+                # Это речь - копируем как есть
+                output_audio.append(chunk)
+                i += window_size
+                
+        return np.concatenate(output_audio) if output_audio else audio_data
+    except Exception as e:
+        print(f"[compress error] {e}")
+        return audio_data
+
+def create_audio_wav(audio_data):
+    """Создание WAV в памяти с защитным интервалом тишины и сжатием пауз."""
+    try:
+        # CEO Fix: Сжимаем длинные паузы перед отправкой, чтобы избежать галлюцинаций
+        audio_data = compress_silence(audio_data)
+        
         # CEO Fix: Добавляем 0.5 секунды тишины в конец, чтобы Whisper не обрезал последние слова
         silence_padding = np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32)
         audio_data = np.append(audio_data, silence_padding)
@@ -364,16 +414,16 @@ def transcribe_cloud_turbo(audio_data):
         'Accept': 'application/json'
     }
 
-    # CEO Fix: Промпт теперь более описательный, что снижает вероятность 
-    # простого повторения слов в конце.
-    context_prompt = "Это качественная расшифровка русской речи. Темы: программирование на Python, работа в Cursor, использование Claude и обсуждение задач уровня CEO to CEO."
+    # CEO Fix: Промпт теперь фокусируется на стиле, а не на словах-галлюциногенах.
+    context_prompt = "Это качественная расшифровка русской деловой речи на IT-тематику. Спикер говорит четко, обсуждает технические задачи и программирование."
 
     files = {'file': ('audio.wav', io.BytesIO(wav_data), 'audio/wav')}
     data = {
         'model': 'whisper-large-v3',
         'language': 'ru',
         'prompt': context_prompt,
-        'temperature': 0.0  # CEO Fix: Возвращаем 0 для максимальной стабильности
+        'temperature': 0.0,
+        'response_format': 'verbose_json' # CEO Fix: Запрашиваем подробные данные для фильтрации
     }
 
     try:
@@ -384,7 +434,17 @@ def transcribe_cloud_turbo(audio_data):
         )
         
         if response.status_code == 200:
-            return response.json().get('text', '')
+            result = response.json()
+            # CEO Fix: Фильтруем сегменты с низкой уверенностью (галлюцинации)
+            segments = result.get('segments', [])
+            valid_text = []
+            for seg in segments:
+                # Если вероятность отсутствия речи высокая (>0.6) и текст короткий - это мусор
+                if seg.get('no_speech_prob', 0) > 0.6 and len(seg.get('text', '').strip()) < 15:
+                    continue
+                valid_text.append(seg.get('text', '').strip())
+            
+            return " ".join(valid_text) if valid_text else result.get('text', '')
         
         if response.status_code == 403:
             print("[!] Groq 403 (Geo-block). Switching to Instant Offline.")
@@ -400,8 +460,11 @@ def transcribe_cloud_turbo(audio_data):
     return None
 
 def refine_text_llm(raw_text):
-    """Stage 2: Лингвистическая полировка через Llama-3.1-70B."""
+    """Stage 2: Лингвистическая полировка через Llama-3.1-70B (Роль: Стенографист)."""
     if not raw_text or len(raw_text) < 5: return raw_text
+    
+    # CEO Fix: Берем короткий шлейф контекста для идеальных падежей
+    context_tail = last_text_context[-40:] if last_text_context else ""
     
     headers = {
         'Authorization': f'Bearer {GROQ_API_KEY}',
@@ -414,23 +477,17 @@ def refine_text_llm(raw_text):
             {
                 "role": "system", 
                 "content": (
-                    "Ты - элитный корректор русской деловой и технической речи. \n"
-                    "Твоя задача: превратить сырую расшифровку (ASR) в безупречный текст.\n\n"
+                    "Ты - профессиональный стенографист. Твоя задача: восстановить текст так, как его произнес человек.\n"
                     "ИНСТРУКЦИИ:\n"
-                    "1. Исправь ошибки распознавания, падежи, склонения и окончания.\n"
-                    "2. Расставь знаки препинания и заглавные буквы.\n"
-                    "3. Сохраняй ВСЕ слова автора и их порядок. НЕ добавляй вводных фраз и НЕ комментируй.\n"
-                    "4. Удаляй только слова-паразиты (э-э, мм, ну).\n"
-                    "5. Технические термины (Claude, CEO, deploy, Cursor) пиши правильно.\n\n"
-                    "ПРИМЕРЫ:\n"
-                    "Ввод: 'сделай деплой на сервер клауд'\n"
-                    "Вывод: 'Сделай деплой на сервер Claude.'\n\n"
-                    "Ввод: 'привет сео то сео как дела'\n"
-                    "Вывод: 'Привет, CEO to CEO, как дела?'\n\n"
-                    "Выдай ТОЛЬКО исправленный текст."
+                    "1. Исправляй ТОЛЬКО технические ошибки распознавания (например, 'смотреющий' -> 'смотри еще').\n"
+                    "2. Удаляй галлюцинации ИИ (например, 'Спикер говорит', 'Голос за кадром', 'Продолжение следует').\n"
+                    "3. Сохраняй 100% смысла и порядка слов. Запрещено перефразировать или сокращать.\n"
+                    "4. Если фраза обрывается на предлоге или союзе, не ставь точку.\n"
+                    "5. Исправляй падежи и окончания, только если они явно ошибочны.\n"
+                    "Выдай ТОЛЬКО чистый текст."
                 )
             },
-            {"role": "user", "content": f"Исправь текст: {raw_text}"}
+            {"role": "user", "content": f"Контекст: ...{context_tail}\nТекст для стенографии: {raw_text}"}
         ],
         "temperature": 0.0
     }
@@ -468,74 +525,86 @@ def process_audio(audio_snapshot: list, session_id: int):
         print(f"[rec] {dur:.1f}s → распознаю...")
         t_start = time.time()
 
-        text = None
-        mode = "OFFLINE"
-
-        # Пытаемся использовать Cloud Turbo только при валидной конфигурации.
-        if CLOUD_ENABLED:
-            print("[mode] Cloud Turbo (Whisper Large-v3)")
-            raw_text = transcribe_cloud_turbo(audio)
-            if raw_text:
-                # CEO Guard: Если Whisper выдал меньше 3 слов при длительном аудио - это сбой.
-                if len(raw_text.split()) < 3 and dur > 3.0:
-                    print(f"[guard] Cloud output too short ({len(raw_text.split())} words for {dur:.1f}s). Forcing Offline.")
-                    raw_text = None
-
-            if raw_text:
-                print(f"[raw whisper] '{raw_text}'")
-                print("[mode] Neural Refinement (Llama-3.1-70B)")
-                text = refine_text_llm(raw_text)
-                mode = "CLOUD+LLM"
-        
-        if not text:
-            if cloud_status["is_blocked"]:
-                print(f"[mode] Local Precision (Cloud paused: {int(60 - (time.time() - cloud_status['last_check_time']))}s left)")
-            else:
-                print("[mode] Local Precision Fallback")
-            # CEO Quality: Максимальное усиление сигнала
-            max_val = np.max(np.abs(audio))
-            if max_val > 0.0001: 
-                audio = audio / max_val * 0.99 # Почти максимальная амплитуда
+        # CEO Diamond: Умное дробление длинных записей (Chunking)
+        # Если запись длиннее 35 секунд, режем её на куски по 25-30 секунд по паузам
+        audio_chunks = []
+        if dur > 35.0:
+            print(f"[diamond] Длинная запись ({dur:.1f}s). Включаю умное дробление...")
+            current_pos = 0
+            chunk_size_samples = int(SAMPLE_RATE * 30) # Базовый кусок 30 сек
             
-            context_prompt = (
-                "Это безупречная расшифровка русской деловой речи. "
-                "Спикер обсуждает IT-задачи, программирование на Python, деплой и работу в Cursor. "
-                "Используются термины: Claude, CEO to CEO, deploy."
-            )
-            
-            # Попытка 1: Deep Listening Mode (CEO Precision)
-            segments, _ = model.transcribe(
-                audio, language="ru", 
-                beam_size=10,         # CEO: Максимальный поиск для точности
-                best_of=5,
-                patience=2.0,        # CEO: Заставляем модель "вслушиваться" дольше
-                repetition_penalty=1.2, 
-                vad_filter=False,     
-                suppress_blank=True, 
-                without_timestamps=True, 
-                condition_on_previous_text=False,
-                initial_prompt=context_prompt,
-                compression_ratio_threshold=2.4,
-                logprob_threshold=-1.0,
-                no_speech_threshold=0.6
-            )
-            text = " ".join(seg.text.strip() for seg in segments).strip()
-            if text: print(f"[raw whisper] '{text}'")
+            while current_pos < len(audio):
+                end_pos = min(current_pos + chunk_size_samples, len(audio))
+                
+                # Если это не последний кусок, ищем паузу для красивого разреза
+                if end_pos < len(audio):
+                    # Ищем тишину в окне +/- 3 секунды от точки разреза
+                    search_window = int(SAMPLE_RATE * 3)
+                    search_start = max(end_pos - search_window, current_pos + int(SAMPLE_RATE * 10))
+                    search_end = min(end_pos + search_window, len(audio) - int(SAMPLE_RATE * 2))
+                    
+                    sub_audio = audio[search_start:search_end]
+                    if len(sub_audio) > SAMPLE_RATE:
+                        # Анализируем энергию в окнах по 100мс
+                        win = int(SAMPLE_RATE * 0.1)
+                        energies = [np.max(np.abs(sub_audio[j:j+win])) for j in range(0, len(sub_audio)-win, win)]
+                        if energies:
+                            min_energy_idx = np.argmin(energies)
+                            end_pos = search_start + (min_energy_idx * win) + (win // 2)
+                
+                audio_chunks.append(audio[current_pos:end_pos])
+                current_pos = end_pos
+        else:
+            audio_chunks = [audio]
 
-            # Попытка 2: Если Попытка 1 выдала пустоту, пробуем "грубую силу"
-            if not text or len(text) < 2:
-                print("[warn] Local precision failed, trying brute force...")
+        final_segments = []
+        for idx, chunk in enumerate(audio_chunks):
+            if len(audio_chunks) > 1:
+                print(f"[diamond] Обработка сегмента {idx+1}/{len(audio_chunks)} ({len(chunk)/SAMPLE_RATE:.1f}s)")
+            
+            chunk_text = None
+            
+            # Пытаемся использовать Cloud Turbo
+            if CLOUD_ENABLED:
+                raw_text = transcribe_cloud_turbo(chunk)
+                if raw_text:
+                    # CEO Guard: Если облако выдало галлюцинацию или слишком коротко
+                    if len(raw_text.split()) < 3 and (len(chunk)/SAMPLE_RATE) > 5.0:
+                        print(f"[guard] Сегмент {idx+1}: Cloud output suspicious. Fallback to Local.")
+                    else:
+                        chunk_text = raw_text
+
+            # Если облако не сработало или выдало брак - используем локальную модель
+            if not chunk_text:
+                # CEO Quality: Максимальное усиление
+                max_val = np.max(np.abs(chunk))
+                if max_val > 0.0001: chunk = chunk / max_val * 0.99
+                
+                context_prompt = "Это безупречная расшифровка русской деловой речи. Спикер обсуждает технические процессы."
+                
                 segments, _ = model.transcribe(
-                    audio, beam_size=1, 
-                    condition_on_previous_text=False,
-                    vad_filter=False, suppress_blank=False,
-                    no_speech_threshold=0.8
+                    chunk, language="ru", 
+                    beam_size=10, patience=2.0, repetition_penalty=1.2,
+                    vad_filter=False, suppress_blank=True, without_timestamps=True,
+                    condition_on_previous_text=False, initial_prompt=context_prompt
                 )
-                text = " ".join(seg.text.strip() for seg in segments).strip()
+                chunk_text = " ".join(seg.text.strip() for seg in segments).strip()
+            
+            if chunk_text:
+                final_segments.append(chunk_text)
+
+        full_raw_text = " ".join(final_segments).strip()
+        if not full_raw_text:
+            print("[skip] Пустой результат")
+            notify("WhisperKey", "Речь не распознана")
+            return
+
+        print(f"[raw whisper] '{full_raw_text}'")
+        print("[mode] Neural Refinement (Llama-3.1-70B)")
+        text = refine_text_llm(full_raw_text)
 
         elapsed = time.time() - t_start
-        print(f"[raw]  '{text}'")
-        print(f"[time] {elapsed:.1f}s ({elapsed/dur*100:.0f}% от длины) [{mode}]")
+        print(f"[time] {elapsed:.1f}s ({elapsed/dur*100:.0f}% от длины)")
         
         text = clean_noise(text)
         text = smart_grammar_fix(text)
@@ -547,11 +616,11 @@ def process_audio(audio_snapshot: list, session_id: int):
             # CEO Fix: Всегда выводим финальный результат в консоль для ручного копирования
             print(f"\n--- ФИНАЛЬНЫЙ ТЕКСТ ---\n{text}\n-----------------------\n")
             
-            # CEO Fix: Возвращаем контекст (250 символов) для идеальных окончаний
-            last_text_context = text[-250:]
+            # CEO Fix: Возвращаем контекст (40 символов) для идеальных окончаний
+            last_text_context = text[-40:]
             direct_insert(text + " ")
             # CEO Fix: Возвращаем уведомление о готовности текста
-            notify("WhisperKey ✓", f"Текст готов [{mode}]")
+            notify("WhisperKey ✓", "Текст готов")
         else:
             print("[skip] Пустой результат")
             notify("WhisperKey", "Речь не распознана")
@@ -646,7 +715,7 @@ def main():
         if hasattr(p, 'cpu_affinity'): p.cpu_affinity([0, 1])
     except: pass
 
-    print(f"WhisperKey v17.5 CEO PRECISION | Warm-up Engine...")
+    print(f"WhisperKey v18.0 CEO PRECISION | Warm-up Engine...")
     try:
         model = WhisperModel(MODEL_PATH, device="cpu", compute_type="int8", cpu_threads=2, local_files_only=False)
         print("Разогрев локальной модели...")
