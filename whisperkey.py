@@ -947,11 +947,11 @@ def process_audio(audio_snapshot: list, session_id: int):
             last_text_context = text[-40:]
             direct_insert(text + " ")
             finalize_eval_sample_meta(session_id, dur, full_raw_text, text)
-            notify("WhisperKey by @Seikatsuma ✓", "Текст готов")
+            notify("WhisperKey ✓", "Текст готов")
         else:
             finalize_eval_sample_meta(session_id, dur, full_raw_text, "")
             print("[skip] Пустой результат")
-            notify("WhisperKey by @Seikatsuma", "Речь не распознана")
+            notify("WhisperKey", "Речь не распознана")
     except Exception as e:
         print(f"[error] {e}")
     finally:
@@ -983,7 +983,7 @@ def on_press(key):
             session_counter += 1
             active_session_id = session_counter
             session_phase = "recording"
-            notify("WhisperKey by @Seikatsuma", "🎙 Запись...")
+            notify("WhisperKey", "🎙 Запись...")
             try:
                 start_audio_stream() # CEO Fix: Включаем микрофон
                 is_recording = True
@@ -1060,7 +1060,7 @@ def check_macos_accessibility():
     return True
 
 def create_desktop_launcher():
-    """CEO UX: Предлагает создать ярлык на рабочем столе для удобного запуска."""
+    """CEO UX: Тихо создает ярлык на рабочем столе, если его еще нет."""
     try:
         desktop = os.path.expanduser("~/Desktop")
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1071,16 +1071,9 @@ def create_desktop_launcher():
             source_path = os.path.join(current_dir, "Запустить WhisperKey.command")
             
             if not os.path.exists(target_path) and os.path.exists(source_path):
-                print("\n" + "—"*60)
-                print(" 💡 СОВЕТ: Хотите добавить иконку запуска на Рабочий стол?")
-                print(f" Это позволит запускать WhisperKey одним кликом.")
-                # Мы не можем интерактивно ждать ввода в некоторых средах, 
-                # поэтому просто копируем, если его там еще нет - это и есть 'деликатно'.
                 import shutil
                 shutil.copy2(source_path, target_path)
                 os.chmod(target_path, 0o755)
-                print(f" ✅ Готово! Иконка '{launcher_name}' появилась на вашем Рабочем столе.")
-                print("—"*60 + "\n")
                 
         elif sys.platform == "win32":
             launcher_name = "WhisperKey.bat"
@@ -1088,14 +1081,10 @@ def create_desktop_launcher():
             source_path = os.path.join(current_dir, "run_whisperkey.bat")
             
             if not os.path.exists(target_path) and os.path.exists(source_path):
-                print("\n" + "—"*60)
-                print(" 💡 СОВЕТ: Добавляю ярлык запуска на Рабочий стол...")
                 import shutil
                 shutil.copy2(source_path, target_path)
-                print(f" ✅ Готово! Теперь вы можете запускать программу через '{launcher_name}'.")
-                print("—"*60 + "\n")
-    except Exception as e:
-        pass # Не критично, если не получилось
+    except:
+        pass
 
 def main():
     global model
@@ -1103,18 +1092,16 @@ def main():
         print("[FATAL] WhisperKey уже запущен. Закрой предыдущий процесс перед новым стартом.")
         return
 
-    # CEO UX: Приветствие и брендинг
+    # CEO UX: Чистое приветствие
     print("\n" + "="*60)
     print(" 🎙️  WhisperKey v23.5 | Professional Transcription Engine")
     print(" Created by Егор Нищук (Telegram: @Seikatsuma)")
-    print("="*60 + "\n")
+    print("="*60)
 
     check_macos_accessibility()
     create_desktop_launcher()
 
-    # Умная подсказка про сон/закрытие крышки
-    print(" 💡 СОВЕТ: Если вы закрывали ноутбук или он уходил в сон,")
-    print(" рекомендуется перезапустить программу, если она перестала реагировать.")
+    print(" Статус: Готов к работе.")
     print("—"*60 + "\n")
 
     try:
