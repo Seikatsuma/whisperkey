@@ -17,7 +17,6 @@ import fcntl
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
-import sounddevice as sd
 import re
 import psutil
 import requests
@@ -28,6 +27,18 @@ import wave
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
+
+try:
+    import sounddevice as sd
+except OSError as e:
+    print("\n" + "!"*60)
+    print(" ОШИБКА: Библиотека PortAudio не найдена.")
+    if sys.platform == "darwin":
+        print(" Пожалуйста, установите её командой: brew install portaudio")
+    else:
+        print(" Пожалуйста, установите PortAudio для вашей системы.")
+    print("!"*60 + "\n")
+    sys.exit(1)
 
 from faster_whisper import WhisperModel
 from pynput import keyboard
@@ -1029,11 +1040,32 @@ def on_release(key):
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
+def check_macos_accessibility():
+    """Проверка прав универсального доступа на macOS."""
+    if sys.platform != "darwin":
+        return True
+    
+    script = 'tell application "System Events" to set isProcessTrusted to UI elements enabled'
+    try:
+        result = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, text=True)
+        if "false" in result.stdout.lower():
+            print("\n" + "!"*60)
+            print(" ВНИМАНИЕ: Права Универсального доступа (Accessibility) не выданы!")
+            print(" Без них автоматическая вставка текста работать НЕ БУДЕТ.")
+            print(" Выдайте права вашему Терминалу/IDE в Системных настройках.")
+            print("!"*60 + "\n")
+            return False
+    except:
+        pass
+    return True
+
 def main():
     global model
     if not acquire_single_instance_lock():
         print("[FATAL] WhisperKey уже запущен. Закрой предыдущий процесс перед новым стартом.")
         return
+
+    check_macos_accessibility()
 
     try:
         p = psutil.Process(os.getpid())
@@ -1041,8 +1073,9 @@ def main():
         if hasattr(p, 'cpu_affinity'): p.cpu_affinity([0, 1])
     except: pass
 
-    print(f"WhisperKey v23.0 Auto-Eval | {CLOUD_WHISPER_MODEL} | Ready.")
+    print(f"WhisperKey v23.5 Auto-Eval | {CLOUD_WHISPER_MODEL} | Ready.")
     try:
+        print("Загрузка локальной модели (может занять время при первом запуске)...")
         model = WhisperModel(MODEL_PATH, device="cpu", compute_type="int8", cpu_threads=2, local_files_only=False)
         print("Разогрев локальной модели...")
         model.transcribe(np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32), language="ru", beam_size=1)
