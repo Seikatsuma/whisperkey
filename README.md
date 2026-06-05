@@ -78,4 +78,4 @@ brew install portaudio
 3. **Architecture:** Это Dual-Stage пайплайн с Large-v3 и Llama 3.1. Сохраняй Skip=0 и Strict Prompt для предотвращения галлюцинаций.
 
 ---
-*Разработано в режиме CEO to CEO для максимальной продуктивности.*
+*Разработано Егором Нищуком (Telegram: [@Seikatsuma](https://t.me/Seikatsuma)) для максимальной продуктивности.*

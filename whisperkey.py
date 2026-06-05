@@ -947,11 +947,11 @@ def process_audio(audio_snapshot: list, session_id: int):
             last_text_context = text[-40:]
             direct_insert(text + " ")
             finalize_eval_sample_meta(session_id, dur, full_raw_text, text)
-            notify("WhisperKey by Alex N. ✓", "Текст готов")
+            notify("WhisperKey by @Seikatsuma ✓", "Текст готов")
         else:
             finalize_eval_sample_meta(session_id, dur, full_raw_text, "")
             print("[skip] Пустой результат")
-            notify("WhisperKey by Alex N.", "Речь не распознана")
+            notify("WhisperKey by @Seikatsuma", "Речь не распознана")
     except Exception as e:
         print(f"[error] {e}")
     finally:
@@ -983,7 +983,7 @@ def on_press(key):
             session_counter += 1
             active_session_id = session_counter
             session_phase = "recording"
-            notify("WhisperKey by Alex N.", "🎙 Запись...")
+            notify("WhisperKey by @Seikatsuma", "🎙 Запись...")
             try:
                 start_audio_stream() # CEO Fix: Включаем микрофон
                 is_recording = True
@@ -1106,7 +1106,7 @@ def main():
     # CEO UX: Приветствие и брендинг
     print("\n" + "="*60)
     print(" 🎙️  WhisperKey v23.5 | Professional Transcription Engine")
-    print(" Created by Alex N. | CEO to CEO Quality")
+    print(" Created by Егор Нищук (Telegram: @Seikatsuma)")
     print("="*60 + "\n")
 
     check_macos_accessibility()
