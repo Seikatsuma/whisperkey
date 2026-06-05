@@ -1,4 +1,4 @@
-#!/usr/local/bin/python3.11
+#!/usr/bin/env python3
 """
 WhisperKey v17.5 - CEO PRECISION RESTORED
 - Архитектура: Dual-Stage Pipeline (Cloud Stealth + Stable Offline)
@@ -6,6 +6,7 @@ WhisperKey v17.5 - CEO PRECISION RESTORED
 - Целостность: Fast Tail Capture (300ms) + VAD Shield (1000ms)
 - Стабильность: Hysteresis Cloud Switching + 15s Timeout
 """
+from __future__ import annotations
 
 import threading
 import subprocess
@@ -13,6 +14,8 @@ import os
 import sys
 import time
 import fcntl
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import sounddevice as sd
 import re
@@ -53,8 +56,37 @@ def load_env_file(path: str = ".env") -> None:
 SAMPLE_RATE = 16000
 TRIGGER_KEY = keyboard.Key.alt_r
 MODEL_PATH  = "small" # CEO Upgrade: 'base' -> 'small' for significantly better Russian accuracy
-TAIL_CAPTURE_SECONDS = 0.8  # CEO Fix: Увеличиваем захват хвоста для надежности
+TAIL_CAPTURE_SECONDS = 0.6  # CEO Speed: 0.8 -> 0.6 (быстрее старт, риск минимален)
 RESTORE_CLIPBOARD = True
+SAVE_DEBUG_AUDIO = False  # Speed: без записи WAV на диск (качество 5/5)
+ASR_CONTEXT_PROMPT = "Русская деловая речь. IT, программирование, технические задачи."
+NARRATOR_LOOP_PATTERN = r'(?:спикер|смикер|speaker)\s+говорит'
+BOH_TAIL_MARKERS = [
+    "редактор субтитров",
+    "корректор",
+    "продолжение следует",
+    "субтитры сделал",
+    "субтитры подогнал",
+    "subtitles by",
+    "thanks for watching"
+]
+CLOUD_WHISPER_MODEL = "whisper-large-v3"
+PARALLEL_CLOUD_CHUNKS = True
+MAX_CLOUD_WORKERS = 4
+LLAMA_SKIP_MAX_WORDS = 0
+HALLUCINATION_TRIGGERS = [
+    "спикер говорит",
+    "смикер говорит",
+    "продолжение следует",
+    "голос за кадром",
+]
+
+# Библиотека эталонных записей на Рабочем столе (для оценки качества)
+EVAL_SAMPLES_ENABLED = False
+EVAL_SAMPLES_ROOT = os.path.expanduser("~/Desktop/WhisperKey-Eval-Samples")
+EVAL_BUCKETS = {
+    "eval_samples": {"limit": 7, "label": "Целевые записи (от 20с)"},
+}
 
 # API Настройки (Groq Cloud)
 # 1) Export key in shell: export GROQ_API_KEY="gsk_..."
@@ -92,7 +124,157 @@ cloud_status = {
 }
 kb = KeyboardController()
 _instance_lock_handle = None
+_eval_lock = threading.Lock()
+_eval_pending_paths: dict[int, str] = {}
+_eval_full_notified: set[str] = set()
 
+
+def _eval_bucket_for_duration(dur: float) -> str:
+    if dur >= 20.0:
+        return "eval_samples"
+    return "ignored"
+
+def _write_raw_recording_wav(audio_data: np.ndarray, path: str) -> None:
+    """Сохраняет сырую запись (без compress/padding) как слышал микрофон."""
+    audio_data = np.asarray(audio_data, dtype=np.float32).flatten()
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        max_v = float(np.max(np.abs(audio_data))) if len(audio_data) else 0.0
+        if max_v > 0:
+            audio_data = audio_data / max_v * 0.98
+        wf.writeframes((audio_data * 32767).astype(np.int16).tobytes())
+
+def _eval_count_in_bucket(bucket: str) -> int:
+    if bucket == "ignored": return 999
+    folder = os.path.join(EVAL_SAMPLES_ROOT, bucket)
+    if not os.path.isdir(folder):
+        return 0
+    return sum(1 for name in os.listdir(folder) if name.lower().endswith(".wav"))
+
+def _eval_refresh_manifest() -> dict:
+    global EVAL_SAMPLES_ENABLED
+    manifest = {"root": EVAL_SAMPLES_ROOT, "buckets": {}}
+    total_collected = 0
+    for bucket, cfg in EVAL_BUCKETS.items():
+        count = _eval_count_in_bucket(bucket)
+        if bucket != "ignored":
+            total_collected += count
+        manifest["buckets"][bucket] = {
+            "label": cfg["label"],
+            "count": count,
+            "limit": cfg["limit"],
+            "full": count >= cfg["limit"],
+        }
+    
+    # CEO Fix: Автоматическое отключение при достижении лимита
+    if total_collected >= 7:
+        if EVAL_SAMPLES_ENABLED:
+            print("[eval] Лимит в 7 записей достигнут. Авто-отключение сбора.")
+            EVAL_SAMPLES_ENABLED = False
+            
+    manifest_path = os.path.join(EVAL_SAMPLES_ROOT, "manifest.json")
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[eval] manifest error: {e}")
+    return manifest
+
+def init_eval_samples_library() -> None:
+    """Создаёт папки на Рабочем столе и README с правилами сбора."""
+    if not EVAL_SAMPLES_ENABLED:
+        return
+    try:
+        os.makedirs(EVAL_SAMPLES_ROOT, exist_ok=True)
+        for bucket in EVAL_BUCKETS:
+            os.makedirs(os.path.join(EVAL_SAMPLES_ROOT, bucket), exist_ok=True)
+        readme = os.path.join(EVAL_SAMPLES_ROOT, "README.txt")
+        if not os.path.exists(readme):
+            lines = [
+                "WhisperKey — эталонные записи для оценки качества",
+                "",
+                "Папки:",
+                "  short_up_to_15s/   — до 5 файлов, длительность ≤ 15 сек",
+                "  medium_15s_to_60s/ — до 10 файлов, 15 < длительность ≤ 60 сек",
+                "  long_over_60s/     — до 5 файлов, длительность > 60 сек",
+                "",
+                "Когда лимит категории заполнен, новые записи этой длины не сохраняются.",
+                "К каждому .wav добавляется .meta.json (raw whisper + финальный текст).",
+                "Статус: manifest.json",
+            ]
+            with open(readme, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        manifest = _eval_refresh_manifest()
+        print(f"[eval] Папка эталонов: {EVAL_SAMPLES_ROOT}")
+        for bucket, info in manifest["buckets"].items():
+            print(f"[eval]   {info['label']}: {info['count']}/{info['limit']}")
+    except Exception as e:
+        print(f"[eval] init error: {e}")
+
+def _eval_collect_worker(audio: np.ndarray, dur: float, session_id: int) -> None:
+    if not EVAL_SAMPLES_ENABLED:
+        return
+    bucket = _eval_bucket_for_duration(dur)
+    limit = EVAL_BUCKETS[bucket]["limit"]
+    folder = os.path.join(EVAL_SAMPLES_ROOT, bucket)
+    os.makedirs(folder, exist_ok=True)
+
+    with _eval_lock:
+        count = _eval_count_in_bucket(bucket)
+        if count >= limit:
+            if bucket not in _eval_full_notified:
+                _eval_full_notified.add(bucket)
+                print(f"[eval] Категория «{EVAL_BUCKETS[bucket]['label']}» полна ({limit}/{limit}), пропуск")
+            return
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        fname = f"{stamp}_{dur:.1f}s_id{session_id}.wav"
+        wav_path = os.path.join(folder, fname)
+        try:
+            _write_raw_recording_wav(audio, wav_path)
+            _eval_pending_paths[session_id] = wav_path
+            _eval_refresh_manifest()
+            new_count = _eval_count_in_bucket(bucket)
+            print(f"[eval] Сохранено [{EVAL_BUCKETS[bucket]['label']}] {new_count}/{limit}: {fname}")
+        except Exception as e:
+            print(f"[eval] save error: {e}")
+
+def schedule_eval_sample_collect(audio: np.ndarray, dur: float, session_id: int) -> None:
+    """Фоновое сохранение записи — не блокирует распознавание."""
+    if not EVAL_SAMPLES_ENABLED or dur < 0.5:
+        return
+    audio_copy = np.array(audio, dtype=np.float32, copy=True)
+    threading.Thread(
+        target=_eval_collect_worker,
+        args=(audio_copy, dur, session_id),
+        daemon=True,
+    ).start()
+
+def finalize_eval_sample_meta(
+    session_id: int, dur: float, raw_text: str, final_text: str
+) -> None:
+    with _eval_lock:
+        wav_path = _eval_pending_paths.pop(session_id, None)
+    if not wav_path:
+        return
+    meta_path = wav_path.rsplit(".", 1)[0] + ".meta.json"
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "duration_sec": round(dur, 2),
+                    "bucket": _eval_bucket_for_duration(dur),
+                    "raw_whisper": raw_text or "",
+                    "final_text": final_text or "",
+                    "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+    except Exception as e:
+        print(f"[eval] meta error: {e}")
 
 def acquire_single_instance_lock() -> bool:
     """Гарантирует один активный процесс WhisperKey на машине."""
@@ -128,13 +310,18 @@ def start_audio_stream():
         print(f"[audio start error] {e}")
 
 def stop_audio_stream():
-    """CEO Method: Полное отключение микрофона после записи."""
+    """CEO Method: Безопасное отключение микрофона без блокировки основного потока."""
     global audio_stream
     try:
         if audio_stream:
-            audio_stream.stop()
-            audio_stream.close()
+            stream_to_close = audio_stream
             audio_stream = None
+            def _close():
+                try:
+                    stream_to_close.stop()
+                    stream_to_close.close()
+                except: pass
+            threading.Thread(target=_close, daemon=True).start()
     except Exception as e:
         print(f"[audio stop error] {e}")
 
@@ -196,24 +383,56 @@ def smart_grammar_fix(text: str) -> str:
     text = re.sub(r'Claude[а-яА-Я]+', 'Claude', text)
     return text.strip()
 
+# Союзы/предлоги в конце — фраза не завершена, точку не ставим (#4).
+_INCOMPLETE_ENDING_RE = re.compile(
+    r'\b(?:и|а|но|или|либо|чтобы|что|как|если|когда|где|куда|откуда|'
+    r'который|которая|которое|которые|которых|которому|которой|'
+    r'при|для|на|в|во|с|со|у|о|об|от|до|без|через|про|над|под|'
+    r'перед|после|между|среди|по|к|ко|из)\s*$',
+    re.IGNORECASE,
+)
+
+def apply_smart_sentence_ending(text: str) -> str:
+    """Умное оформление конца: заглавная буква, точка только если мысль завершена."""
+    if not text or len(text) <= 1:
+        return text
+    if text[0].islower():
+        text = text[0].upper() + text[1:]
+    stripped = text.rstrip()
+    if not stripped:
+        return text
+    if stripped[-1] in '.!?…':
+        return stripped
+    tail_check = stripped.rstrip('.,;:')
+    if _INCOMPLETE_ENDING_RE.search(tail_check):
+        return stripped
+    return stripped + '.'
+
+def _restore_clipboard_async(old_clipboard: bytes) -> None:
+    """Возврат буфера обмена в фоне — не блокирует завершение вставки."""
+    def run_restore():
+        try:
+            time.sleep(0.5)
+            process = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
+            process.communicate(input=old_clipboard)
+        except Exception as e:
+            print(f"[insert] clipboard restore error: {e}")
+
+    threading.Thread(target=run_restore, daemon=True).start()
+
 def direct_insert(text: str):
     """CEO Method: Вставка через буфер с максимальной совместимостью."""
     try:
         # 1. Сохраняем старый буфер
         old_clipboard = subprocess.run(['pbpaste'], capture_output=True).stdout
-        
-        # 2. Определяем целевое приложение для логов
-        front_app = subprocess.run(
-            ["/usr/bin/osascript", "-e", 'tell application "System Events" to get name of first process whose frontmost is true'],
-            capture_output=True,
-            text=True
-        ).stdout.strip()
-        print(f"[insert target] {front_app or 'Unknown'}")
+
+        # Подготавливаем текст заранее
+        text_bytes = text.encode('utf-8')
 
         inserted = False
         for attempt in range(1, 4):
             # Копируем текст в буфер
-            subprocess.run(['pbcopy'], input=text.encode('utf-8'), check=True)
+            subprocess.run(['pbcopy'], input=text_bytes, check=True)
             time.sleep(0.1) # Даем macOS время обновить буфер
             
             # Попытка А: AppleScript через key code 9 (v) - самый надежный метод на Mac
@@ -249,41 +468,74 @@ def direct_insert(text: str):
         if inserted:
             print(f"[insert success] '{text[:30]}...'")
             if RESTORE_CLIPBOARD:
-                time.sleep(0.5) # Ждем завершения вставки перед возвратом буфера
-                process = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
-                process.communicate(input=old_clipboard)
+                _restore_clipboard_async(old_clipboard)
         else:
             print("[insert fail] Check Accessibility permissions for Terminal/Cursor")
             
     except Exception as e:
         print(f"[insert error] {e}")
 
+def strip_asr_artifacts(text: str) -> str:
+    """MED: удаляет типичные ASR-хвосты без агрессивной очистки основного текста."""
+    cleaned = text.strip()
+    if not cleaned:
+        return cleaned
+
+    # Deloop: режем только если narrator-паттерн повторяется 2+ раза.
+    loop_matches = list(re.finditer(NARRATOR_LOOP_PATTERN, cleaned, flags=re.IGNORECASE))
+    if len(loop_matches) >= 2:
+        cut_pos = loop_matches[0].start()
+        print(f"[boh] deloop cut at {cut_pos} ({len(loop_matches)} matches)")
+        cleaned = cleaned[:cut_pos].strip()
+
+    if not cleaned:
+        return cleaned
+
+    lower = cleaned.lower()
+    tail_start = int(len(lower) * 0.7)  # Проверяем только хвост, чтобы не трогать середину фразы.
+    for marker in BOH_TAIL_MARKERS:
+        idx = lower.find(marker, tail_start)
+        if idx != -1:
+            print(f"[boh] tail marker trimmed: '{marker}'")
+            cleaned = cleaned[:idx].strip()
+            lower = cleaned.lower()
+            tail_start = int(len(lower) * 0.7)
+
+    return cleaned.strip()
+
+def should_skip_llm(raw_text: str) -> bool:
+    """Пропуск Llama на коротком чистом raw — быстрее без потери на типичных фразах."""
+    words = raw_text.split()
+    if len(words) > LLAMA_SKIP_MAX_WORDS:
+        return False
+    lower = raw_text.lower()
+    if any(t in lower for t in HALLUCINATION_TRIGGERS):
+        return False
+    if any(m in lower for m in BOH_TAIL_MARKERS):
+        return False
+    if len(re.findall(NARRATOR_LOOP_PATTERN, raw_text, flags=re.IGNORECASE)) >= 2:
+        return False
+    return True
+
 def clean_noise(text: str) -> str:
     """Удаляет галлюцинации и применяет бизнес-словарь."""
     if not text: return ""
+    text = strip_asr_artifacts(text)
+    if not text:
+        return ""
     
-    # CEO Fix: Расширенный список жестких галлюцинаций для удаления
-    hallucination_phrases = [
-        r"Спикер говорит", r"Голос за кадром", r"Продолжение следует", 
-        r"Спасибо за просмотр", r"Подписывайтесь на канал"
-    ]
-    for phrase in hallucination_phrases:
-        text = re.sub(phrase + r".*?([.!?]|$)", "", text, flags=re.IGNORECASE).strip()
-
-    # Если Whisper выдает одно слово-заглушку
+    # CEO Fix: Удаляем только ОДИНОЧНЫЕ слова-заглушки на полной тишине.
+    # Если эти слова часть предложения - они НЕ удаляются.
     hallucination_words = ["КОНЕЦ", "Конец", "Конец связи", "Cursor", "Python", "CEO to CEO"]
     if text.strip() in hallucination_words:
-        print(f"[hallucination detected] '{text.strip()}' -> skipping")
         return ""
 
     text = re.sub(r'[фФfFaA]{4,}', '', text).strip()
     text = re.sub(r'[.]{3,}', '...', text).strip()
     
-    # CEO Fix: Удаляем повторяющиеся технические термины в самом конце, если они выглядят как галлюцинации
-    # (например, если они идут после точки или просто списком в конце)
+    # CEO Fix: Удаляем технические "хвосты" только если они явно лишние в конце после точки
     bad_endings = [r"Cursor[.!?]*$", r"Python[.!?]*$", r"CEO to CEO[.!?]*$", r"Claude[.!?]*$"]
     for pattern in bad_endings:
-        # Если слово встречается в конце и перед ним была точка или это единственное слово в сегменте
         if re.search(r'[.!?]\s+' + pattern, text):
             text = re.sub(r'\s+' + pattern, '', text).strip()
 
@@ -296,64 +548,54 @@ def clean_noise(text: str) -> str:
         r'\b[Сс]ео\b': 'CEO',
         r'\b[Дд]ипло\b': 'деплой',
         r'\b[Дд]епло\b': 'деплой',
-        r'\b[Dd]eplo\b': 'deploy'
+        r'\b[Dd]eplo\b': 'deploy',
     }
     for pattern, replacement in business_vocabulary.items():
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-    
-    # CEO Fix: Удаляем галлюцинации только если они в самом конце и похожи на мусор
-    hallucinations = [
-        "Субтитры сделал DimaTorzok", "Субтитры создавал DimaTorzok", 
-        "Отредактировал DimaTorzok", "Продолжение следует", "Спасибо за просмотр"
-    ]
-    for bad in hallucinations:
-        if text.endswith(bad):
-            text = text[:-len(bad)].strip()
-    
-    # Отдельно для слова "субтитры", которое часто бывает галлюцинацией в конце
-    if text.lower().rstrip('.!? ').endswith("субтитры"):
-        # Если это не единственное слово
-        if len(text.split()) > 2:
-            text = re.sub(r'(?i)\s+субтитры[.!?]*$', '', text).strip()
             
     return text.strip()
 
 def compress_silence(audio_data, threshold=0.01, min_pause=1.5, keep_pause=0.5):
-    """CEO Method: Сжатие длинных пауз до фиксированной длины."""
+    """CEO Method: Сжатие длинных пауз до фиксированной длины (векторизовано)."""
     try:
         if len(audio_data) == 0: return audio_data
         
-        # Анализируем энергию звука в окнах по 100мс
+        # Анализируем энергию в окнах по 100мс
         window_size = int(SAMPLE_RATE * 0.1)
-        output_audio = []
+        n_windows = len(audio_data) // window_size
+        if n_windows == 0: return audio_data
         
-        i = 0
-        while i < len(audio_data):
-            chunk = audio_data[i:i+window_size]
-            if len(chunk) == 0: break
-            
-            # Если это тишина
-            if np.max(np.abs(chunk)) < threshold:
-                # Считаем длительность тишины
-                silence_start = i
-                while i < len(audio_data) and np.max(np.abs(audio_data[i:i+window_size])) < threshold:
-                    i += window_size
-                
-                silence_duration = (i - silence_start) / SAMPLE_RATE
-                
-                # Если пауза длинная - сжимаем её
-                if silence_duration > min_pause:
-                    # Оставляем только keep_pause секунд тишины
-                    output_audio.append(np.zeros(int(SAMPLE_RATE * keep_pause), dtype=np.float32))
-                else:
-                    # Оставляем паузу как есть
-                    output_audio.append(audio_data[silence_start:i])
-            else:
-                # Это речь - копируем как есть
-                output_audio.append(chunk)
-                i += window_size
-                
-        return np.concatenate(output_audio) if output_audio else audio_data
+        # Векторизованный поиск тишины
+        windows = audio_data[:n_windows*window_size].reshape(-1, window_size)
+        is_silent = np.max(np.abs(windows), axis=1) < threshold
+        
+        # Находим границы пауз
+        silent_diff = np.diff(is_silent.astype(int))
+        starts = np.where(silent_diff == 1)[0] + 1
+        ends = np.where(silent_diff == -1)[0] + 1
+        
+        if is_silent[0]: starts = np.insert(starts, 0, 0)
+        if is_silent[-1]: ends = np.append(ends, n_windows)
+        
+        # Считаем длительность пауз в окнах
+        min_pause_windows = int(min_pause / 0.1)
+        keep_pause_samples = int(keep_pause * SAMPLE_RATE)
+        
+        output_chunks = []
+        last_idx = 0
+        
+        for s, e in zip(starts, ends):
+            if (e - s) > min_pause_windows:
+                # Добавляем звук до паузы
+                output_chunks.append(audio_data[last_idx * window_size : s * window_size])
+                # Добавляем сжатую тишину
+                output_chunks.append(np.zeros(keep_pause_samples, dtype=np.float32))
+                last_idx = e
+        
+        # Добавляем остаток
+        output_chunks.append(audio_data[last_idx * window_size:])
+        
+        return np.concatenate(output_chunks) if output_chunks else audio_data
     except Exception as e:
         print(f"[compress error] {e}")
         return audio_data
@@ -378,19 +620,20 @@ def create_audio_wav(audio_data):
                 audio_data = audio_data / max_v
             wf.writeframes((audio_data * 32767).astype(np.int16).tobytes())
         
-        # CEO Debug: Сохраняем последний чанк для анализа качества
-        try:
-            with open("debug_audio.wav", "wb") as f:
-                f.write(wav_io.getvalue())
-        except: pass
-            
+        if SAVE_DEBUG_AUDIO:
+            try:
+                with open("debug_audio.wav", "wb") as f:
+                    f.write(wav_io.getvalue())
+            except Exception:
+                pass
+
         return wav_io.getvalue()
     except Exception as e:
         print(f"[wav error] {e}")
         return None
 
 def transcribe_cloud_turbo(audio_data):
-    """Stage 1: Расшифровка через Groq (Whisper Large-v3) с мгновенным переключением."""
+    """Stage 1: Расшифровка через Groq (Whisper Large v3 Turbo) с мгновенным переключением."""
     global cloud_status
     
     if cloud_status["is_blocked"]:
@@ -414,14 +657,11 @@ def transcribe_cloud_turbo(audio_data):
         'Accept': 'application/json'
     }
 
-    # CEO Fix: Промпт теперь фокусируется на стиле, а не на словах-галлюциногенах.
-    context_prompt = "Это качественная расшифровка русской деловой речи на IT-тематику. Спикер говорит четко, обсуждает технические задачи и программирование."
-
     files = {'file': ('audio.wav', io.BytesIO(wav_data), 'audio/wav')}
     data = {
-        'model': 'whisper-large-v3',
+        'model': CLOUD_WHISPER_MODEL,
         'language': 'ru',
-        'prompt': context_prompt,
+        'prompt': ASR_CONTEXT_PROMPT,
         'temperature': 0.0,
         'response_format': 'verbose_json' # CEO Fix: Запрашиваем подробные данные для фильтрации
     }
@@ -438,11 +678,26 @@ def transcribe_cloud_turbo(audio_data):
             # CEO Fix: Фильтруем сегменты с низкой уверенностью (галлюцинации)
             segments = result.get('segments', [])
             valid_text = []
+            has_sentence_ending = False
             for seg in segments:
-                # Если вероятность отсутствия речи высокая (>0.6) и текст короткий - это мусор
-                if seg.get('no_speech_prob', 0) > 0.6 and len(seg.get('text', '').strip()) < 15:
+                seg_text = seg.get('text', '').strip()
+                if not seg_text:
                     continue
-                valid_text.append(seg.get('text', '').strip())
+                no_speech_prob = seg.get('no_speech_prob', 0.0)
+
+                # A) Короткий мусор на тишине.
+                if no_speech_prob > 0.6 and len(seg_text) < 15:
+                    print(f"[filter] skip short silent segment (p={no_speech_prob:.2f})")
+                    continue
+
+                # B) Подозрительный хвост после завершенной мысли.
+                if has_sentence_ending and no_speech_prob > 0.65:
+                    print(f"[filter] skip tail segment (p={no_speech_prob:.2f})")
+                    continue
+
+                valid_text.append(seg_text)
+                if re.search(r'[.!?…]\s*$', seg_text):
+                    has_sentence_ending = True
             
             return " ".join(valid_text) if valid_text else result.get('text', '')
         
@@ -477,17 +732,17 @@ def refine_text_llm(raw_text):
             {
                 "role": "system", 
                 "content": (
-                    "Ты - профессиональный стенографист. Твоя задача: восстановить текст так, как его произнес человек.\n"
-                    "ИНСТРУКЦИИ:\n"
-                    "1. Исправляй ТОЛЬКО технические ошибки распознавания (например, 'смотреющий' -> 'смотри еще').\n"
-                    "2. Удаляй галлюцинации ИИ (например, 'Спикер говорит', 'Голос за кадром', 'Продолжение следует').\n"
-                    "3. Сохраняй 100% смысла и порядка слов. Запрещено перефразировать или сокращать.\n"
-                    "4. Если фраза обрывается на предлоге или союзе, не ставь точку.\n"
-                    "5. Исправляй падежи и окончания, только если они явно ошибочны.\n"
-                    "Выдай ТОЛЬКО чистый текст."
+                    "Ты - эксперт-лингвист. Твоя цель: превратить сырой ASR-текст в безупречный.\n"
+                    "ПРАВИЛА:\n"
+                    "1. Исправляй фонетику (провайдеры, может, Экхарт Толле).\n"
+                    "2. СТРОГИЙ ЗАПРЕТ на выдумку фамилий и ассоциаций (если в ASR только 'Игорь', не пиши фамилию).\n"
+                    "3. НЕ добавляй контекст (не меняй 'вендинг' на 'бизнес').\n"
+                    "4. Восстанавливай падежи, окончания и пунктуацию, сохраняя авторский порядок слов.\n"
+                    "5. Если фраза обрывается - не дописывай.\n"
+                    "Выдай ТОЛЬКО чистый исправленный текст."
                 )
             },
-            {"role": "user", "content": f"Контекст: ...{context_tail}\nТекст для стенографии: {raw_text}"}
+            {"role": "user", "content": f"Контекст: ...{context_tail}\nСырой текст ASR: {raw_text}"}
         ],
         "temperature": 0.0
     }
@@ -512,6 +767,50 @@ def refine_text_llm(raw_text):
     except: pass
     return raw_text
 
+def _transcribe_local(chunk: np.ndarray) -> str:
+    """Локальный fallback — только когда cloud не дал пригодный текст."""
+    max_val = np.max(np.abs(chunk))
+    if max_val > 0.0001:
+        chunk = chunk / max_val * 0.99
+    segments, _ = model.transcribe(
+        chunk, language="ru",
+        beam_size=5, patience=1.0, repetition_penalty=1.2,
+        vad_filter=False, suppress_blank=True, without_timestamps=True,
+        condition_on_previous_text=False, initial_prompt=ASR_CONTEXT_PROMPT,
+    )
+    return " ".join(seg.text.strip() for seg in segments).strip()
+
+def _transcribe_one_chunk(chunk: np.ndarray, chunk_idx: int, n_chunks: int) -> tuple[int, str | None]:
+    """Cloud (+ BoH при галлюцинации) → local только при пустом/ошибке cloud."""
+    if n_chunks > 1:
+        print(f"[diamond] Сегмент {chunk_idx + 1}/{n_chunks} ({len(chunk) / SAMPLE_RATE:.1f}s)")
+
+    chunk_text = None
+    chunk_dur = len(chunk) / SAMPLE_RATE
+    use_cloud = CLOUD_ENABLED and not cloud_status.get("is_blocked")
+
+    if use_cloud:
+        raw_text = transcribe_cloud_turbo(chunk)
+        if raw_text:
+            lower = raw_text.lower()
+            if any(t in lower for t in HALLUCINATION_TRIGGERS):
+                cleaned = strip_asr_artifacts(raw_text)
+                if cleaned and (len(cleaned.split()) >= 3 or chunk_dur <= 5.0):
+                    print(f"[fast] Сегмент {chunk_idx + 1}: BoH вместо local fallback")
+                    chunk_text = cleaned
+                else:
+                    print(f"[guard] Сегмент {chunk_idx + 1}: cloud пуст после BoH → local")
+            elif len(raw_text.split()) < 3 and chunk_dur > 5.0:
+                print(f"[guard] Сегмент {chunk_idx + 1}: cloud слишком короткий → local")
+            else:
+                chunk_text = raw_text
+
+    if not chunk_text:
+        print(f"[local] Сегмент {chunk_idx + 1}: offline decode")
+        chunk_text = _transcribe_local(chunk) or None
+
+    return chunk_idx, chunk_text
+
 # ─── Транскрибация ────────────────────────────────────────────────────────────
 
 def process_audio(audio_snapshot: list, session_id: int):
@@ -522,16 +821,18 @@ def process_audio(audio_snapshot: list, session_id: int):
         dur = len(audio) / SAMPLE_RATE
         if dur < 0.5: return
 
+        schedule_eval_sample_collect(audio, dur, session_id)
+
         print(f"[rec] {dur:.1f}s → распознаю...")
         t_start = time.time()
 
         # CEO Diamond: Умное дробление длинных записей (Chunking)
-        # Если запись длиннее 35 секунд, режем её на куски по 25-30 секунд по паузам
+        # Если запись длиннее 30 секунд, режем её на куски по 20 секунд по паузам
         audio_chunks = []
-        if dur > 35.0:
+        if dur > 30.0:
             print(f"[diamond] Длинная запись ({dur:.1f}s). Включаю умное дробление...")
             current_pos = 0
-            chunk_size_samples = int(SAMPLE_RATE * 30) # Базовый кусок 30 сек
+            chunk_size_samples = int(SAMPLE_RATE * 20) # CEO Fix: Снижаем до 20 сек для стабильности
             
             while current_pos < len(audio):
                 end_pos = min(current_pos + chunk_size_samples, len(audio))
@@ -540,8 +841,8 @@ def process_audio(audio_snapshot: list, session_id: int):
                 if end_pos < len(audio):
                     # Ищем тишину в окне +/- 3 секунды от точки разреза
                     search_window = int(SAMPLE_RATE * 3)
-                    search_start = max(end_pos - search_window, current_pos + int(SAMPLE_RATE * 10))
-                    search_end = min(end_pos + search_window, len(audio) - int(SAMPLE_RATE * 2))
+                    search_start = max(end_pos - search_window, current_pos + int(SAMPLE_RATE * 5))
+                    search_end = min(end_pos + search_window, len(audio) - int(SAMPLE_RATE * 1))
                     
                     sub_audio = audio[search_start:search_end]
                     if len(sub_audio) > SAMPLE_RATE:
@@ -557,71 +858,79 @@ def process_audio(audio_snapshot: list, session_id: int):
         else:
             audio_chunks = [audio]
 
-        final_segments = []
-        for idx, chunk in enumerate(audio_chunks):
-            if len(audio_chunks) > 1:
-                print(f"[diamond] Обработка сегмента {idx+1}/{len(audio_chunks)} ({len(chunk)/SAMPLE_RATE:.1f}s)")
-            
-            chunk_text = None
-            
-            # Пытаемся использовать Cloud Turbo
-            if CLOUD_ENABLED:
-                raw_text = transcribe_cloud_turbo(chunk)
-                if raw_text:
-                    # CEO Guard: Если облако выдало галлюцинацию или слишком коротко
-                    if len(raw_text.split()) < 3 and (len(chunk)/SAMPLE_RATE) > 5.0:
-                        print(f"[guard] Сегмент {idx+1}: Cloud output suspicious. Fallback to Local.")
-                    else:
-                        chunk_text = raw_text
+        n_chunks = len(audio_chunks)
+        t_asr_start = time.time()
+        ordered_parts: list[str | None] = [None] * n_chunks
 
-            # Если облако не сработало или выдало брак - используем локальную модель
-            if not chunk_text:
-                # CEO Quality: Максимальное усиление
-                max_val = np.max(np.abs(chunk))
-                if max_val > 0.0001: chunk = chunk / max_val * 0.99
-                
-                context_prompt = "Это безупречная расшифровка русской деловой речи. Спикер обсуждает технические процессы."
-                
-                segments, _ = model.transcribe(
-                    chunk, language="ru", 
-                    beam_size=10, patience=2.0, repetition_penalty=1.2,
-                    vad_filter=False, suppress_blank=True, without_timestamps=True,
-                    condition_on_previous_text=False, initial_prompt=context_prompt
-                )
-                chunk_text = " ".join(seg.text.strip() for seg in segments).strip()
-            
-            if chunk_text:
-                final_segments.append(chunk_text)
+        parallel_ok = (
+            PARALLEL_CLOUD_CHUNKS
+            and n_chunks > 1
+            and CLOUD_ENABLED
+            and not cloud_status.get("is_blocked")
+        )
+
+        if parallel_ok:
+            print(f"[fast] Параллельный cloud: {n_chunks} сегментов, workers={MAX_CLOUD_WORKERS}")
+            with ThreadPoolExecutor(max_workers=MAX_CLOUD_WORKERS) as pool:
+                futures = [
+                    pool.submit(_transcribe_one_chunk, chunk, idx, n_chunks)
+                    for idx, chunk in enumerate(audio_chunks)
+                ]
+                for fut in as_completed(futures):
+                    idx, chunk_text = fut.result()
+                    if chunk_text:
+                        ordered_parts[idx] = chunk_text
+        else:
+            for idx, chunk in enumerate(audio_chunks):
+                _, chunk_text = _transcribe_one_chunk(chunk, idx, n_chunks)
+                if chunk_text:
+                    ordered_parts[idx] = chunk_text
+
+        final_segments = [p for p in ordered_parts if p]
+        t_asr_done = time.time()
 
         full_raw_text = " ".join(final_segments).strip()
         if not full_raw_text:
+            finalize_eval_sample_meta(session_id, dur, "", "")
             print("[skip] Пустой результат")
             notify("WhisperKey", "Речь не распознана")
             return
 
         print(f"[raw whisper] '{full_raw_text}'")
-        print("[mode] Neural Refinement (Llama-3.1-70B)")
-        text = refine_text_llm(full_raw_text)
+
+        t_llm_start = time.time()
+        if should_skip_llm(full_raw_text):
+            print(f"[fast] Llama skip ({len(full_raw_text.split())} слов, чистый raw)")
+            text = full_raw_text
+        else:
+            print("[mode] Neural Refinement (Llama-3.1-70B)")
+            text = refine_text_llm(full_raw_text)
+        t_llm_done = time.time()
 
         elapsed = time.time() - t_start
-        print(f"[time] {elapsed:.1f}s ({elapsed/dur*100:.0f}% от длины)")
+        asr_sec = t_asr_done - t_asr_start
+        llm_sec = t_llm_done - t_llm_start
+        print(
+            f"[time] total={elapsed:.1f}s | asr={asr_sec:.1f}s | llama={llm_sec:.1f}s "
+            f"({elapsed / dur * 100:.0f}% от длины записи)"
+        )
         
         text = clean_noise(text)
         text = smart_grammar_fix(text)
 
         if text and len(text) > 1:
-            if text[0].islower(): text = text[0].upper() + text[1:]
-            if text[-1] not in '.!?…': text += '.'
-            
+            text = apply_smart_sentence_ending(text)
+
             # CEO Fix: Всегда выводим финальный результат в консоль для ручного копирования
             print(f"\n--- ФИНАЛЬНЫЙ ТЕКСТ ---\n{text}\n-----------------------\n")
             
             # CEO Fix: Возвращаем контекст (40 символов) для идеальных окончаний
             last_text_context = text[-40:]
             direct_insert(text + " ")
-            # CEO Fix: Возвращаем уведомление о готовности текста
+            finalize_eval_sample_meta(session_id, dur, full_raw_text, text)
             notify("WhisperKey ✓", "Текст готов")
         else:
+            finalize_eval_sample_meta(session_id, dur, full_raw_text, "")
             print("[skip] Пустой результат")
             notify("WhisperKey", "Речь не распознана")
     except Exception as e:
@@ -661,6 +970,14 @@ def on_press(key):
                 is_recording = True
                 recording_data = []
                 print("[rec] Начата (микрофон включен)")
+                
+                # CEO Speed: Пре-ворминг соединения с Groq во время записи
+                if USE_CLOUD:
+                    def warm_groq():
+                        try: http_session.options("https://api.groq.com/openai/v1/audio/transcriptions", timeout=1.0)
+                        except: pass
+                    threading.Thread(target=warm_groq, daemon=True).start()
+                    
             except Exception as e:
                 print(f"[audio error] {e}")
                 is_recording = False
@@ -682,12 +999,12 @@ def on_release(key):
             global is_recording
             is_recording = False 
             stop_audio_stream() # CEO Fix: Выключаем микрофон
-            notify("WhisperKey", "⏹ Запись остановлена, распознаю...")
             
             # После полной остановки и захвата хвоста - запускаем обработку
             audio_snapshot = list(recording_data)
-            if len(audio_snapshot) < 5:
+            if len(audio_snapshot) < 10: # CEO Fix: Чуть увеличили порог для стабильности
                 print("[skip] Слишком коротко")
+                notify("WhisperKey", "⚠️ Слишком короткая запись")
                 global processing
                 processing = False
                 with state_lock:
@@ -695,6 +1012,7 @@ def on_release(key):
                         session_phase = "idle"
                 return
             
+            notify("WhisperKey", "⏹ Распознаю...")
             print(f"[rec] Остановлена (хвост захвачен)")
             threading.Thread(target=process_audio, args=(audio_snapshot, current_session_id), daemon=True).start()
 
@@ -715,7 +1033,7 @@ def main():
         if hasattr(p, 'cpu_affinity'): p.cpu_affinity([0, 1])
     except: pass
 
-    print(f"WhisperKey v18.0 CEO PRECISION | Warm-up Engine...")
+    print(f"WhisperKey v23.0 Auto-Eval | {CLOUD_WHISPER_MODEL} | Ready.")
     try:
         model = WhisperModel(MODEL_PATH, device="cpu", compute_type="int8", cpu_threads=2, local_files_only=False)
         print("Разогрев локальной модели...")
@@ -729,6 +1047,7 @@ def main():
             threading.Thread(target=warm_network, daemon=True).start()
             
         print("Система готова.")
+        init_eval_samples_library()
     except Exception as e:
         print(f"[FATAL] {e}")
         return
