@@ -89,11 +89,19 @@ EVAL_BUCKETS = {
 }
 
 # API Настройки (Groq Cloud)
-# 1) Export key in shell: export GROQ_API_KEY="gsk_..."
-# 2) Fallback to hardcoded value below (if you prefer).
 load_env_file(".env")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip() or "YOUR_GROQ_API_KEY_HERE"
-USE_CLOUD = bool(GROQ_API_KEY and GROQ_API_KEY != "YOUR_GROQ_API_KEY_HERE")
+
+if GROQ_API_KEY == "YOUR_GROQ_API_KEY_HERE" or not GROQ_API_KEY:
+    print("\n" + "!"*60)
+    print(" ОШИБКА: API КЛЮЧ НЕ НАЙДЕН")
+    print(" Пожалуйста, создайте файл .env и добавьте туда GROQ_API_KEY")
+    print(" Инструкция в README.md")
+    print("!"*60 + "\n")
+    USE_CLOUD = False
+else:
+    USE_CLOUD = True
+
 CLOUD_ENABLED = USE_CLOUD
 
 # Создаем глобальную сессию для Keep-Alive

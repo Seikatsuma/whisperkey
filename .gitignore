@@ -4,5 +4,7 @@ __pycache__/
 .cache/
 whisper_small_manual/
 *.mp3
-*.wav
 .env
+*.wav
+WhisperKey-Eval-Samples/
+whisperkey.lock

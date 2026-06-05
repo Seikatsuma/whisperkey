@@ -18,30 +18,39 @@
 ### 1. Подготовка окружения
 Убедитесь, что у вас установлен **Python 3.10** или выше.
 
-#### Для macOS:
+#### Рекомендуется использовать виртуальное окружение:
 ```bash
-# Установите системные зависимости
-brew install portaudio
+# Создание окружения
+python -m venv venv
+
+# Активация (macOS/Linux):
+source venv/bin/activate
+
+# Активация (Windows):
+venv\Scripts\activate
 ```
 
-#### Для Windows:
-Скачайте и установите Python с сайта [python.org](https://www.python.org/). При установке обязательно поставьте галочку **"Add Python to PATH"**.
-
-### 2. Клонирование и установка зависимостей
+### 2. Установка зависимостей
 ```bash
-git clone https://github.com/Seikatsuma/whisperkey.git
-cd whisperkey
+# Обновите pip и установите пакеты
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
+**Для macOS:** также необходимо установить системную библиотеку для работы со звуком:
+```bash
+brew install portaudio
+```
+
 ### 3. Настройка API (Groq)
-Для работы "Turbo" режима необходим бесплатный (или платный) ключ API от Groq.
+Для работы "Turbo" режима необходим API ключ от Groq.
 1. Перейдите на [Groq Cloud Console](https://console.groq.com/keys).
 2. Создайте новый API Key.
-3. В папке проекта создайте файл `.env` и добавьте туда ваш ключ:
-   ```env
-   GROQ_API_KEY=gsk_ваша_комбинация_символов
+3. Скопируйте файл `.env.example` в новый файл `.env`:
+   ```bash
+   cp .env.example .env
    ```
+4. Откройте `.env` и вставьте ваш ключ в поле `GROQ_API_KEY`.
 
 ### 4. Настройка прав (macOS)
 Для того чтобы программа могла вставлять текст, нужно дать права **Accessibility** (Универсальный доступ) вашему терминалу или IDE (Cursor/VS Code):
@@ -51,9 +60,9 @@ pip install -r requirements.txt
 
 ## ⌨️ Как пользоваться
 
-### Запуск
-- **macOS:** Запустите файл `Запустить WhisperKey.command` (или через терминал `python3 whisperkey.py`).
-- **Windows:** Запустите `python whisperkey.py` в командной строке.
+### Запуск (в один клик)
+- **macOS:** Запустите файл `Запустить WhisperKey.command`.
+- **Windows:** Запустите файл `run_whisperkey.bat`.
 
 ### Управление
 1. **Зажмите ПРАВЫЙ OPTION (ALT):** Начнется запись (вы увидите уведомление).
