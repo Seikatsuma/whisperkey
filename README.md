@@ -63,7 +63,7 @@ brew install portaudio
 ## ⌨️ Как пользоваться
 
 ### Запуск (в один клик)
-- **macOS:** Запустите файл `Запустить WhisperKey.command`. Он автоматически использует `whisperkey_mac.py`.
+- **macOS:** Запустите файл `Запустить WhisperKey.command`. Он автоматически использует `whisperkey.py`.
 - **Windows:** Запустите файл `run_whisperkey.bat`. Он автоматически использует `whisperkey_win.py`.
 
 ### Управление

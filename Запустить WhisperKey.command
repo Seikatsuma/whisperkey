@@ -1,5 +1,5 @@
 #!/bin/bash
-cd "$(dirname "$0")" || exit 1
+cd "/Users/alexnbox/Desktop/Курсор/Whisper на MAC" || exit 1
 export KMP_DUPLICATE_LIB_OK=TRUE
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -17,4 +17,4 @@ if [ -z "$PY" ]; then
   exit 1
 fi
 echo "Python: $($PY --version)"
-exec "$PY" whisperkey_mac.py
+exec "$PY" whisperkey.py
