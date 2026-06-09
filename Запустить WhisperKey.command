@@ -17,4 +17,4 @@ if [ -z "$PY" ]; then
   exit 1
 fi
 echo "Python: $($PY --version)"
-exec "$PY" whisperkey.py
+exec "$PY" whisperkey_mac.py

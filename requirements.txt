@@ -5,3 +5,4 @@ faster-whisper
 pynput
 psutil
 python-dotenv
+pyperclip

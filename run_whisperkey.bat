@@ -18,7 +18,7 @@ if not exist .env (
 )
 
 :: Run the script
-python whisperkey.py
+python whisperkey_win.py
 if %errorlevel% neq 0 (
     echo.
     echo WhisperKey stopped with an error.
