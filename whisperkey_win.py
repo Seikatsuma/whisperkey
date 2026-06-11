@@ -425,17 +425,24 @@ def transcribe_cloud_turbo(audio_data):
 def refine_text_llm(raw_text):
     if not raw_text or len(raw_text) < 5: return raw_text
     context_tail = last_text_context[-40:] if last_text_context else ""
-    headers = {'Authorization': f'Bearer {GROQ_API_KEY}', 'Content-Type': 'application/json'}
+    headers = {
+        'Authorization': f'Bearer {GROQ_API_KEY}',
+        'Content-Type': 'application/json',
+    }
     payload = {
         "model": "llama-3.1-70b-versatile",
         "messages": [
             {
-                "role": "system", 
+                "role": "system",
                 "content": (
                     "Ты - эксперт-лингвист. Твоя цель: превратить сырой ASR-текст в безупречный.\n"
-                    "ПРАВИЛА:\n1. Исправляй фонетику.\n2. СТРОГИЙ ЗАПРЕТ на выдумку фамилий.\n"
-                    "3. НЕ добавляй контекст.\n4. Восстанавливай падежи и пунктуацию.\n"
-                    "5. Если фраза обрывается - не дописывай.\nВыдай ТОЛЬКО чистый текст."
+                    "ПРАВИЛА:\n"
+                    "1. Исправляй фонетику (провайдеры, может, Экхарт Толле).\n"
+                    "2. СТРОГИЙ ЗАПРЕТ на выдумку фамилий и ассоциаций (если в ASR только 'Игорь', не пиши фамилию).\n"
+                    "3. НЕ добавляй контекст (не меняй 'вендинг' на 'бизнес').\n"
+                    "4. Восстанавливай падежи, окончания и пунктуацию, сохраняя авторский порядок слов.\n"
+                    "5. Если фраза обрывается - не дописывай.\n"
+                    "Выдай ТОЛЬКО чистый исправленный текст."
                 )
             },
             {"role": "user", "content": f"Контекст: ...{context_tail}\nСырой текст ASR: {raw_text}"}
@@ -443,20 +450,30 @@ def refine_text_llm(raw_text):
         "temperature": 0.0
     }
     try:
-        response = http_session.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=10)
+        response = http_session.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers, json=payload, timeout=10
+        )
         if response.status_code == 200:
             refined = response.json()['choices'][0]['message']['content'].strip()
             words_raw = len(raw_text.split())
             words_refined = len(refined.split())
             if words_refined >= words_raw - 1 and words_refined >= words_raw * 0.9:
                 return refined.strip('"')
+            print(f"[warn] LLM word count guard failed ({words_refined} vs {words_raw}). Using raw text.")
     except: pass
     return raw_text
 
 def _transcribe_local(chunk: np.ndarray) -> str:
     max_val = np.max(np.abs(chunk))
-    if max_val > 0.0001: chunk = chunk / max_val * 0.99
-    segments, _ = model.transcribe(chunk, language="ru", beam_size=5, initial_prompt=ASR_CONTEXT_PROMPT)
+    if max_val > 0.0001:
+        chunk = chunk / max_val * 0.99
+    segments, _ = model.transcribe(
+        chunk, language="ru",
+        beam_size=5, patience=1.0, repetition_penalty=1.2,
+        vad_filter=False, suppress_blank=True, without_timestamps=True,
+        condition_on_previous_text=False, initial_prompt=ASR_CONTEXT_PROMPT,
+    )
     return " ".join(seg.text.strip() for seg in segments).strip()
 
 def _transcribe_one_chunk(chunk: np.ndarray, chunk_idx: int, n_chunks: int) -> tuple[int, str | None]:
@@ -541,7 +558,13 @@ def process_audio(audio_snapshot: list, session_id: int):
             if active_session_id == session_id: session_phase = "idle"
 
 def is_trigger(key):
-    if key == keyboard.Key.alt_r: return True
+    if key == keyboard.Key.alt_r:
+        return True
+    try:
+        if hasattr(key, 'vk') and key.vk in (165, 61):  # Right Alt / AltGr on Windows
+            return True
+    except:
+        pass
     return False
 
 def on_press(key):
@@ -597,16 +620,23 @@ def on_release(key):
         threading.Thread(target=delayed_stop, daemon=True).start()
 
 def create_desktop_launcher():
+    """Создаёт на Рабочем столе .bat, который всегда запускает проект из правильной папки."""
     try:
         desktop = os.path.expanduser("~/Desktop")
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        launcher_name = "WhisperKey.bat"
-        target_path = os.path.join(desktop, launcher_name)
-        source_path = os.path.join(current_dir, "run_whisperkey.bat")
-        if not os.path.exists(target_path) and os.path.exists(source_path):
-            import shutil
-            shutil.copy2(source_path, target_path)
-    except: pass
+        target_path = os.path.join(desktop, "WhisperKey.bat")
+        if os.path.exists(target_path):
+            return
+        launcher_body = f'''@echo off
+title WhisperKey
+cd /d "{current_dir}"
+call run_whisperkey.bat
+'''
+        with open(target_path, "w", encoding="utf-8") as f:
+            f.write(launcher_body)
+        print(f"[setup] Ярлык на Рабочем столе: {target_path}")
+    except Exception as e:
+        print(f"[setup] Не удалось создать ярлык: {e}")
 
 def main():
     global model
@@ -625,9 +655,18 @@ def main():
         p.nice(psutil.HIGH_PRIORITY_CLASS)
     except: pass
     try:
-        print("Загрузка локальной модели...")
+        print("Загрузка локальной модели (при первом offline-запуске ~500 МБ, подождите)...")
         model = WhisperModel(MODEL_PATH, device="cpu", compute_type="int8", cpu_threads=2)
-        print("Система готова. Зажми ПРАВЫЙ ALT для записи.")
+        print("Разогрев локальной модели...")
+        model.transcribe(np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32), language="ru", beam_size=1)
+        if USE_CLOUD:
+            print("Разогрев облачного соединения...")
+            def warm_network():
+                try: http_session.head("https://api.groq.com", timeout=2.0)
+                except: pass
+            threading.Thread(target=warm_network, daemon=True).start()
+        print("Система готова. Зажми ПРАВЫЙ ALT (AltGr) для записи.")
+        print("Подсказка: если запись не начинается — запустите .bat от имени администратора.")
         with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
             listener.join()
     except Exception as e:

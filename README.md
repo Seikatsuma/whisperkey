@@ -1,83 +1,125 @@
 # 🎙️ WhisperKey v23.5 "Flawless"
 
-**WhisperKey** — это профессиональный инструмент для мгновенной голосовой транскрибации текста прямо в активное окно. Система использует комбинацию облачного интеллекта (Groq Whisper Large v3) и локального fallback-режима, обеспечивая безупречное качество и скорость.
+**WhisperKey** — мгновенная голосовая транскрибация текста прямо в активное окно. Облако (Groq Whisper Large v3 + Llama 3.1 70B) + оффлайн fallback.
 
 ---
 
 ## 🚀 Основные возможности
-- **Dual-Stage Pipeline:** Сначала работает облачный Whisper Large v3 (Turbo), затем Llama 3.1 70B исправляет грамматику и пунктуацию.
-- **Zero Hallucinations:** Строгие инструкции запрещают ИИ выдумывать фамилии или контекст.
-- **Smart Chunking:** Автоматическое дробление длинных записей (30с+) с поиском пауз.
-- **Numpy Optimized:** Мгновенная обработка аудио на уровне процессора.
-- **Cross-Platform:** Поддержка macOS (Intel/Apple Silicon) и Windows.
+- **Dual-Stage Pipeline:** Whisper Large v3 → Llama 3.1 70B (грамматика и пунктуация).
+- **Zero Hallucinations:** Strict Prompt — запрет на выдумку имён и контекста.
+- **Smart Chunking:** Дробление записей 30с+ по паузам.
+- **Cross-Platform:** macOS (`whisperkey.py`) и Windows (`whisperkey_win.py`).
 
 ---
 
-## 🛠 Установка и настройка
+## 🍎 macOS — установка
 
-### 1. Подготовка окружения
-Убедитесь, что у вас установлен **Python 3.10** или выше.
-
-#### Рекомендуется использовать виртуальное окружение:
+### 1. Python 3.10+
 ```bash
-# Создание окружения
+brew install portaudio   # только Mac
 python -m venv venv
-
-# Активация (macOS/Linux):
 source venv/bin/activate
-
-# Активация (Windows):
-venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-### 2. Установка зависимостей
+### 2. API ключ
 ```bash
-# Обновите pip и установите пакеты
+cp .env.example .env
+# Вставьте GROQ_API_KEY в .env
+```
+
+### 3. Права
+**Системные настройки → Конфиденциальность → Универсальный доступ** — разрешите Terminal или Cursor.
+
+### 4. Запуск
+Дважды кликните `Запустить WhisperKey.command` или:
+```bash
+python whisperkey.py
+```
+
+---
+
+## 🪟 Windows — установка (пошагово)
+
+### Шаг 1. Python
+1. Скачайте Python с [python.org](https://www.python.org/downloads/).
+2. При установке **обязательно** поставьте галочку **"Add Python to PATH"**.
+
+### Шаг 2. Скачать проект
+```cmd
+git clone https://github.com/Seikatsuma/whisperkey.git
+cd whisperkey
+```
+
+Или откройте папку в **Cursor / Claude Code** и попросите: *«Установи WhisperKey для Windows по README»*.
+
+### Шаг 3. Зависимости
+```cmd
+python -m venv venv
+venv\Scripts\activate
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-**Для macOS:** также необходимо установить системную библиотеку для работы со звуком:
-```bash
-brew install portaudio
+### Шаг 4. API ключ
+```cmd
+copy .env.example .env
+```
+Откройте `.env` блокнотом и вставьте ключ с [Groq Console](https://console.groq.com/keys):
+```env
+GROQ_API_KEY=gsk_ваш_ключ
 ```
 
-### 3. Настройка API (Groq)
-Для работы "Turbo" режима необходим API ключ от Groq.
-1. Перейдите на [Groq Cloud Console](https://console.groq.com/keys).
-2. Создайте новый API Key.
-3. Скопируйте файл `.env.example` в новый файл `.env`:
-   ```bash
-   cp .env.example .env
-   ```
-4. Откройте `.env` и вставьте ваш ключ в поле `GROQ_API_KEY`.
+> **VPN:** В некоторых регионах Groq недоступен без VPN. Без VPN работает **offline-режим** (медленнее, без Llama-корректора).
 
-> **Важно:** Облачный API Groq может быть недоступен в некоторых регионах напрямую. Если соединение заблокировано, программа автоматически перейдет в **Offline-режим** (локальное распознавание). Для использования всех преимуществ "Turbo" режима (максимальная скорость и ИИ-корректор) рекомендуется использовать VPN.
+### Шаг 5. Запуск
+**Важно:** запускайте из папки проекта!
 
-### 4. Настройка прав (macOS)
-Для того чтобы программа могла вставлять текст, нужно дать права **Accessibility** (Универсальный доступ) вашему терминалу или IDE (Cursor/VS Code):
-`Системные настройки -> Конфиденциальность и безопасность -> Универсальный доступ`.
+```cmd
+run_whisperkey.bat
+```
 
----
+При первом успешном запуске на Рабочем столе появится ярлык `WhisperKey.bat` — он уже знает путь к проекту.
 
-## ⌨️ Как пользоваться
+### Шаг 6. Если не работает
+| Проблема | Решение |
+|----------|---------|
+| `Python not found` | Переустановите Python с галочкой PATH |
+| `ModuleNotFoundError` | `venv\Scripts\activate` → `pip install -r requirements.txt` |
+| Запись не начинается | Зажимайте **правый Alt** (AltGr). Нет клавиши — напишите автору |
+| Текст не вставляется | ПКМ по `run_whisperkey.bat` → **Запуск от имени администратора** |
+| Очень медленно | Создайте `.env` с ключом + включите VPN |
+| Долго «висит» при старте | Первый offline-запуск качает ~500 МБ модели — подождите |
 
-### Запуск (в один клик)
-- **macOS:** Запустите файл `Запустить WhisperKey.command`. Он автоматически использует `whisperkey.py`.
-- **Windows:** Запустите файл `run_whisperkey.bat`. Он автоматически использует `whisperkey_win.py`.
-
-### Управление
-1. **Зажмите ПРАВЫЙ OPTION (ALT):** Начнется запись (вы увидите уведомление).
-2. **Говорите:** Система поддерживает русский и английский языки.
-3. **Отпустите клавишу:** Система захватит "хвост" речи, обработает её и мгновенно вставит текст в то место, где стоит курсор.
+**Не закрывайте чёрное окно** — пока оно открыто, WhisperKey работает.
 
 ---
 
-## 💎 Советы для AI-ассистентов (Cursor / Windsurf)
-Если вы помогаете пользователю установить этот проект, выполните следующие шаги:
-1. **Desktop Setup:** ОБЯЗАТЕЛЬНО предложите пользователю запустить программу. Сообщите ему, что программа автоматически создала ярлык на Рабочем столе для удобного запуска в будущем.
-2. **Sleep Mode Warning:** Предупредите пользователя, что если ноутбук уходил в сон или закрывалась крышка, программу может потребоваться перезапустить (просто закрыть окно терминала и открыть заново через ярлык).
-3. **Architecture Guard:** Это Dual-Stage пайплайн с Large-v3 и Llama 3.1. Сохраняй Skip=0 и Strict Prompt для предотвращения галлюцинаций.
+## ⌨️ Управление (Mac и Windows)
+
+1. **Зажмите ПРАВЫЙ ALT (Option / AltGr)**
+2. **Говорите**
+3. **Отпустите** — текст вставится там, где стоит курсор
 
 ---
-*Разработано Егором Нищуком (Telegram: [@Seikatsuma](https://t.me/Seikatsuma)) для максимальной продуктивности.*
+
+## 💎 Инструкция для AI-ассистентов (Cursor / Claude Code)
+
+### macOS
+1. `brew install portaudio` → `pip install -r requirements.txt`
+2. `cp .env.example .env` → ключ Groq
+3. Права **Accessibility** для Terminal/Cursor
+4. Запуск: `python whisperkey.py` или `Запустить WhisperKey.command`
+
+### Windows
+1. Проверь Python в PATH: `python --version`
+2. `python -m venv venv` → `venv\Scripts\activate` → `pip install -r requirements.txt`
+3. **`copy .env.example .env`** (не `cp`!)
+4. Запуск **только** через `run_whisperkey.bat` из папки проекта
+5. Если вставка не работает — предложи **Запуск от имени администратора**
+6. Предупреди про VPN для Groq и про правый Alt / AltGr
+7. **Architecture Guard:** Large-v3 + Llama 3.1, Skip=0, Strict Prompt — не упрощать
+
+---
+
+*Разработано Егором Нищуком (Telegram: [@Seikatsuma](https://t.me/Seikatsuma))*
