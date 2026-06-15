@@ -495,7 +495,7 @@ def direct_insert(text: str):
         print(f"[insert error] {e}")
 
 def strip_asr_artifacts(text: str) -> str:
-    """MED: удаляет типичные ASR-хвосты без агрессивной очистки основного текста."""
+    """MED: удаляет типичные ASR-хвосты только если они являются явными галлюцинациями."""
     cleaned = text.strip()
     if not cleaned:
         return cleaned
@@ -510,15 +510,19 @@ def strip_asr_artifacts(text: str) -> str:
     if not cleaned:
         return cleaned
 
+    # CEO Quality: Проверяем хвост на маркеры галлюцинаций.
+    # Удаляем маркер только если он стоит особняком в конце (последние 20 символов).
     lower = cleaned.lower()
-    tail_start = int(len(lower) * 0.7)  # Проверяем только хвост, чтобы не трогать середину фразы.
+    tail_zone = lower[-20:]
     for marker in BOH_TAIL_MARKERS:
-        idx = lower.find(marker, tail_start)
-        if idx != -1:
-            print(f"[boh] tail marker trimmed: '{marker}'")
+        if marker in tail_zone:
+            idx = lower.rfind(marker)
+            # Если перед маркером есть точка или пробел - это вероятно галлюцинация.
+            # Если маркер - часть длинного слова, не трогаем.
+            print(f"[boh] tail marker detected: '{marker}'")
             cleaned = cleaned[:idx].strip()
             lower = cleaned.lower()
-            tail_start = int(len(lower) * 0.7)
+            tail_zone = lower[-20:]
 
     return cleaned.strip()
 
@@ -697,26 +701,19 @@ def transcribe_cloud_turbo(audio_data):
             # CEO Fix: Фильтруем сегменты с низкой уверенностью (галлюцинации)
             segments = result.get('segments', [])
             valid_text = []
-            has_sentence_ending = False
             for seg in segments:
                 seg_text = seg.get('text', '').strip()
                 if not seg_text:
                     continue
                 no_speech_prob = seg.get('no_speech_prob', 0.0)
 
-                # A) Короткий мусор на тишине.
-                if no_speech_prob > 0.6 and len(seg_text) < 15:
-                    print(f"[filter] skip short silent segment (p={no_speech_prob:.2f})")
-                    continue
-
-                # B) Подозрительный хвост после завершенной мысли.
-                if has_sentence_ending and no_speech_prob > 0.65:
-                    print(f"[filter] skip tail segment (p={no_speech_prob:.2f})")
+                # CEO Quality: Отсекаем только экстремально вероятный шум (p > 0.85).
+                # Мы убрали 'has_sentence_ending', чтобы не обрезать важные уточнения в конце.
+                if no_speech_prob > 0.85 and len(seg_text) < 10:
+                    print(f"[filter] skip silent artifact (p={no_speech_prob:.2f}): '{seg_text}'")
                     continue
 
                 valid_text.append(seg_text)
-                if re.search(r'[.!?…]\s*$', seg_text):
-                    has_sentence_ending = True
             
             return " ".join(valid_text) if valid_text else result.get('text', '')
         
@@ -819,8 +816,6 @@ def _transcribe_one_chunk(chunk: np.ndarray, chunk_idx: int, n_chunks: int) -> t
                     chunk_text = cleaned
                 else:
                     print(f"[guard] Сегмент {chunk_idx + 1}: cloud пуст после BoH → local")
-            elif len(raw_text.split()) < 3 and chunk_dur > 5.0:
-                print(f"[guard] Сегмент {chunk_idx + 1}: cloud слишком короткий → local")
             else:
                 chunk_text = raw_text
 

@@ -282,14 +282,16 @@ def strip_asr_artifacts(text: str) -> str:
         cut_pos = loop_matches[0].start()
         cleaned = cleaned[:cut_pos].strip()
     if not cleaned: return cleaned
+    
+    # CEO Quality: Проверяем хвост на маркеры галлюцинаций.
     lower = cleaned.lower()
-    tail_start = int(len(lower) * 0.7)
+    tail_zone = lower[-20:]
     for marker in BOH_TAIL_MARKERS:
-        idx = lower.find(marker, tail_start)
-        if idx != -1:
+        if marker in tail_zone:
+            idx = lower.rfind(marker)
             cleaned = cleaned[:idx].strip()
             lower = cleaned.lower()
-            tail_start = int(len(lower) * 0.7)
+            tail_zone = lower[-20:]
     return cleaned.strip()
 
 def should_skip_llm(raw_text: str) -> bool:
@@ -402,17 +404,18 @@ def transcribe_cloud_turbo(audio_data):
         response = http_session.post("https://api.groq.com/openai/v1/audio/transcriptions", headers=headers, files=files, data=data, timeout=15)
         if response.status_code == 200:
             result = response.json()
+            # CEO Fix: Фильтруем сегменты с низкой уверенностью (галлюцинации)
             segments = result.get('segments', [])
             valid_text = []
-            has_sentence_ending = False
             for seg in segments:
                 seg_text = seg.get('text', '').strip()
                 if not seg_text: continue
                 no_speech_prob = seg.get('no_speech_prob', 0.0)
-                if no_speech_prob > 0.6 and len(seg_text) < 15: continue
-                if has_sentence_ending and no_speech_prob > 0.65: continue
+
+                # CEO Quality: Отсекаем только экстремально вероятный шум (p > 0.85).
+                if no_speech_prob > 0.85 and len(seg_text) < 10: continue
+
                 valid_text.append(seg_text)
-                if re.search(r'[.!?…]\s*$', seg_text): has_sentence_ending = True
             return " ".join(valid_text) if valid_text else result.get('text', '')
         if response.status_code == 403:
             cloud_status["is_blocked"] = True
@@ -487,7 +490,6 @@ def _transcribe_one_chunk(chunk: np.ndarray, chunk_idx: int, n_chunks: int) -> t
             if any(t in lower for t in HALLUCINATION_TRIGGERS):
                 cleaned = strip_asr_artifacts(raw_text)
                 if cleaned and (len(cleaned.split()) >= 3 or chunk_dur <= 5.0): chunk_text = cleaned
-            elif len(raw_text.split()) < 3 and chunk_dur > 5.0: pass
             else: chunk_text = raw_text
     if not chunk_text:
         print(f"[local] Сегмент {chunk_idx + 1}: offline decode")
