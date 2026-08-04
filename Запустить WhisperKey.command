@@ -1,5 +1,12 @@
 #!/bin/bash
-cd "/Users/alexnbox/Desktop/Курсор/Whisper на MAC" || exit 1
+# Переходим в папку, где лежит сам скрипт
+cd "$(dirname "$0")" || exit 1
+
+# Если мы не в той папке (например, скрипт скопирован на рабочий стол), 
+# пробуем перейти по абсолютному пути
+if [ ! -f "whisperkey.py" ]; then
+  cd "/Users/alexnbox/Desktop/Проэкты 📈/Рабочие проэкты 🏛️/Whisper на MAC" || exit 1
+fi
 export KMP_DUPLICATE_LIB_OK=TRUE
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
