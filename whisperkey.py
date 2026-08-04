@@ -500,13 +500,19 @@ def notify(title: str, message: str):
     threading.Thread(target=run_notify, daemon=True).start()
 
 def smart_grammar_fix(text: str) -> str:
-    """CEO Quality: Исправление типичных ошибок и окончаний."""
-    if not text: return text
-    text = re.sub(r"(\w+)ться", r"\1ться", text)
-    text = re.sub(r'\s+([,.!?])', r'\1', text)
-    text = re.sub(r'([,.!?])\1+', r'\1', text)
-    text = re.sub(r'([,.!?])(?=[^\s])', r'\1 ', text)
-    text = re.sub(r'Claude[а-яА-Я]+', 'Claude', text)
+    """Косметика пробелов и ничего больше.
+
+    Убрано отсюда сознательно:
+      - вставка пробела после .!? — ломала числа, версии и имена файлов
+        ("версия 3.5" -> "версия 3. 5", "main.py" -> "main. py");
+      - re.sub(r"(\\w+)ться", r"\\1ться") — шаблон тождественен замене, мёртвый код;
+      - схлопывание Claude[а-яА-Я]+ — правило из словаря замен, переписывало речь.
+    Whisper сам расставляет пробелы после знаков корректно; чинить нечего.
+    """
+    if not text:
+        return text
+    text = re.sub(r'\s+([,.!?;:])', r'\1', text)   # пробел ПЕРЕД знаком — всегда лишний
+    text = re.sub(r'[ \t]{2,}', ' ', text)          # двойные пробелы
     return text.strip()
 
 # Союзы/предлоги в конце — фраза не завершена, точку не ставим (#4).
@@ -518,8 +524,16 @@ _INCOMPLETE_ENDING_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Оформление сверху ОТКЛЮЧЕНО по умолчанию: whisper-large-v3 уже возвращает текст
+# с заглавной буквы и с точкой в конце, а навязывание поверх ломает диктовку
+# в середину предложения ("и добавь туда" -> "И добавь туда."). Поставь True,
+# если захочешь вернуть автооформление.
+FORCE_SENTENCE_CASE = False
+
 def apply_smart_sentence_ending(text: str) -> str:
-    """Умное оформление конца: заглавная буква, точка только если мысль завершена."""
+    """Оформление конца фразы. По умолчанию — тождественная функция."""
+    if not FORCE_SENTENCE_CASE:
+        return text.rstrip() if text else text
     if not text or len(text) <= 1:
         return text
     if text[0].islower():
@@ -601,37 +615,48 @@ def direct_insert(text: str):
     except Exception as e:
         print(f"[insert error] {e}")
 
+artifacts_removed: list[str] = []   # что вырезали в последней обработке — для уведомления
+
 def strip_asr_artifacts(text: str) -> str:
-    """MED: удаляет типичные ASR-хвосты только если они являются явными галлюцинациями."""
+    """Удаляет водяные знаки Whisper, НЕ трогая окружающий текст.
+
+    Два принципиальных отличия от прежней версии:
+      1. Вырезается только сам маркер, а не "маркер и всё после него". Раньше
+         cleaned[:idx] выбрасывал продолжение фразы — "Он корректор и дизайнер"
+         превращалось в "Он".
+      2. Ищем по всему тексту, а не в последних 20 символах: в реальных выдачах
+         маркеры стоят и в середине (замер по transcribe-bot — все 4 подстановки
+         были в середине текста).
+    Маркер удаляется, только когда он занимает отдельную фразу — то есть слева
+    начало текста или конец предложения, справа конец текста или знак препинания.
+    """
     cleaned = text.strip()
     if not cleaned:
         return cleaned
 
-    # Deloop: режем только если narrator-паттерн повторяется 2+ раза.
+    # Зацикленный рассказчик: режем, только если паттерн повторился 2+ раза.
     loop_matches = list(re.finditer(NARRATOR_LOOP_PATTERN, cleaned, flags=re.IGNORECASE))
     if len(loop_matches) >= 2:
         cut_pos = loop_matches[0].start()
+        artifacts_removed.append(f"зацикливание ({len(loop_matches)} повторов)")
         print(f"[boh] deloop cut at {cut_pos} ({len(loop_matches)} matches)")
         cleaned = cleaned[:cut_pos].strip()
 
     if not cleaned:
         return cleaned
 
-    # CEO Quality: Проверяем хвост на маркеры галлюцинаций.
-    # Удаляем маркер только если он стоит особняком в конце (последние 20 символов).
-    lower = cleaned.lower()
-    tail_zone = lower[-20:]
     for marker in BOH_TAIL_MARKERS:
-        if marker in tail_zone:
-            idx = lower.rfind(marker)
-            # Если перед маркером есть точка или пробел - это вероятно галлюцинация.
-            # Если маркер - часть длинного слова, не трогаем.
-            print(f"[boh] tail marker detected: '{marker}'")
-            cleaned = cleaned[:idx].strip()
-            lower = cleaned.lower()
-            tail_zone = lower[-20:]
+        pattern = re.compile(
+            r'(?:(?<=^)|(?<=[.!?…]))\s*' + re.escape(marker) + r'[.!?…]*\s*(?=$|[.!?…])',
+            flags=re.IGNORECASE,
+        )
+        new_cleaned, n = pattern.subn(' ', cleaned)
+        if n:
+            artifacts_removed.append(marker)
+            print(f"[boh] водяной знак удалён: '{marker}' ({n} шт.)")
+            cleaned = new_cleaned
 
-    return cleaned.strip()
+    return re.sub(r'\s{2,}', ' ', cleaned).strip()
 
 def should_skip_llm(raw_text: str) -> bool:
     """Пропуск Llama на коротком чистом raw — быстрее без потери на типичных фразах."""
@@ -647,42 +672,44 @@ def should_skip_llm(raw_text: str) -> bool:
         return False
     return True
 
+# Нормализация написания названий продуктов — единственная разрешённая замена слов.
+# Слово не меняется на другое слово: приводится лишь регистр/латиница уже
+# распознанного названия. Ставь False, если не нужно даже это.
+NORMALIZE_BRAND_NAMES = True
+BRAND_NAMES = {
+    r'\bclaude\b': 'Claude',
+    r'\bcursor\b': 'Cursor',
+    r'\bgroq\b': 'Groq',
+    r'\btelegram\b': 'Telegram',
+    r'\bwhisper\b': 'Whisper',
+    r'\bgithub\b': 'GitHub',
+    r'\bapi\b': 'API',
+}
+
 def clean_noise(text: str) -> str:
-    """Удаляет галлюцинации и применяет бизнес-словарь."""
-    if not text: return ""
+    """Снимает водяные знаки ASR. Слова пользователя не трогает.
+
+    Что убрано отсюда и почему:
+      - hallucination_words: одиночные "Python"/"Cursor"/"Конец" обнулялись целиком,
+        то есть односложный ответ терялся на 100% и приходило "Речь не распознана";
+      - bad_endings: срезали настоящее последнее слово фразы;
+      - business_vocabulary: переписывал живую речь ("сео" -> "CEO", "депло" -> "деплой")
+        без ведома говорящего;
+      - [фФfFaA]{4,}: смесь кириллицы и латиницы, ломала имена файлов
+        ("Открой файл AAAA.txt" -> "Открой файл. txt").
+    """
+    if not text:
+        return ""
     text = strip_asr_artifacts(text)
     if not text:
         return ""
-    
-    # CEO Fix: Удаляем только ОДИНОЧНЫЕ слова-заглушки на полной тишине.
-    # Если эти слова часть предложения - они НЕ удаляются.
-    hallucination_words = ["КОНЕЦ", "Конец", "Конец связи", "Cursor", "Python", "CEO to CEO"]
-    if text.strip() in hallucination_words:
-        return ""
 
-    text = re.sub(r'[фФfFaA]{4,}', '', text).strip()
-    text = re.sub(r'[.]{3,}', '...', text).strip()
-    
-    # CEO Fix: Удаляем технические "хвосты" только если они явно лишние в конце после точки
-    bad_endings = [r"Cursor[.!?]*$", r"Python[.!?]*$", r"CEO to CEO[.!?]*$", r"Claude[.!?]*$"]
-    for pattern in bad_endings:
-        if re.search(r'[.!?]\s+' + pattern, text):
-            text = re.sub(r'\s+' + pattern, '', text).strip()
+    text = re.sub(r'[.]{4,}', '...', text).strip()   # только явно избыточные точки
 
-    business_vocabulary = {
-        r'\b[Cc]laude\b': 'Claude',
-        r'\b[Cc]eo to [Cc]eo\b': 'CEO to CEO',
-        r'\b[Cc][Ee][Oo]\b': 'CEO',
-        r'\b[Сс]ело то [Сс]ело\b': 'CEO to CEO',
-        r'\b[Сс]ео то [Сс]ео\b': 'CEO to CEO',
-        r'\b[Сс]ео\b': 'CEO',
-        r'\b[Дд]ипло\b': 'деплой',
-        r'\b[Дд]епло\b': 'деплой',
-        r'\b[Dd]eplo\b': 'deploy',
-    }
-    for pattern, replacement in business_vocabulary.items():
-        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-            
+    if NORMALIZE_BRAND_NAMES:
+        for pattern, replacement in BRAND_NAMES.items():
+            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
     return text.strip()
 
 def compress_silence(audio_data, threshold=0.01, min_pause=1.5, keep_pause=0.5):
@@ -1019,20 +1046,16 @@ def process_audio(audio_snapshot: list, session_id: int):
 
         print(f"[raw whisper] '{full_raw_text}'")
 
-        t_llm_start = time.time()
-        if should_skip_llm(full_raw_text):
-            print(f"[fast] Llama skip ({len(full_raw_text.split())} слов, чистый raw)")
-            text = full_raw_text
-        else:
-            print("[mode] Neural Refinement (Llama-3.1-70B)")
-            text = refine_text_llm(full_raw_text)
-        t_llm_done = time.time()
+        # LLM-полировка удалена. Модель llama-3.1-70b-versatile выведена Groq из
+        # обслуживания (HTTP 400 model_decommissioned), и год вызов молча возвращал
+        # сырой текст — это и было то качество, которое всех устраивало. Рабочая
+        # llama-3.3 на замере переписывает 4.2-5.6% слов, а цель — дословность.
+        text = full_raw_text
 
         elapsed = time.time() - t_start
         asr_sec = t_asr_done - t_asr_start
-        llm_sec = t_llm_done - t_llm_start
         print(
-            f"[time] total={elapsed:.1f}s | asr={asr_sec:.1f}s | llama={llm_sec:.1f}s "
+            f"[time] total={elapsed:.1f}s | asr={asr_sec:.1f}s "
             f"({elapsed / dur * 100:.0f}% от длины записи)"
         )
         
