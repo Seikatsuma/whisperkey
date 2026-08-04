@@ -70,34 +70,68 @@ MODEL_PATH  = "small" # CEO Upgrade: 'base' -> 'small' for significantly better 
 TAIL_CAPTURE_SECONDS = 0.6  # CEO Speed: 0.8 -> 0.6 (быстрее старт, риск минимален)
 RESTORE_CLIPBOARD = True
 SAVE_DEBUG_AUDIO = False  # Speed: без записи WAV на диск (качество 5/5)
-ASR_CONTEXT_PROMPT = "Русская деловая речь. IT, программирование, технические задачи."
+
+# Промпт НЕ задаёт тему. Замер 05.08.26: тематическая подсказка
+# ("Русская деловая речь. IT, программирование...") на 20-секундном куске дала
+# 3 слова "Субтитры делал DimaTorzok" вместо 74 слов реальной речи — воспроизводится
+# побуквенно. Тематический промпт провоцирует вставки, а не защищает от них.
+ASR_CONTEXT_PROMPT = ""
+
 NARRATOR_LOOP_PATTERN = r'(?:спикер|смикер|speaker)\s+говорит'
+
+# Только водяные знаки Whisper из субтитровых корпусов. Обычные слова русского языка
+# сюда попадать НЕ должны: "корректор" и "продолжение следует" съедали до 75% фразы
+# ("Он корректор и дизайнер" -> "Он.").
 BOH_TAIL_MARKERS = [
     "редактор субтитров",
-    "корректор",
-    "продолжение следует",
     "субтитры сделал",
+    "субтитры сделала",
     "субтитры подогнал",
+    "субтитры делал",
+    "субтитры создавал",
     "subtitles by",
-    "thanks for watching"
+    "thanks for watching",
+    "dimatorzok",
+    "ссылка на сайт в описании",
 ]
 CLOUD_WHISPER_MODEL = "whisper-large-v3"
 PARALLEL_CLOUD_CHUNKS = True
 MAX_CLOUD_WORKERS = 4
-LLAMA_SKIP_MAX_WORDS = 0
+
+# Дробление длинной записи. Пороги замерены 05.08.26:
+# на 25 с и 60 с модель не теряет ничего (69=69, 140=140 слов), провалы начинаются
+# на длинном входе. Резать раньше 90 с вредно — каждый кусок создаёт искусственный
+# "конец записи", место рождения субтитрового спама.
+CHUNK_THRESHOLD_SECONDS = 90.0
+CHUNK_SIZE_SECONDS = 60.0
+CHUNK_OVERLAP_SECONDS = 3.0
+
+# Детектор провала распознавания. no_speech_prob его НЕ ловит (у пустых сегментов
+# замерено 0.028 и 0.581), плотность слов ловит 3 из 3 и 4 из 4 в двух проверках.
+DENSITY_GATE_MIN_DURATION = 8.0
+DENSITY_GATE_MIN_WORDS_PER_SEC = 0.5
+
 HALLUCINATION_TRIGGERS = [
     "спикер говорит",
     "смикер говорит",
-    "продолжение следует",
     "голос за кадром",
 ]
 
-# Библиотека эталонных записей на Рабочем столе (для оценки качества)
-EVAL_SAMPLES_ENABLED = False
+# ─── Сбор корпуса реальных диктовок ───────────────────────────────────────────
+# Все замеры качества сделаны на чужом материале (получасовой созвон, дальний
+# микрофон). Корпуса собственной диктовки нет — без него пороги нарезки остаются
+# экстраполяцией. Сбор идёт EVAL_COLLECT_DAYS дней от первого запуска, потом
+# выключается сам и при старте показывает баннер.
+EVAL_SAMPLES_ENABLED = True
+EVAL_COLLECT_DAYS = 7
 EVAL_SAMPLES_ROOT = os.path.expanduser("~/Desktop/WhisperKey-Eval-Samples")
+EVAL_STATE_FILE = os.path.join(EVAL_SAMPLES_ROOT, "state.json")
+EVAL_MIN_DURATION = 1.0          # короче — не показательно
+EVAL_HARD_LIMIT = 400            # предохранитель от разрастания папки
 EVAL_BUCKETS = {
-    "eval_samples": {"limit": 7, "label": "Целевые записи (от 20с)"},
+    "eval_samples": {"limit": EVAL_HARD_LIMIT, "label": "Диктовки"},
 }
+eval_collection_finished = False  # выставляется при старте, читается баннером
 
 # API Настройки (Groq Cloud)
 load_env_file(".env")
@@ -149,9 +183,86 @@ _eval_full_notified: set[str] = set()
 
 
 def _eval_bucket_for_duration(dur: float) -> str:
-    if dur >= 20.0:
+    # Собираем ВСЕ диктовки, а не только длинные: короткие фразы — основной режим,
+    # и именно на них ломались текстовые фильтры.
+    if dur >= EVAL_MIN_DURATION:
         return "eval_samples"
     return "ignored"
+
+def _eval_load_state() -> dict:
+    try:
+        with open(EVAL_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _eval_save_state(state: dict) -> None:
+    try:
+        os.makedirs(EVAL_SAMPLES_ROOT, exist_ok=True)
+        with open(EVAL_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[eval] state error: {e}")
+
+def _eval_check_deadline() -> tuple[bool, int, int]:
+    """Решает, идёт ли сбор. Возвращает (сбор_активен, прошло_дней, собрано_записей).
+
+    Срок отсчитывается от ПЕРВОГО запуска со сбором, а не от установки: иначе
+    неделя истекала бы, пока программа лежит без дела.
+    """
+    global EVAL_SAMPLES_ENABLED, eval_collection_finished
+    if not EVAL_SAMPLES_ENABLED:
+        return False, 0, 0
+
+    state = _eval_load_state()
+    now = time.time()
+    started = state.get("started_at")
+    if not started:
+        started = now
+        state["started_at"] = started
+        state["started_human"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        _eval_save_state(state)
+
+    days_passed = int((now - started) // 86400)
+    collected = _eval_count_in_bucket("eval_samples")
+    deadline_hit = (now - started) >= EVAL_COLLECT_DAYS * 86400
+    limit_hit = collected >= EVAL_HARD_LIMIT
+
+    if deadline_hit or limit_hit:
+        EVAL_SAMPLES_ENABLED = False
+        eval_collection_finished = True
+        if not state.get("finished"):
+            state["finished"] = True
+            state["finished_human"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            state["collected"] = collected
+            state["reason"] = "срок" if deadline_hit else "лимит записей"
+            _eval_save_state(state)
+            notify("WhisperKey — сбор завершён",
+                   f"Собрано {collected} записей. Материал готов к разбору.")
+        return False, days_passed, collected
+
+    return True, days_passed, collected
+
+def _eval_print_banner(active: bool, days_passed: int, collected: int) -> None:
+    """Крупная плашка в терминале — её видно при каждом запуске."""
+    if eval_collection_finished or not active:
+        if collected <= 0:
+            return
+        print()
+        print("=" * 70)
+        print("   ███  С Б О Р   З А В Е Р Ш Ё Н  ███")
+        print()
+        print(f"   Собрано записей: {collected}")
+        print(f"   Папка: {EVAL_SAMPLES_ROOT}")
+        print()
+        print("   МОЖНО ИДТИ ДАЛЬШЕ — материал готов к разбору.")
+        print("   Скажи Клоду: «разбери корпус диктовок».")
+        print("=" * 70)
+        print()
+        return
+
+    left = max(0, EVAL_COLLECT_DAYS - days_passed)
+    print(f"[eval] Сбор корпуса идёт: {collected} записей, осталось дней: {left}")
 
 def _write_raw_recording_wav(audio_data: np.ndarray, path: str) -> None:
     """Сохраняет сырую запись (без compress/padding) как слышал микрофон."""
@@ -187,12 +298,8 @@ def _eval_refresh_manifest() -> dict:
             "full": count >= cfg["limit"],
         }
     
-    # CEO Fix: Автоматическое отключение при достижении лимита
-    if total_collected >= 7:
-        if EVAL_SAMPLES_ENABLED:
-            print("[eval] Лимит в 7 записей достигнут. Авто-отключение сбора.")
-            EVAL_SAMPLES_ENABLED = False
-            
+    # Останов по сроку и по жёсткому лимиту живёт в _eval_check_deadline(),
+    # здесь только снимок состояния.
     manifest_path = os.path.join(EVAL_SAMPLES_ROOT, "manifest.json")
     try:
         with open(manifest_path, "w", encoding="utf-8") as f:
@@ -202,9 +309,7 @@ def _eval_refresh_manifest() -> dict:
     return manifest
 
 def init_eval_samples_library() -> None:
-    """Создаёт папки на Рабочем столе и README с правилами сбора."""
-    if not EVAL_SAMPLES_ENABLED:
-        return
+    """Готовит папку сбора и печатает статус. Решение «идёт или закончен» — в _eval_check_deadline."""
     try:
         os.makedirs(EVAL_SAMPLES_ROOT, exist_ok=True)
         for bucket in EVAL_BUCKETS:
@@ -212,23 +317,25 @@ def init_eval_samples_library() -> None:
         readme = os.path.join(EVAL_SAMPLES_ROOT, "README.txt")
         if not os.path.exists(readme):
             lines = [
-                "WhisperKey — эталонные записи для оценки качества",
+                "WhisperKey — корпус реальных диктовок",
                 "",
-                "Папки:",
-                "  short_up_to_15s/   — до 5 файлов, длительность ≤ 15 сек",
-                "  medium_15s_to_60s/ — до 10 файлов, 15 < длительность ≤ 60 сек",
-                "  long_over_60s/     — до 5 файлов, длительность > 60 сек",
+                f"Сбор идёт {EVAL_COLLECT_DAYS} дней от первого запуска, затем выключается сам.",
+                "Каждая диктовка сохраняется как .wav + .meta.json рядом с ним.",
+                "В .meta.json лежит сырой ответ Whisper и финальный вставленный текст —",
+                "по ним видно, что именно испортила обработка.",
                 "",
-                "Когда лимит категории заполнен, новые записи этой длины не сохраняются.",
-                "К каждому .wav добавляется .meta.json (raw whisper + финальный текст).",
-                "Статус: manifest.json",
+                "Зачем: пороги нарезки и фильтров сейчас подобраны на чужом материале.",
+                "На своём корпусе их можно проверить и подвинуть по факту.",
+                "",
+                "Статус сбора: state.json и manifest.json в этой папке.",
+                "Когда сбор закончится, программа скажет об этом при запуске.",
             ]
             with open(readme, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")
-        manifest = _eval_refresh_manifest()
-        print(f"[eval] Папка эталонов: {EVAL_SAMPLES_ROOT}")
-        for bucket, info in manifest["buckets"].items():
-            print(f"[eval]   {info['label']}: {info['count']}/{info['limit']}")
+
+        active, days_passed, collected = _eval_check_deadline()
+        _eval_refresh_manifest()
+        _eval_print_banner(active, days_passed, collected)
     except Exception as e:
         print(f"[eval] init error: {e}")
 
