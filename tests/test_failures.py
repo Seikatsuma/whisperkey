@@ -131,8 +131,9 @@ def test_exception_in_one_chunk():
           f"вставлено: {text!r}")
     check("Отказ 1 куска: есть метка потери", "[не распознано" in text,
           f"вставлено: {text!r}")
-    check("Отказ 1 куска: пользователь уведомлён", len(notes) > 0 and any(
-        "частично" in m.lower() or "потеряно" in str(n).lower() for n, m in notes),
+    joined = " ".join(f"{n} {m}" for n, m in notes).lower()
+    check("Отказ 1 куска: пользователь уведомлён",
+          notes and ("частично" in joined or "потеряно" in joined),
           f"уведомления: {notes}")
 
 

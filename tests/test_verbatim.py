@@ -23,6 +23,7 @@ WANTED_FUNCS = {
     "smart_grammar_fix", "apply_smart_sentence_ending", "strip_asr_artifacts",
     "clean_noise", "_norm_word", "_drop_overlap", "_fmt_mmss", "_join_chunks",
     "_split_audio", "_find_degenerate_segments", "_text_from_response",
+    "_words_in_range",
 }
 WANTED_CONSTS = {
     "SAMPLE_RATE", "NARRATOR_LOOP_PATTERN", "BOH_TAIL_MARKERS", "ASR_CONTEXT_PROMPT",
@@ -312,14 +313,51 @@ def test_density_gate_ignores_normal():
 
 # ─── Т5. words[] предпочитается segments[] ────────────────────────────────────
 
-def test_words_preferred():
+def test_healthy_segment_keeps_punctuation():
+    """Здоровый сегмент отдаётся как есть — со знаками препинания.
+
+    Это главное отличие от сборки только из words[]: там пунктуации нет вовсе.
+    """
     result = {
-        "text": "полный текст",
-        "segments": [{"start": 0.0, "end": 5.0, "text": "часть", "no_speech_prob": 0.0}],
-        "words": [{"word": "часть"}, {"word": "которая"}, {"word": "длиннее"}],
+        "text": "неважно",
+        "segments": [{"start": 0.0, "end": 5.0,
+                      "text": "Да, вот так. И вот так.", "no_speech_prob": 0.0}],
+        "words": [{"word": "Да", "start": 0.1, "end": 0.4},
+                  {"word": "вот", "start": 0.5, "end": 0.8},
+                  {"word": "так", "start": 0.9, "end": 1.2}],
     }
     text, _ = M["_text_from_response"](result)
-    check("Т5 берём words[]", text == "часть которая длиннее", f"получено {text!r}")
+    check("Т5 пунктуация сохранена", "," in text and "." in text, f"получено {text!r}")
+    check("Т5 текст из сегмента", text == "Да, вот так. И вот так.", f"получено {text!r}")
+
+
+def test_degenerate_segment_recovered_from_words():
+    """Сорванное окно подменяется словами из words[] — это и есть спасённый текст."""
+    result = {
+        "text": "неважно",
+        "segments": [
+            {"start": 0.0, "end": 10.0, "text": "Нормальный кусок речи, вот такой.",
+             "no_speech_prob": 0.0},
+            # 15 секунд, три слова-мусора: классический срыв модели
+            {"start": 10.0, "end": 25.0, "text": "95 95 95", "no_speech_prob": 0.03},
+        ],
+        "words": [{"word": "Нормальный", "start": 0.5, "end": 1.0},
+                  {"word": "кусок", "start": 1.1, "end": 1.5},
+                  {"word": "речи", "start": 1.6, "end": 2.0},
+                  {"word": "вот", "start": 2.1, "end": 2.4},
+                  {"word": "такой", "start": 2.5, "end": 3.0},
+                  {"word": "а", "start": 11.0, "end": 11.2},
+                  {"word": "здесь", "start": 11.3, "end": 11.7},
+                  {"word": "была", "start": 11.8, "end": 12.1},
+                  {"word": "живая", "start": 12.2, "end": 12.6},
+                  {"word": "речь", "start": 12.7, "end": 13.0}],
+    }
+    text, degenerate = M["_text_from_response"](result)
+    check("Т5 срыв обнаружен", len(degenerate) == 1, f"найдено {len(degenerate)}")
+    check("Т5 речь восстановлена", "здесь была живая речь" in text, f"получено {text!r}")
+    check("Т5 мусор выброшен", "95 95 95" not in text, f"получено {text!r}")
+    check("Т5 здоровая часть цела", "Нормальный кусок речи, вот такой." in text,
+          f"получено {text!r}")
 
 
 def test_falls_back_to_segments():
@@ -332,10 +370,25 @@ def test_falls_back_to_segments():
     check("Т5 запасной путь", text == "из сегментов", f"получено {text!r}")
 
 
-def test_prompt_is_empty():
-    """Тематический промпт — доказанный источник галлюцинаций."""
-    check("Т4 промпт пуст", not M["ASR_CONTEXT_PROMPT"],
-          f"промпт задан: {M['ASR_CONTEXT_PROMPT']!r}")
+def test_prompt_has_no_topic():
+    """Промпт задаёт только пунктуацию. Тема и имена в нём протекают в текст.
+
+    Проверяется отсутствие терминов и слов с заглавной буквы в середине —
+    именно они подставлялись моделью вместо неразобранной речи.
+    """
+    prompt = M["ASR_CONTEXT_PROMPT"]
+    forbidden = ["it", "программирован", "технич", "деловая", "фонд", "задачи"]
+    low = prompt.lower()
+    hits = [w for w in forbidden if w in low]
+    check("Т4 промпт без темы", not hits, f"найдено {hits} в {prompt!r}")
+
+    # Имя собственное = заглавная буква не в начале предложения
+    proper = re.findall(r'(?<![.!?]\s)(?<!^)\b[А-ЯA-Z][а-яa-z]{2,}', prompt)
+    check("Т4 промпт без имён собственных", not proper, f"найдено {proper}")
+
+    check("Т4 промпт содержит пунктуацию",
+          prompt.count('.') + prompt.count(',') >= 3,
+          f"знаков мало: {prompt!r}")
 
 
 def test_markers_have_no_plain_words():

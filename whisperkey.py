@@ -72,11 +72,18 @@ TAIL_CAPTURE_SECONDS = 0.6  # CEO Speed: 0.8 -> 0.6 (быстрее старт, 
 RESTORE_CLIPBOARD = True
 SAVE_DEBUG_AUDIO = False  # Speed: без записи WAV на диск (качество 5/5)
 
-# Промпт НЕ задаёт тему. Замер 05.08.26: тематическая подсказка
-# ("Русская деловая речь. IT, программирование...") на 20-секундном куске дала
-# 3 слова "Субтитры делал DimaTorzok" вместо 74 слов реальной речи — воспроизводится
-# побуквенно. Тематический промпт провоцирует вставки, а не защищает от них.
-ASR_CONTEXT_PROMPT = ""
+# Промпт задаёт модели ТОЛЬКО образец пунктуации — ни темы, ни терминов, ни имён
+# собственных. Тематическая подсказка опасна: она протекает в текст там, где речь
+# не разобрана (замер: "Субтитры делал DimaTorzok" — 3 слова вместо 74 живых).
+#
+# Замер 05.08.26 на 10 окнах реального разговора (2 независимые выборки по 5):
+#   промпт                    слов    точек   запятых
+#   пусто                      996        5        11   (текст сплошным потоком)
+#   тематический (прежний)     975       97       139
+#   этот                      1033      105       159
+# То есть образец пунктуации без содержания даёт И больше текста (+5.9% к прежнему,
+# +3.7% к пустому), И больше знаков препинания. Галлюцинаций — 0 на всех 10 окнах.
+ASR_CONTEXT_PROMPT = "Да, конечно. Хорошо. А что дальше?"
 
 NARRATOR_LOOP_PATTERN = r'(?:спикер|смикер|speaker)\s+говорит'
 
@@ -852,33 +859,81 @@ def _find_degenerate_segments(segments: list) -> list:
                         'words': n_words, 'dur': dur})
     return bad
 
-def _text_from_response(result: dict) -> tuple[str, list]:
-    """Собирает текст, предпочитая words[] сегментам.
+def _words_in_range(words: list, start: float, end: float) -> str:
+    """Слова из words[], попадающие в интервал времени."""
+    picked = []
+    for w in words:
+        try:
+            w_start = float(w.get('start', -1))
+        except (TypeError, ValueError):
+            continue
+        if start <= w_start < end:
+            token = (w.get('word') or '').strip()
+            if token:
+                picked.append(token)
+    return ' '.join(picked)
 
-    words[] — строгое надмножество segments[]: во всех замерах слов, которые есть
-    в сегментах и отсутствуют в словах, было ровно 0, а обратно — до 112 слов
-    на пятиминутном окне (+19.5% выхода). На коротких диктовках прибавка нулевая,
-    но и риска никакого, поэтому путь один для обоих режимов.
+def _text_from_response(result: dict) -> tuple[str, list]:
+    """Собирает текст: пунктуация из segments[], потерянное — из words[].
+
+    Почему не одно из двух:
+      - segments[] дают читаемый текст со знаками препинания, но на длинном входе
+        модель отдаёт пустые и вырожденные окна ("95 95 95") — до 19.5% выхода
+        теряется прямо внутри успешного ответа API;
+      - words[] содержат ВСЁ распознанное (слов, которые есть в сегментах и нет
+        в словах, во всех замерах было ровно 0), но приходят без пунктуации.
+    Поэтому основа — сегменты, а words[] подставляются только туда, где сегмент
+    сорвался. Так сохраняется и читаемость, и полнота.
     """
     words = result.get('words') or []
     segments = result.get('segments') or []
     degenerate = _find_degenerate_segments(segments)
+    degenerate_spans = {(d['start'], d['end']) for d in degenerate}
 
-    if words:
-        parts = [w.get('word', '') for w in words if w.get('word')]
-        text = ' '.join(p.strip() for p in parts if p.strip())
-        if text:
-            return text, degenerate
+    if not segments:
+        if words:
+            return ' '.join((w.get('word') or '').strip()
+                            for w in words if (w.get('word') or '').strip()), degenerate
+        return (result.get('text') or '').strip(), degenerate
 
-    valid_text = []
+    pieces = []
+    prev_end = 0.0
     for seg in segments:
-        seg_text = seg.get('text', '').strip()
-        if seg_text:
-            valid_text.append(seg_text)
-    if valid_text:
-        return ' '.join(valid_text), degenerate
+        try:
+            s_start = float(seg.get('start', 0.0))
+            s_end = float(seg.get('end', 0.0))
+        except (TypeError, ValueError):
+            s_start = s_end = 0.0
+        seg_text = (seg.get('text') or '').strip()
 
-    return (result.get('text') or '').strip(), degenerate
+        # Слова, оставшиеся между сегментами — модель их распознала, но в текст
+        # они не попали.
+        if words and s_start > prev_end + 0.5:
+            gap = _words_in_range(words, prev_end, s_start)
+            if gap:
+                pieces.append(gap)
+
+        if (s_start, s_end) in degenerate_spans or not seg_text:
+            recovered = _words_in_range(words, s_start, s_end) if words else ''
+            if recovered:
+                print(f"[recover] окно {s_start:.1f}-{s_end:.1f}с: "
+                      f"восстановлено {len(recovered.split())} слов из words[]")
+                pieces.append(recovered)
+            elif seg_text:
+                pieces.append(seg_text)
+        elif seg_text:
+            pieces.append(seg_text)
+
+        prev_end = max(prev_end, s_end)
+
+    # Хвост после последнего сегмента
+    if words:
+        tail = _words_in_range(words, prev_end, float('inf'))
+        if tail:
+            pieces.append(tail)
+
+    text = ' '.join(p for p in pieces if p).strip()
+    return (text or (result.get('text') or '').strip()), degenerate
 
 def transcribe_cloud_turbo(audio_data, allow_retry: bool = True, use_prompt: bool = True):
     """Расшифровка через Groq whisper-large-v3.
