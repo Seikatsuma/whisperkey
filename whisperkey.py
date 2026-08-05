@@ -1576,8 +1576,14 @@ def on_release(key):
             session_phase = "processing"
         # CEO Fix: Задержка для захвата хвоста
         def delayed_stop():
+            # global обязателен для ВСЕХ трёх имён. У session_phase его не было:
+            # объявление в on_release на вложенную функцию не распространяется,
+            # поэтому "idle" ниже писалось в ЛОКАЛЬНУЮ переменную, а модульная
+            # фаза навсегда оставалась "processing" — и on_press с этого момента
+            # выходил по первой же проверке. Итог: одно случайное короткое
+            # касание правого Option намертво выключало диктовку до перезапуска.
+            global is_recording, processing, session_phase
             time.sleep(TAIL_CAPTURE_SECONDS)
-            global is_recording
             is_recording = False
             # При включённой предзаписи поток остаётся открытым — иначе следующее
             # нажатие снова начнётся с холодного старта и срежет первое слово.
@@ -1588,7 +1594,6 @@ def on_release(key):
             if len(audio_snapshot) < 10:
                 print("[skip] Слишком коротко")
                 notify("WhisperKey", "⚠️ Слишком короткая запись")
-                global processing
                 processing = False
                 with state_lock:
                     if active_session_id == current_session_id:

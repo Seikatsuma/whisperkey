@@ -410,12 +410,31 @@ def _start_capture_async(session_id: int) -> None:
     только поток поднимется, а is_recording поднят заранее и колбэк ничего
     не потеряет (до открытия его просто никто не зовёт).
 
+    Уведомление «Запись…» уезжает сюда же и намеренно: оно должно приходить
+    не раньше, чем микрофон начал отдавать сэмплы, иначе пользователь начинает
+    говорить в ещё не открытое устройство и теряет первое слово — ровно та
+    болезнь, от которой заводили предзапись.
+
     Если микрофон не открылся — сессия снимается, но только если её не успел
     забрать on_release: тогда фазу «processing» доводит delayed_stop.
     """
     def run():
         global is_recording, session_phase
         if start_audio_stream():
+            with state_lock:
+                stale = (active_session_id != session_id
+                         or session_phase != "recording")
+            if stale:
+                # Клавишу отпустили быстрее, чем открылось устройство: стоп
+                # в delayed_stop прошёл по ещё пустому audio_stream, и без
+                # этой ветки микрофон остался бы занят до следующей диктовки
+                # (горящий индикатор записи в трее и у камеры).
+                print("[audio] Клавиша отпущена раньше, чем открылся микрофон")
+                if not PREROLL_ENABLED:
+                    stop_audio_stream()
+                return
+            notify("WhisperKey", "Запись...")
+            print("[rec] Начата")
             return
         is_recording = False
         with state_lock:
@@ -1768,23 +1787,16 @@ def on_press(key):
                     # порядок — is_recording = True, потом recording_data = [].
                     recording_data = list(preroll_buffer)
                     preroll_buffer.clear()
-                else:
-                    # Открытие устройства вынесено ИЗ ЭТОГО ПОТОКА намеренно —
-                    # см. _start_capture_async. Здесь остаётся только сброс
-                    # буфера, он мгновенный.
-                    recording_data = []
-                    _start_capture_async(active_session_id)
+                    is_recording = True
 
-                is_recording = True
+                    # Пока Alt ещё удерживается — гасим меню активного окна,
+                    # иначе Ctrl+V после диктовки уйдёт в меню (см. mask_alt_press).
+                    mask_alt_press()
 
-                # Пока Alt ещё удерживается — гасим меню активного окна,
-                # иначе Ctrl+V после диктовки уйдёт в меню (см. mask_alt_press).
-                mask_alt_press()
-
-                # Уведомление ПОСЛЕ фактического начала захвата: раньше «говори»
-                # выдавалось до того, как микрофон отдавал первый сэмпл.
-                notify("WhisperKey", "Запись...")
-                if PREROLL_ENABLED:
+                    # Уведомление ПОСЛЕ фактического начала захвата: раньше
+                    # «говори» выдавалось до того, как микрофон отдавал первый
+                    # сэмпл, и первое слово срезалось.
+                    notify("WhisperKey", "Запись...")
                     pre = len(recording_data) * 512 / SAMPLE_RATE
                     # Нулевая предзапись при включённом режиме — признак того, что
                     # поток был мёртв. Молчать об этом нельзя: дальше запись уйдёт
@@ -1794,7 +1806,15 @@ def on_press(key):
                     else:
                         print(f"[rec] Начата (предзапись {pre * 1000:.0f} мс)")
                 else:
-                    print("[rec] Начата")
+                    recording_data = []
+                    is_recording = True
+                    mask_alt_press()
+                    # Открытие устройства и уведомление «Запись…» — внутри
+                    # _start_capture_async. Открытие стоит сотни миллисекунд,
+                    # а этот поток обязан освободиться немедленно; уведомление
+                    # едет вместе с ним, чтобы «говори» по-прежнему приходило
+                    # не раньше, чем микрофон реально начал отдавать сэмплы.
+                    _start_capture_async(active_session_id)
 
                 if USE_CLOUD:
                     def warm_groq():
@@ -1820,8 +1840,15 @@ def on_release(key):
             session_phase = "processing"
 
         def delayed_stop():
+            # global обязателен для ВСЕХ трёх имён. session_phase здесь его
+            # не имел: объявление в on_release на вложенную функцию не
+            # распространяется, поэтому "idle" ниже писалось в ЛОКАЛЬНУЮ
+            # переменную, а модульная фаза навсегда оставалась "processing" —
+            # и on_press с этого момента выходил по первой же проверке.
+            # Итог: одно случайное короткое касание правого Alt намертво
+            # выключало диктовку до перезапуска программы.
+            global is_recording, processing, session_phase
             time.sleep(TAIL_CAPTURE_SECONDS)
-            global is_recording
             is_recording = False
             # При включённой предзаписи поток остаётся открытым — иначе следующее
             # нажатие снова начнётся с холодного старта и срежет первое слово.
@@ -1832,7 +1859,6 @@ def on_release(key):
             if len(audio_snapshot) < 10:
                 print("[skip] Слишком коротко")
                 notify("WhisperKey", "Слишком короткая запись")
-                global processing
                 processing = False
                 with state_lock:
                     if active_session_id == current_session_id:
