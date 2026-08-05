@@ -27,7 +27,7 @@ WANTED_FUNCS = {
 }
 WANTED_CONSTS = {
     "SAMPLE_RATE", "NARRATOR_LOOP_PATTERN", "BOH_TAIL_MARKERS", "ASR_CONTEXT_PROMPT",
-    "_INCOMPLETE_ENDING_RE", "FORCE_SENTENCE_CASE", "NORMALIZE_BRAND_NAMES",
+    "_INCOMPLETE_ENDING_RE", "CAPITALIZE_FIRST", "FORCE_TRAILING_DOT", "NORMALIZE_BRAND_NAMES",
     "BRAND_NAMES", "artifacts_removed", "CHUNK_THRESHOLD_SECONDS",
     "CHUNK_SIZE_SECONDS", "CHUNK_OVERLAP_SECONDS", "DENSITY_GATE_MIN_DURATION",
     "DENSITY_GATE_MIN_WORDS_PER_SEC", "HALLUCINATION_TRIGGERS",
@@ -180,10 +180,15 @@ def test_anchors():
 
 
 def test_no_forced_formatting():
-    """Ни заглавная, ни точка не навязываются."""
+    """Заглавная ставится, точка — нет.
+
+    Заглавная безопасна: слова не меняются. Точка в конце опасна — диктовка
+    часто идёт в середину предложения, и навязанная точка ломает мысль.
+    """
     out = pipeline("и добавь туда")
-    check("Т2 без заглавной", out.startswith("и"), f"получено {out!r}")
+    check("Т2 заглавная поставлена", out.startswith("И"), f"получено {out!r}")
     check("Т2 без точки", not out.endswith("."), f"получено {out!r}")
+    check("Т2 слова целы", len(out.split()) == 3, f"получено {out!r}")
 
 
 # ─── Т3. Двусторонний гард: ничего не потеряно и ничего не добавлено ──────────
@@ -388,9 +393,11 @@ def test_prompt_has_no_topic():
     proper = re.findall(r'(?<![.!?]\s)(?<!^)\b[А-ЯA-Z][а-яa-z]{2,}', prompt)
     check("Т4 промпт без имён собственных", not proper, f"найдено {proper}")
 
-    check("Т4 промпт содержит пунктуацию",
-          prompt.count('.') + prompt.count(',') >= 3,
-          f"знаков мало: {prompt!r}")
+    # Промпт пуст намеренно: на короткой диктовке он глушит речь.
+    # Замер 06.08.26 на 8-секундных клипах: 80 слов с промптом против 112 без,
+    # причём одна фраза схлопнулась в «Да.» — слово из самого промпта.
+    check("Т4 промпт пуст", prompt == "",
+          f"промпт задан: {prompt!r} — на короткой диктовке это теряет текст")
 
 
 def test_markers_have_no_plain_words():

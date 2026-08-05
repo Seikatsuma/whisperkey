@@ -115,7 +115,7 @@ def test_all_ok():
     def ok(chunk, idx, n):
         return idx, f"текст_куска_{idx}", "cloud", []
     text, notes = run_scenario(ok)
-    check("Контроль: текст вставлен", "текст_куска_0" in text, f"вставлено: {text!r}")
+    check("Контроль: текст вставлен", "текст_куска_0" in text.lower(), f"вставлено: {text!r}")
     check("Контроль: уведомление есть", any("готов" in m.lower() for _, m in notes),
           f"уведомления: {notes}")
 
@@ -127,7 +127,7 @@ def test_exception_in_one_chunk():
             raise RuntimeError("сеть отвалилась")
         return idx, f"текст_куска_{idx}", "cloud", []
     text, notes = run_scenario(boom)
-    check("Отказ 1 куска: остальные дошли", "текст_куска_0" in text and "текст_куска_2" in text,
+    check("Отказ 1 куска: остальные дошли", "текст_куска_0" in text.lower() and "текст_куска_2" in text.lower(),
           f"вставлено: {text!r}")
     check("Отказ 1 куска: есть метка потери", "[не распознано" in text,
           f"вставлено: {text!r}")
@@ -154,7 +154,7 @@ def test_local_fallback_is_visible():
     def local(chunk, idx, n):
         return idx, f"текст_куска_{idx}", "local" if idx == 0 else "cloud", []
     text, notes = run_scenario(local)
-    check("Локальная модель: текст есть", "текст_куска_0" in text, f"вставлено: {text!r}")
+    check("Локальная модель: текст есть", "текст_куска_0" in text.lower(), f"вставлено: {text!r}")
     check("Локальная модель: пользователь предупреждён",
           any("локальная" in m.lower() or "частично" in str(n).lower() for n, m in notes),
           f"уведомления: {notes}")
