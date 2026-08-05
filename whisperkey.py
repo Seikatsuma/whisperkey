@@ -935,11 +935,31 @@ def _text_from_response(result: dict) -> tuple[str, list]:
     text = ' '.join(p for p in pieces if p).strip()
     return (text or (result.get('text') or '').strip()), degenerate
 
-def transcribe_cloud_turbo(audio_data, allow_retry: bool = True, use_prompt: bool = True):
+_rate_lock = threading.Lock()
+_last_request_ts = [0.0]
+
+def _throttle():
+    """Разносит запросы во времени.
+
+    Замер на 30-минутной записи: 32 куска в 4 потока без пауз словили 429 и
+    потеряли 4 куска текста насовсем. Лимит ключа — 7200 секунд аудио в час,
+    но упирается всё в частоту запросов, а не в объём.
+    """
+    with _rate_lock:
+        delta = time.time() - _last_request_ts[0]
+        if delta < MIN_REQUEST_INTERVAL:
+            time.sleep(MIN_REQUEST_INTERVAL - delta)
+        _last_request_ts[0] = time.time()
+
+def transcribe_cloud_turbo(audio_data, allow_retry: bool = True, use_prompt: bool = True,
+                           return_words: bool = False):
     """Расшифровка через Groq whisper-large-v3.
 
-    Возвращает строку текста либо None. Сорванные окна отдаёт через
-    cloud_status['last_degenerate'] — вызывающий решает, переспрашивать ли.
+    Возвращает строку текста либо None. При return_words=True — кортеж
+    (текст, список слов с таймкодами): слова нужны для склейки перекрытий
+    по времени, текстовое сравнение на стыке ненадёжно, потому что модель
+    распознаёт один и тот же участок в разных кусках немного по-разному.
+    Сорванные окна отдаёт через cloud_status['last_degenerate'].
     """
     global cloud_status
 
@@ -975,11 +995,12 @@ def transcribe_cloud_turbo(audio_data, allow_retry: bool = True, use_prompt: boo
     if use_prompt and ASR_CONTEXT_PROMPT:
         data.append(('prompt', ASR_CONTEXT_PROMPT))
 
-    for attempt in range(3):
+    for attempt in range(4):
         try:
+            _throttle()
             response = http_session.post(
                 "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers=headers, files=files, data=data, timeout=30
+                headers=headers, files=files, data=data, timeout=60
             )
 
             if response.status_code == 200:
@@ -989,6 +1010,8 @@ def transcribe_cloud_turbo(audio_data, allow_retry: bool = True, use_prompt: boo
                 if degenerate:
                     total = sum(d['dur'] for d in degenerate)
                     print(f"[gate] сорванных окон: {len(degenerate)}, суммарно {total:.1f}с")
+                if return_words:
+                    return text, (result.get('words') or [])
                 return text
 
             if response.status_code == 403:
