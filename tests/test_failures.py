@@ -100,7 +100,7 @@ def make_audio(seconds):
     return [np.full((512, 1), 0.1, dtype=np.float32) for _ in range(n_blocks)]
 
 
-def run_scenario(chunk_behaviour, seconds=200.0):
+def run_scenario(chunk_behaviour, seconds=1100.0):
     """Прогоняет process_audio, подменив распознавание одного куска."""
     INSERTED.clear()
     NOTIFIED.clear()

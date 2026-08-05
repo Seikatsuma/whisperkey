@@ -249,7 +249,9 @@ def test_split_short_not_chunked():
 
 
 def test_split_long_has_overlap():
-    dur = 300.0
+    # Порог нарезки — 15 минут: всё короче уходит в облако одним запросом,
+    # это доказано замером (одним куском 79.8% против 72.3% у нарезки).
+    dur = M["CHUNK_THRESHOLD_SECONDS"] + 120.0
     audio = np.zeros(int(M["SAMPLE_RATE"] * dur), dtype=np.float32)
     chunks, offsets = M["_split_audio"](audio, dur)
     check("Т5 длинная режется", len(chunks) > 1, f"кусков {len(chunks)}")

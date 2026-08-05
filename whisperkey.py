@@ -109,11 +109,18 @@ PARALLEL_CLOUD_CHUNKS = True
 MAX_CLOUD_WORKERS = 3
 MIN_REQUEST_INTERVAL = 0.7
 
-# Дробление длинной записи. Пороги замерены 05.08.26:
-# на 25 с и 60 с модель не теряет ничего (69=69, 140=140 слов), провалы начинаются
-# на длинном входе. Резать раньше 90 с вредно — каждый кусок создаёт искусственный
-# "конец записи", место рождения субтитрового спама.
-CHUNK_THRESHOLD_SECONDS = 90.0
+# Дробление длинной записи — крайняя мера, а не норма.
+#
+# Замер 05.08.26 на реальной записи 29:45, сравнение с эталонной расшифровкой:
+#   одним куском целиком        3810 слов, полнота 79.8%, точность 92.3%
+#   нарезка 60 с + перекрытие   3559 слов, полнота 72.3%, точность 89.4%
+# Groq режет длинный файл у себя внутри и делает это лучше, чем мы снаружи:
+# наша нарезка добавляет швы, дубли на стыках и лишние запросы, упирающиеся
+# в лимит. Поэтому порог поднят выше любой реальной диктовки — до 15 минут.
+# Всё, что короче, уходит в облако одним запросом: максимум качества,
+# ни одного шва. Нарезка остаётся только для записей, которые иначе
+# не влезут в ограничение API по размеру файла.
+CHUNK_THRESHOLD_SECONDS = 900.0
 CHUNK_SIZE_SECONDS = 60.0
 CHUNK_OVERLAP_SECONDS = 3.0
 
@@ -1192,27 +1199,26 @@ def _fmt_mmss(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     return f"{m:02d}:{s:02d}"
 
-def _drop_overlap_by_time(words: list, chunk_start: float, cut_before: float) -> str | None:
-    """Собирает текст куска, выбрасывая слова из зоны перекрытия по времени.
+def _overlap_word_count(words: list, chunk_start: float, cut_before: float) -> int:
+    """Сколько первых слов куска попало в зону перекрытия с предыдущим.
 
-    Надёжнее текстового сравнения: модель распознаёт один и тот же участок
-    в соседних кусках немного по-разному, поэтому точного совпадения слов
-    на стыке может не быть вовсе, и дубль проходит насквозь.
+    Считаем по таймкодам, а режем потом от ТЕКСТА — иначе, пересобирая фразу
+    из words[], мы теряем пунктуацию, которая есть только в segments[].
+    Сравнение по времени надёжнее текстового: один и тот же участок в соседних
+    кусках модель распознаёт немного по-разному, и точного совпадения на стыке
+    может не быть вовсе.
     """
-    if not words:
-        return None
-    kept = []
+    n = 0
     for w in words:
         try:
             abs_start = chunk_start + float(w.get('start', 0.0))
         except (TypeError, ValueError):
-            continue
-        if abs_start < cut_before:
-            continue
-        token = (w.get('word') or '').strip()
-        if token:
-            kept.append(token)
-    return ' '.join(kept) if kept else None
+            break
+        if abs_start >= cut_before:
+            break
+        if (w.get('word') or '').strip():
+            n += 1
+    return n
 
 def _join_chunks(parts: list, quality: list, offsets: list,
                  words_per_chunk: list | None = None) -> tuple[str, list]:
@@ -1241,10 +1247,13 @@ def _join_chunks(parts: list, quality: list, offsets: list,
         chunk_words = (words_per_chunk[idx] if words_per_chunk and idx < len(words_per_chunk)
                        else None)
         if pieces and prev_end is not None and chunk_words:
-            trimmed = _drop_overlap_by_time(chunk_words, offsets[idx], prev_end)
-            # Пустой результат означает, что кусок целиком лежит в перекрытии —
-            # такого быть не должно, но лучше оставить текст, чем потерять его.
-            text = trimmed if trimmed else text
+            n_dup = _overlap_word_count(chunk_words, offsets[idx], prev_end)
+            words_of_text = text.split()
+            # Режем от текста, а не от words[] — так остаётся пунктуация.
+            # Если перекрытие вдруг накрыло весь кусок, оставляем текст как есть:
+            # лишний дубль пережить можно, потерянные слова нет.
+            if 0 < n_dup < len(words_of_text):
+                text = ' '.join(words_of_text[n_dup:])
         elif pieces:
             text = _drop_overlap(pieces[-1], text)
 
