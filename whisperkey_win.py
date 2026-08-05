@@ -393,6 +393,38 @@ def start_audio_stream(raise_on_error: bool = False):
         raise last_error
     return False
 
+def _start_capture_async(session_id: int) -> None:
+    """Поднимает микрофон ВНЕ потока клавиатурного хука (платформенная точка 7).
+
+    Windows-специфика, аналога которой на macOS нет. pynput ставит
+    WH_KEYBOARD_LL и качает очередь сообщений в одном и том же потоке: сам
+    хук только кладёт событие в очередь, а on_press вызывается уже из цикла
+    сообщений — то есть пока on_press работает, поток НЕ качает очередь и хук
+    позвать нельзя. Если это длится дольше LowLevelHooksTimeout (по умолчанию
+    300 мс), Windows 7 и новее СНИМАЕТ хук молча — клавиша перестаёт работать
+    до перезапуска программы, без единого сообщения.
+
+    Открытие устройства под MME стоит сотни миллисекунд, а start_audio_stream
+    делает до трёх попыток с паузами 0.25 и 0.5 с — то есть до полутора секунд
+    прямо в этом потоке. Поэтому здесь только запуск: захват начнётся, как
+    только поток поднимется, а is_recording поднят заранее и колбэк ничего
+    не потеряет (до открытия его просто никто не зовёт).
+
+    Если микрофон не открылся — сессия снимается, но только если её не успел
+    забрать on_release: тогда фазу «processing» доводит delayed_stop.
+    """
+    def run():
+        global is_recording, session_phase
+        if start_audio_stream():
+            return
+        is_recording = False
+        with state_lock:
+            if active_session_id == session_id and session_phase == "recording":
+                session_phase = "idle"
+        schedule_idle_close()
+
+    threading.Thread(target=run, daemon=True).start()
+
 _idle_timer: threading.Timer | None = None
 _idle_timer_lock = threading.Lock()
 
@@ -649,8 +681,59 @@ def _get_user32():
         u.SendInput.restype = ctypes.c_uint
         u.MapVirtualKeyW.argtypes = (ctypes.c_uint, ctypes.c_uint)
         u.MapVirtualKeyW.restype = ctypes.c_uint
+        u.GetForegroundWindow.argtypes = ()
+        u.GetForegroundWindow.restype = ctypes.c_void_p
+        u.GetWindowThreadProcessId.argtypes = (ctypes.c_void_p,
+                                               ctypes.POINTER(ctypes.c_uint32))
+        u.GetWindowThreadProcessId.restype = ctypes.c_uint32
         _user32 = u
     return _user32
+
+
+def _foreground_input_blocked() -> bool:
+    """True — активное окно принадлежит процессу выше нас по целостности (UIPI).
+
+    Зачем отдельная проверка, хотя SendInput возвращает число событий: по
+    документации Microsoft «This function fails when it is blocked by UIPI.
+    Note that neither GetLastError nor the return value will indicate the
+    failure». То есть при вставке в окно, запущенное от администратора,
+    SendInput отчитывается об успехе, ввод при этом никуда не идёт — и решение
+    «вставилось, можно вернуть буфер» уничтожает диктовку через
+    CLIPBOARD_RESTORE_DELAY секунд. Ровно тот отказ, ради которого проверка
+    возврата и заводилась, по возврату не виден.
+
+    Признак, который работает: попытка открыть процесс окна с самым слабым
+    правом PROCESS_QUERY_LIMITED_INFORMATION. Непривилегированный процесс
+    получает на процессе с более высокой целостностью ERROR_ACCESS_DENIED —
+    это то же самое условие, по которому UIPI режет ввод. Если WhisperKey
+    сам запущен от администратора, открытие проходит, и путь обычный.
+
+    Любая неопределённость трактуется в сторону сохранности текста: не смогли
+    открыть — считаем, что вставка не подтверждена, и буфер не возвращаем.
+    """
+    try:
+        u = _get_user32()
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.CloseHandle.argtypes = (ctypes.c_void_p,)
+
+        hwnd = u.GetForegroundWindow()
+        if not hwnd:
+            return False
+        pid = ctypes.c_uint32(0)
+        u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value or pid.value == os.getpid():
+            return False
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid.value)
+        if handle:
+            k32.CloseHandle(ctypes.c_void_p(handle))
+            return False
+        return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+    except Exception:
+        return False
 
 
 def _send_keys(events: list) -> bool:
@@ -664,9 +747,10 @@ def _send_keys(events: list) -> bool:
     либо в поле прилетает буква «v». Явный vk снимает и вторую проблему —
     раскладка перестаёт влиять вовсе.
 
-    Возврат SendInput — единственный на Windows признак того, что ввод вообще
-    дошёл до окна: если целевое окно запущено от администратора, UIPI молча
-    режет ввод от непривилегированного процесса, и pynput об этом не узнает.
+    Возврат SendInput ловит только грубый отказ (событие не принято системой
+    вовсе). Блокировку UIPI он НЕ ловит: документация Microsoft прямо говорит,
+    что при ней ни возврат, ни GetLastError на отказ не указывают. Поэтому
+    окно от администратора проверяется отдельно — _foreground_input_blocked.
     """
     user32 = _get_user32()
     n = len(events)
@@ -808,6 +892,12 @@ def direct_insert(text: str):
 
         time.sleep(0.1)   # окну нужен момент, чтобы увидеть новое содержимое буфера
 
+        # Целостность активного окна спрашиваем ДО отправки: по документации
+        # Microsoft при блокировке UIPI SendInput не сообщает об отказе ни
+        # возвратом, ни GetLastError — то есть на возврат в этом случае
+        # полагаться нельзя (см. _foreground_input_blocked).
+        blocked = _foreground_input_blocked()
+
         inserted = _send_ctrl_v()
         if inserted is None:
             # WinAPI недоступен — остаётся pynput. Проверить успех здесь нечем,
@@ -817,10 +907,17 @@ def direct_insert(text: str):
         # что-то ещё нельзя: pynput на Windows шлёт ввод ТЕМ ЖЕ SendInput, значит
         # упрётся в тот же запрет — но соврёт об успехе, и буфер будет затёрт.
 
-        if inserted:
+        if inserted and not blocked:
             print(f"[insert success] '{text[:30]}...'")
             if RESTORE_CLIPBOARD and old_clipboard:
                 _restore_clipboard_async(old_clipboard)
+        elif blocked:
+            # Текст ОСТАЁТСЯ в буфере — восстанавливать прежнее содержимое
+            # нельзя, иначе диктовка исчезнет и из окна, и из буфера.
+            print("[insert fail] Активное окно от администратора (UIPI): "
+                  "текст остался в буфере обмена — нажми Ctrl+V")
+            notify("WhisperKey — вставка не удалась",
+                   "Окно запущено от администратора. Текст в буфере, нажми Ctrl+V")
         else:
             print("[insert fail] Текст остался в буфере обмена — нажми Ctrl+V")
             notify("WhisperKey — вставка не удалась", "Текст в буфере, нажми Ctrl+V")
@@ -1587,6 +1684,23 @@ def process_audio(audio_snapshot: list, session_id: int):
 
 # ─── Обработка клавиш (платформенная точка 7) ─────────────────────────────────
 
+TRIGGER_VK = 165          # VK_RMENU
+
+
+def _key_vk(key):
+    """vk клавиши, чем бы она ни пришла из pynput.
+
+    Тонкость, из-за которой сравнение «в лоб» не работает: колбэк получает либо
+    KeyCode (у него есть .vk), либо член перечисления Key — а у члена enum
+    своего .vk НЕТ, он лежит в .value. Поэтому hasattr(key, 'vk') на Key всегда
+    False, и проверка «key.vk == 165» до члена перечисления не доходит вовсе.
+    """
+    vk = getattr(key, 'vk', None)
+    if vk is None:
+        vk = getattr(getattr(key, 'value', None), 'vk', None)
+    return vk
+
+
 def is_trigger(key):
     """Правый Alt. Код 61 из mac-версии удалён — это vk правого Option на macOS.
 
@@ -1594,20 +1708,34 @@ def is_trigger(key):
     (VK_OEM_PLUS = 187), то есть проверка на него давала только лишний шанс
     на ложное срабатывание от посторонней клавиши.
 
+    ГЛАВНОЕ, и это ломало клавишу целиком: pynput на Windows отдаёт правый Alt
+    как Key.alt_gr, а НЕ Key.alt_r. В pynput/keyboard/_win32.py объявлены обе
+    константы с одним и тем же vk 165 (alt_r с флагом EXTENDEDKEY, alt_gr без
+    него), из-за разных флагов они не схлопываются в псевдоним enum, а таблица
+    listener'а строится словарём {key.value.vk: key} — и alt_gr, объявленный
+    ПОЗЖЕ, затирает alt_r. То есть vk 165 всегда приезжает как Key.alt_gr.
+    Проверено воспроизведением логики enum из pynput 1.8.2.
+    Сравнение «key == Key.alt_r» при этом даёт False, а запасная ветка
+    «hasattr(key, 'vk')» до члена перечисления не добирается (см. _key_vk) —
+    в сумме триггер не срабатывал НИКОГДА, запись не начиналась.
+
+    Поэтому здесь три пути сразу: оба члена перечисления и явный vk. Левый Alt
+    (164) и общий Alt (18) под них не подпадают.
+
     Про AltGr: стандартная русская раскладка Windows флага KLLF_ALTGR не имеет,
     правый Alt в ней — обычный VK_RMENU, и триггер безопасен. На раскладках
     с настоящим AltGr (US-International, немецкая, польская) система перед
     RMENU подсовывает фантомный левый Ctrl — там ввод любого символа через
     AltGr будет стартовать запись. Это ограничение, а не дефект кода.
     """
-    if key == keyboard.Key.alt_r:
+    if key is None:
+        return False
+    if key is keyboard.Key.alt_r or key is getattr(keyboard.Key, 'alt_gr', None):
         return True
     try:
-        if hasattr(key, 'vk') and key.vk == 165:
-            return True
-    except:
-        pass
-    return False
+        return _key_vk(key) == TRIGGER_VK
+    except Exception:
+        return False
 
 def on_press(key):
     global is_recording, recording_data, processing, trigger_held, last_trigger_ts, session_counter, active_session_id, session_phase
@@ -1641,10 +1769,11 @@ def on_press(key):
                     recording_data = list(preroll_buffer)
                     preroll_buffer.clear()
                 else:
-                    if not start_audio_stream():
-                        session_phase = "idle"
-                        return
+                    # Открытие устройства вынесено ИЗ ЭТОГО ПОТОКА намеренно —
+                    # см. _start_capture_async. Здесь остаётся только сброс
+                    # буфера, он мгновенный.
                     recording_data = []
+                    _start_capture_async(active_session_id)
 
                 is_recording = True
 
@@ -1771,7 +1900,12 @@ def main():
     global model
     if not acquire_single_instance_lock():
         print("[FATAL] WhisperKey уже запущен. Закрой предыдущий процесс перед новым стартом.")
-        return
+        # Именно sys.exit с ненулевым кодом, а не return: run_whisperkey.bat
+        # держит окно открытым только при ненулевом errorlevel. С обычным
+        # выходом консоль закрывалась мгновенно, и это сообщение — как и любая
+        # другая причина отказа стартовать — пользователю не показывалось
+        # вообще: он видел мигнувшее окно и считал, что «ничего не произошло».
+        sys.exit(2)
 
     print("\n" + "="*60)
     print(" WhisperKey v24 | Windows Edition | Дословная диктовка")
@@ -1823,7 +1957,7 @@ def main():
                 print("Предзапись недоступна — микрофон не открылся, работаю по старой схеме")
     except Exception as e:
         print(f"[FATAL] {e}")
-        return
+        sys.exit(1)      # чтобы .bat не закрыл окно с этим сообщением
 
     print("Готов! Зажми ПРАВЫЙ ALT для записи.")
     print("Если текст не вставляется в окно, запущенное от администратора —")

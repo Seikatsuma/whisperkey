@@ -44,7 +44,7 @@ echo Starting WhisperKey...
 "%PY%" -u whisperkey_win.py
 if %errorlevel% neq 0 (
     echo.
-    echo WhisperKey остановлен с ошибкой.
+    echo WhisperKey завершился. Причина — в сообщениях выше.
     echo Если текст не вставляется — попробуйте: ПКМ по этому файлу -^> "Запуск от имени администратора"
     pause
 )
