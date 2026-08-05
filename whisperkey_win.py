@@ -1,27 +1,93 @@
 #!/usr/bin/env python3
 """
-WhisperKey v23.5 - Windows Edition
-- Архитектура: Dual-Stage Pipeline (Cloud Stealth + Stable Offline)
-- Качество: Context-Aware Grammar (возврат идеальных окончаний)
-- Целостность: Fast Tail Capture (300ms) + VAD Shield (1000ms)
-- Стабильность: Windows Native Compatibility
+WhisperKey v24 — Windows Edition. Дословная диктовка под правый Alt.
+
+Логика распознавания синхронизирована с whisperkey.py (macOS) — он эталон,
+и причины всех решений с цифрами замеров лежат в agent.md. Расходиться с ним
+можно ровно в семи платформенных точках, и они помечены в коде:
+  1. однократный запуск — именованный мьютекс вместо fcntl.flock;
+  2. уведомления — консоль плюс системный звук вместо osascript-баннера;
+  3. вставка текста — буфер обмена плюс SendInput вместо AppleScript;
+  4. путь к Рабочему столу — реестр вместо ~/Desktop (OneDrive);
+  5. приоритет процесса — класс приоритета вместо nice;
+  6. кодировка stdout — иначе русский print убивает программу;
+  7. поведение клавиши Alt — одиночный Alt на Windows открывает меню окна.
+Всё остальное (текстовые фильтры, разбор ответа модели, нарезка, склейка,
+сеть) переносится из эталона дословно — там оно доказано замерами.
 """
 from __future__ import annotations
 
-import threading
-import subprocess
+import ctypes
+import io
 import os
-import sys
-import time
-import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import numpy as np
 import re
+import sys
+import threading
+import time
+import wave
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ─── Консоль Windows (платформенная точка 6) ──────────────────────────────────
+# Делается ДО первого print и до импортов, которые печатают.
+#
+# На Windows кодировка вывода — не косметика, а живучесть программы. Три отказа,
+# ни одного из которых нет на macOS:
+#   1. вывод перенаправлен в файл или пайп (запуск из планировщика, из IDE,
+#      из обёртки) — Python берёт системную cp1251, и первый же русский print
+#      бросает UnicodeEncodeError. Печать у нас идёт в том числе из колбэка
+#      клавиатурного хука; исключение оттуда pynput ловит в _emitter, ОСТАНАВЛИВАЕТ
+#      listener и перебрасывает из join() — клавиша умирает до перезапуска;
+#   2. запуск под pythonw.exe — sys.stdout вообще None, print падает с
+#      AttributeError по тому же маршруту;
+#   3. QuickEdit в cmd.exe включён по умолчанию: случайное выделение мышью
+#      в окне консоли замораживает запись в stdout навсегда. Уведомления
+#      печатаются из отдельного потока (см. notify), но лишний раз рисковать
+#      незачем — снимаем режим сразу.
+def _setup_console() -> None:
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None:
+            try:
+                setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+            except Exception:
+                pass
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+    try:
+        # Кодовая страница консоли: cmd.exe стартует в cp866, и кириллица
+        # в ней нечитаема независимо от кодировки самого Python.
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+    except Exception:
+        pass
+
+    try:
+        k32 = ctypes.windll.kernel32
+        handle = k32.GetStdHandle(-10)          # STD_INPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if k32.GetConsoleMode(handle, ctypes.byref(mode)):
+            # ENABLE_EXTENDED_FLAGS (0x0080) обязателен: без него система
+            # вернёт снятый бит QUICK_EDIT_MODE (0x0040) обратно.
+            k32.SetConsoleMode(handle, (mode.value & ~0x0040) | 0x0080)
+    except Exception:
+        pass
+
+
+_setup_console()
+
+import numpy as np
 import psutil
 import requests
-import io
-import wave
 import pyperclip
+
+try:
+    import winsound            # stdlib, есть только на Windows
+except Exception:
+    winsound = None
 
 try:
     import sounddevice as sd
@@ -56,36 +122,95 @@ def load_env_file(path: str = ".env") -> None:
         print(f"[env warn] {e}")
 
 # ─── Настройки ────────────────────────────────────────────────────────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SAMPLE_RATE = 16000
 TRIGGER_KEY = keyboard.Key.alt_r
-MODEL_PATH  = "small" 
-TAIL_CAPTURE_SECONDS = 0.6  
+MODEL_PATH  = "small"          # запасная локальная модель, если облако недоступно
+TAIL_CAPTURE_SECONDS = 0.6     # добор хвоста после отпускания клавиши
 RESTORE_CLIPBOARD = True
-SAVE_DEBUG_AUDIO = False  
-ASR_CONTEXT_PROMPT = "Русская деловая речь. IT, программирование, технические задачи."
+SAVE_DEBUG_AUDIO = False       # без записи WAV на диск
+
+# Браузерный User-Agent — строка ДЛЯ WINDOWS. На macOS в эталоне стоит
+# "Macintosh", и копировать её сюда нельзя: вся ветка cloud_status["is_blocked"]
+# построена вокруг ответа 403 (гео-блок Groq), а несовпадение UA с платформой
+# этот шанс только повышает. Без UA отказ приходит чаще, и диктовка молча
+# уходит на слабую локальную модель small.
+WIN_USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                  '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36')
+
+# Промпт задаёт модели ТОЛЬКО образец пунктуации — ни темы, ни терминов, ни имён
+# собственных. Тематическая подсказка (здесь раньше стояла «Русская деловая речь.
+# IT, программирование, технические задачи.») опасна: она протекает в текст там,
+# где речь не разобрана (замер: "Субтитры делал DimaTorzok" — 3 слова вместо 74 живых).
+#
+# Замер 05.08.26 на 10 окнах реального разговора (2 независимые выборки по 5):
+#   промпт                    слов    точек   запятых
+#   пусто                      996        5        11   (текст сплошным потоком)
+#   тематический (прежний)     975       97       139
+#   этот                      1033      105       159
+# То есть образец пунктуации без содержания даёт И больше текста (+5.9% к прежнему,
+# +3.7% к пустому), И больше знаков препинания. Галлюцинаций — 0 на всех 10 окнах.
+ASR_CONTEXT_PROMPT = "Да, конечно. Хорошо. А что дальше?"
+
 NARRATOR_LOOP_PATTERN = r'(?:спикер|смикер|speaker)\s+говорит'
+
+# Только водяные знаки Whisper из субтитровых корпусов. Обычные слова русского языка
+# сюда попадать НЕ должны: "корректор" и "продолжение следует" съедали до 75% фразы
+# ("Он корректор и дизайнер" -> "Он.").
 BOH_TAIL_MARKERS = [
     "редактор субтитров",
-    "корректор",
-    "продолжение следует",
     "субтитры сделал",
+    "субтитры сделала",
     "субтитры подогнал",
+    "субтитры делал",
+    "субтитры создавал",
     "subtitles by",
-    "thanks for watching"
+    "thanks for watching",
+    "dimatorzok",
+    "ссылка на сайт в описании",
 ]
 CLOUD_WHISPER_MODEL = "whisper-large-v3"
 PARALLEL_CLOUD_CHUNKS = True
-MAX_CLOUD_WORKERS = 4
-LLAMA_SKIP_MAX_WORDS = 0
+# Три потока, а не четыре, и пауза между запросами: на 30-минутной записи
+# 32 куска в 4 потока без пауз словили 429 и потеряли 4 куска текста насовсем.
+MAX_CLOUD_WORKERS = 3
+MIN_REQUEST_INTERVAL = 0.7
+
+# Дробление длинной записи — крайняя мера, а не норма.
+#
+# Замер 05.08.26 на реальной записи 29:45, сравнение с эталонной расшифровкой:
+#   одним куском целиком        3810 слов, полнота 79.8%, точность 92.3%
+#   нарезка 60 с + перекрытие   3559 слов, полнота 72.3%, точность 89.4%
+# Groq режет длинный файл у себя внутри и делает это лучше, чем мы снаружи:
+# наша нарезка добавляет швы, дубли на стыках и лишние запросы, упирающиеся
+# в лимит. Поэтому порог поднят выше любой реальной диктовки — до 15 минут.
+# Прежний порог здесь был 30 секунд, то есть на Windows резалась практически
+# каждая длинная диктовка, причём БЕЗ перекрытия — слова на швах терялись
+# безвозвратно, склеить их обратно было нечем.
+CHUNK_THRESHOLD_SECONDS = 900.0
+CHUNK_SIZE_SECONDS = 60.0
+CHUNK_OVERLAP_SECONDS = 3.0
+
+# Детектор провала распознавания. no_speech_prob его НЕ ловит (у пустых сегментов
+# замерено 0.028 и 0.581), плотность слов ловит 3 из 3 и 4 из 4 в двух проверках.
+DENSITY_GATE_MIN_DURATION = 8.0
+DENSITY_GATE_MIN_WORDS_PER_SEC = 0.5
+
+# "Продолжение следует" отсюда убрано вместе с BOH_TAIL_MARKERS: это нормальная
+# русская фраза, а попадание в этот список включает принудительную чистку куска,
+# после которой кусок короче трёх слов выбрасывается целиком.
 HALLUCINATION_TRIGGERS = [
     "спикер говорит",
     "смикер говорит",
-    "продолжение следует",
     "голос за кадром",
 ]
 
 # API Настройки (Groq Cloud)
-load_env_file(".env")
+# Путь абсолютный от самого файла: с относительным ключ не находился при запуске
+# не через run_whisperkey.bat (из Проводника, из ярлыка с другой рабочей папкой,
+# из планировщика), и вся диктовка молча уходила на слабую локальную модель —
+# пользователь видел только резко упавшее качество, без единого сообщения.
+load_env_file(os.path.join(BASE_DIR, ".env"))
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip() or "YOUR_GROQ_API_KEY_HERE"
 
 if GROQ_API_KEY == "YOUR_GROQ_API_KEY_HERE" or not GROQ_API_KEY:
@@ -108,67 +233,222 @@ is_recording   = False
 recording_data = []
 model          = None
 processing     = False
-last_text_context = ""  
-global_audio_buffer = [] 
+last_text_context = ""
+global_audio_buffer = []
 trigger_held = False
 last_trigger_ts = 0.0
+
+# Предзапись. Поток микрофона держится открытым, и последние PREROLL_SECONDS
+# всегда лежат в кольце — при нажатии клавиши они уходят в запись вместе с новым
+# звуком. Это единственное настоящее лекарство от срезанного первого слова:
+# PortAudio не отдаёт ни одного сэмпла, пока поднимается, а уведомление «говори»
+# выдавалось ещё раньше. На Windows выигрыш должен быть БОЛЬШЕ, чем на Mac:
+# прежняя версия открывала устройство прямо в колбэке клавиатурного хука, а под
+# MME/WASAPI открытие занимает сотни миллисекунд.
+#
+# Поток НЕ висит вечно: после PREROLL_IDLE_TIMEOUT секунд без диктовки он
+# закрывается сам. Вечно открытый поток вреден не нагрузкой (32 раза в секунду
+# по 2 КБ — доли процента ядра), а тем, что молча умирает при смене
+# аудиоустройства. На Windows это случается чаще, чем на Mac: USB-гарнитура,
+# Bluetooth, переключение «устройства связи». Поэтому ensure_audio_stream
+# проверяет stream.active, а не наличие объекта.
+#
+# ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНА — так же, как в эталоне. Причина отключения на macOS
+# (CoreAudio отвечал -10863 kAudioUnitErr_CannotDoInCurrentContext, поток умирал,
+# предзапись обнулялась, диктовка уходила в никуда) к Windows не относится:
+# такого кода ошибки здесь нет. Но выигрыш предзаписи НЕ ИЗМЕРЕН ни на одной
+# платформе, а проверить его на Windows-машине отсюда невозможно. Включать
+# True — только вместе с проверкой руками: в логе при старте записи должно быть
+# «предзапись 500 мс», а не «предзапись пуста».
+PREROLL_ENABLED = False
+PREROLL_SECONDS = 0.5
+PREROLL_IDLE_TIMEOUT = 90.0
+_PREROLL_BLOCKS = max(1, int(PREROLL_SECONDS * SAMPLE_RATE / 512))
+preroll_buffer: deque = deque(maxlen=_PREROLL_BLOCKS)
 TRIGGER_DEBOUNCE_SEC = 0.35
 session_counter = 0
 state_lock = threading.Lock()
-session_phase = "idle"   
+session_phase = "idle"   # idle -> recording -> processing
 active_session_id = 0
-audio_stream = None 
+audio_stream = None
 
-# CEO Cloud Management
+# CEO Cloud Management: Динамическое управление состоянием облака
 cloud_status = {
     "is_blocked": False,
     "last_check_time": 0,
     "check_in_progress": False,
-    "consecutive_success": 0  
+    "consecutive_success": 0,
+    "last_degenerate": [],     # окна, где модель сорвалась (гейт плотности)
 }
 kb = KeyboardController()
 _instance_lock_handle = None
+_mutex_handle = None
 
+
+# ─── Однократный запуск (платформенная точка 1) ───────────────────────────────
 
 def acquire_single_instance_lock() -> bool:
-    """Windows version: Гарантирует один активный процесс через файл-флаг."""
-    lock_path = "whisperkey.lock"
+    """Гарантирует один активный процесс WhisperKey.
+
+    Именованный мьютекс, а не pid-файл. fcntl.flock из эталона даёт два свойства,
+    которых у pid-файла нет ни одного: атомарность (проверка и захват — одна
+    операция) и освобождение операционной системой при смерти процесса, включая
+    kill. Прежний pid-файл ломался дважды: Windows агрессивно переиспользует
+    PID, и чужой процесс с тем же номером после перезагрузки заставлял WhisperKey
+    навсегда отказываться стартовать «уже запущен» — лечилось только удалением
+    файла руками; плюс путь был относительным, поэтому второй экземпляр,
+    запущенный из другого каталога, замка просто не видел.
+    Префикс Local\\, а не Global\\: Global требует привилегии, которой
+    у обычного пользователя нет.
+    """
+    global _mutex_handle
+    try:
+        # use_last_error=True обязателен: без него ctypes не сохраняет код
+        # ошибки потока, и отдельный вызов GetLastError() может вернуть чужой
+        # результат — то есть замок иногда «срабатывал» бы на пустом месте.
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.restype = ctypes.c_void_p   # HANDLE, а не int: на x64 int обрежет
+        _mutex_handle = k32.CreateMutexW(None, False, "Local\\WhisperKey")
+        if not _mutex_handle:
+            return True                              # мьютекс не создался — не мешаем работать
+        return ctypes.get_last_error() != 183         # ERROR_ALREADY_EXISTS
+    except Exception:
+        return _acquire_lock_by_pidfile()
+
+
+def _acquire_lock_by_pidfile() -> bool:
+    """Запасной замок, если WinAPI недоступен. Путь абсолютный от файла проекта."""
+    global _instance_lock_handle
+    lock_path = os.path.join(BASE_DIR, "whisperkey.lock")
     try:
         if os.path.exists(lock_path):
-            # Проверяем, живой ли процесс
             try:
                 with open(lock_path, "r") as f:
                     old_pid = int(f.read().strip())
                 if psutil.pid_exists(old_pid):
                     return False
-            except:
+            except Exception:
                 pass
-        
         with open(lock_path, "w") as f:
             f.write(str(os.getpid()))
         return True
-    except:
-        return False
+    except Exception:
+        return True
+
+
+# ─── Микрофон ─────────────────────────────────────────────────────────────────
 
 def audio_callback(indata, frames, time_info, status):
-    if is_recording:
-        recording_data.append(indata.copy())
+    """Пишет в запись, а между записями — в кольцо предзаписи.
 
-def start_audio_stream():
+    Флаг status раньше игнорировался: input_overflow от PortAudio означает
+    сэмплы, выброшенные аппаратным буфером, и это было полностью невидимо.
+    """
+    if status:
+        print(f"[audio] PortAudio: {status}")
+    block = indata.copy()
+    if is_recording:
+        recording_data.append(block)
+    elif PREROLL_ENABLED:
+        preroll_buffer.append(block)
+
+def start_audio_stream(raise_on_error: bool = False):
+    """Открывает поток захвата. Возвращает True/False.
+
+    Раньше исключение глоталось здесь же и функция ничего не возвращала, поэтому
+    is_recording вставал в True при мёртвом потоке, а отказ микрофона доходил
+    до пользователя как «Слишком короткая запись».
+    """
     global audio_stream
-    try:
-        if audio_stream:
+    if audio_stream:
+        try:
             audio_stream.stop()
             audio_stream.close()
-        audio_stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-            latency='low', blocksize=512, callback=audio_callback
-        )
-        audio_stream.start()
-    except Exception as e:
-        print(f"[audio start error] {e}")
+        except Exception:
+            pass
+        audio_stream = None
+
+    # Пара повторов дешевле сорванной диктовки: устройство бывает занято
+    # ровно в момент открытия — только что подключилась USB-гарнитура,
+    # переключилось «устройство связи», Bluetooth перехватил профиль.
+    last_error = None
+    for attempt in range(3):
+        try:
+            audio_stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                latency='low', blocksize=512, callback=audio_callback
+            )
+            audio_stream.start()
+            return True
+        except Exception as e:
+            last_error = e
+            audio_stream = None
+            if attempt < 2:
+                print(f"[audio] Микрофон не открылся ({type(e).__name__}), повтор {attempt + 2} из 3")
+                time.sleep(0.25 * (attempt + 1))
+
+    print(f"[audio start error] {last_error}")
+    notify("WhisperKey — микрофон недоступен", str(last_error)[:120])
+    if raise_on_error:
+        raise last_error
+    return False
+
+_idle_timer: threading.Timer | None = None
+_idle_timer_lock = threading.Lock()
+
+def ensure_audio_stream() -> bool:
+    """Гарантирует живой поток захвата.
+
+    Поток умирает при смене аудиоустройства, причём молча: объект остаётся,
+    а сэмплы не идут. Поэтому проверяем не наличие объекта, а его активность.
+    """
+    global audio_stream
+    stream = audio_stream
+    if stream is not None:
+        try:
+            if stream.active:
+                return True
+        except Exception:
+            pass
+        print("[audio] Поток микрофона умер (возможно, сменилось устройство) — переоткрываю")
+        stop_audio_stream()
+        preroll_buffer.clear()
+    return start_audio_stream()
+
+def _close_idle_stream():
+    """Отпускает микрофон после простоя — чтобы индикатор не горел без дела."""
+    global audio_stream
+    if is_recording:
+        return
+    with state_lock:
+        if session_phase != "idle":
+            return
+    if audio_stream is not None:
+        print(f"[audio] Микрофон освобождён после {PREROLL_IDLE_TIMEOUT:.0f}с простоя")
+        stop_audio_stream()
+        preroll_buffer.clear()
+
+def schedule_idle_close():
+    """Заводит таймер освобождения микрофона, сбрасывая предыдущий."""
+    global _idle_timer
+    if not PREROLL_ENABLED or PREROLL_IDLE_TIMEOUT <= 0:
+        return
+    with _idle_timer_lock:
+        if _idle_timer is not None:
+            _idle_timer.cancel()
+        _idle_timer = threading.Timer(PREROLL_IDLE_TIMEOUT, _close_idle_stream)
+        _idle_timer.daemon = True
+        _idle_timer.start()
+
+def cancel_idle_close():
+    global _idle_timer
+    with _idle_timer_lock:
+        if _idle_timer is not None:
+            _idle_timer.cancel()
+            _idle_timer = None
 
 def stop_audio_stream():
+    """Безопасное отключение микрофона без блокировки основного потока."""
     global audio_stream
     try:
         if audio_stream:
@@ -184,13 +464,17 @@ def stop_audio_stream():
         print(f"[audio stop error] {e}")
 
 def background_cloud_probe():
+    """Фоновая проверка доступности облака с подтверждением стабильности."""
     global cloud_status
     if cloud_status["check_in_progress"]: return
-    
+
     def probe():
         cloud_status["check_in_progress"] = True
         try:
-            headers = {'Authorization': f'Bearer {GROQ_API_KEY}'}
+            headers = {
+                'Authorization': f'Bearer {GROQ_API_KEY}',
+                'User-Agent': WIN_USER_AGENT,
+            }
             response = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=5)
             if response.status_code == 200:
                 cloud_status["consecutive_success"] += 1
@@ -210,30 +494,90 @@ def background_cloud_probe():
 
     threading.Thread(target=probe, daemon=True).start()
 
-# ─── Утилиты ──────────────────────────────────────────────────────────────────
+# ─── Уведомления (платформенная точка 2) ──────────────────────────────────────
+
+NOTIFY_SOUND = True
 
 def notify(title: str, message: str):
-    """Windows version: Уведомление через консоль (самый надежный метод)."""
-    print(f"\n>>> {title}: {message}")
+    """Уведомление на Windows: строка в консоль плюс системный звук.
+
+    Асинхронно — по двум причинам, обеих на macOS нет. notify() зовётся изнутри
+    state_lock и изнутри колбэка низкоуровневого хука клавиатуры: синхронный
+    print, застрявший на выделении мышью в консоли (QuickEdit), заморозил бы
+    всё приложение вместе с захваченным локом, а UnicodeEncodeError из хука
+    останавливает listener pynput — клавиша умирает до перезапуска.
+
+    Звук, а не только печать: консоль стоит за активным окном, а пользователь
+    в этот момент смотрит в поле ввода. Без звука уход на локальную модель,
+    вырезанный водяной знак и потерянный кусок остаются незамеченными — то есть
+    вся работа по видимости деградаций пропадает. Тост через PowerShell
+    сознательно НЕ используется: внешняя зависимость, 300-800 мс и мигание
+    окном на каждое уведомление прямо в горячем пути клавиши.
+    """
+    def run_notify():
+        try:
+            print(f"\n>>> {title}: {message}")
+        except Exception:
+            pass
+        if NOTIFY_SOUND and winsound is not None:
+            try:
+                msg = message.lower()
+                # На старте записи и на «распознаю» молчим: звук в этот момент
+                # попадёт в микрофон (при включённой предзаписи — гарантированно).
+                # Сравнение по началу строки, а не по вхождению: «Слишком короткая
+                # запись» — это отказ, и он обязан быть слышен.
+                if not (msg.startswith("запись") or msg.startswith("распознаю")):
+                    low = (title + " " + message).lower()
+                    bad = any(w in low for w in (
+                        "сбой", "не удалась", "частично", "недоступен", "занят",
+                        "не распознана", "коротк", "молчит"))
+                    winsound.MessageBeep(0x30 if bad else 0x00)
+            except Exception:
+                pass
+
+    threading.Thread(target=run_notify, daemon=True).start()
+
+# ─── Утилиты текста ───────────────────────────────────────────────────────────
 
 def smart_grammar_fix(text: str) -> str:
-    if not text: return text
-    text = re.sub(r"(\w+)ться", r"\1ться", text)
-    text = re.sub(r'\s+([,.!?])', r'\1', text)
-    text = re.sub(r'([,.!?])\1+', r'\1', text)
-    text = re.sub(r'([,.!?])(?=[^\s])', r'\1 ', text)
-    text = re.sub(r'Claude[а-яА-Я]+', 'Claude', text)
+    """Косметика пробелов и ничего больше.
+
+    Убрано отсюда сознательно:
+      - вставка пробела после .!? — ломала числа, версии и имена файлов
+        ("версия 3.5" -> "версия 3. 5", "main.py" -> "main. py");
+      - схлопывание ([,.!?])\\1+ — вместе с приведением "...." к "..." выше
+        превращало многоточие в одну точку;
+      - re.sub(r"(\\w+)ться", r"\\1ться") — шаблон тождественен замене, мёртвый код;
+      - схлопывание Claude[а-яА-Я]+ — переписывало слово целиком ("Клауде" -> "Claude").
+    Whisper сам расставляет пробелы после знаков корректно; чинить нечего.
+    """
+    if not text:
+        return text
+    text = re.sub(r'\s+([,.!?;:])', r'\1', text)   # пробел ПЕРЕД знаком — всегда лишний
+    text = re.sub(r'[ \t]{2,}', ' ', text)          # двойные пробелы
     return text.strip()
 
+# Союзы/предлоги в конце — фраза не завершена, точку не ставим.
+# Английские when|where отсюда убраны: это регексп по РУССКОЙ речи, а четырёх
+# нормальных русских союзов (когда, где, куда, откуда) в нём не было.
 _INCOMPLETE_ENDING_RE = re.compile(
-    r'\b(?:и|а|но|или|либо|чтобы|что|как|если|when|where|'
+    r'\b(?:и|а|но|или|либо|чтобы|что|как|если|когда|где|куда|откуда|'
     r'который|которая|которое|которые|которых|которому|которой|'
     r'при|для|на|в|во|с|со|у|о|об|от|до|без|через|про|над|под|'
     r'перед|после|между|среди|по|к|ко|из)\s*$',
     re.IGNORECASE,
 )
 
+# Оформление сверху ОТКЛЮЧЕНО по умолчанию: whisper-large-v3 уже возвращает текст
+# с заглавной буквы и с точкой в конце, а навязывание поверх ломает диктовку
+# в середину предложения ("и добавь туда" -> "И добавь туда."). Поставь True,
+# если захочешь вернуть автооформление.
+FORCE_SENTENCE_CASE = False
+
 def apply_smart_sentence_ending(text: str) -> str:
+    """Оформление конца фразы. По умолчанию — тождественная функция."""
+    if not FORCE_SENTENCE_CASE:
+        return text.rstrip() if text else text
     if not text or len(text) <= 1:
         return text
     if text[0].islower():
@@ -248,93 +592,345 @@ def apply_smart_sentence_ending(text: str) -> str:
         return stripped
     return stripped + '.'
 
+# ─── Вставка текста (платформенные точки 3 и 7) ───────────────────────────────
+
+VK_CONTROL = 0x11
+VK_V = 0x56
+VK_MENU_MASK = 0xE8        # код без назначения — им гасится одиночный Alt
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+ERROR_ACCESS_DENIED = 5
+
+# Пауза перед возвратом буфера. 0.5 с из прежней версии — гонка: Ctrl+V
+# асинхронен, окно читает буфер, когда доберётся до сообщения, и Electron-окна
+# (Slack, VS Code) после тяжёлого декода регулярно не успевают — вставлялось
+# СТАРОЕ содержимое буфера вместо диктовки.
+CLIPBOARD_RESTORE_DELAY = 1.5
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", ctypes.c_ushort),
+                ("wScan", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_uint32),
+                ("time", ctypes.c_uint32),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", ctypes.c_int32),
+                ("dy", ctypes.c_int32),
+                ("mouseData", ctypes.c_uint32),
+                ("dwFlags", ctypes.c_uint32),
+                ("time", ctypes.c_uint32),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [("uMsg", ctypes.c_uint32),
+                ("wParamL", ctypes.c_ushort),
+                ("wParamH", ctypes.c_ushort)]
+
+class _INPUT_UNION(ctypes.Union):
+    # Все три члена объявлены не для красоты: SendInput сверяет cbSize с размером
+    # НАСТОЯЩЕЙ структуры INPUT, а её размер задаёт самый большой член (мышиный).
+    # С одним только KEYBDINPUT структура вышла бы на 8 байт короче, и вызов
+    # отвергался бы с ERROR_INVALID_PARAMETER.
+    _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT), ("hi", _HARDWAREINPUT)]
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_uint32), ("u", _INPUT_UNION)]
+
+
+_user32 = None
+
+def _get_user32():
+    global _user32
+    if _user32 is None:
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        u.SendInput.argtypes = (ctypes.c_uint, ctypes.POINTER(_INPUT), ctypes.c_int)
+        u.SendInput.restype = ctypes.c_uint
+        u.MapVirtualKeyW.argtypes = (ctypes.c_uint, ctypes.c_uint)
+        u.MapVirtualKeyW.restype = ctypes.c_uint
+        _user32 = u
+    return _user32
+
+
+def _send_keys(events: list) -> bool:
+    """Шлёт настоящие виртуальные клавиши. True — событие принято системой.
+
+    pynput тут не годится по механике: kb.press('v') под Windows превращается
+    в KeyCode(char='v', vk=None), а win32-бэкенд отправляет такой символ как
+    KEYEVENTF_UNICODE с wVk=0 (VK_PACKET). Это событие ВВОДА ТЕКСТА, а не
+    нажатие клавиши: приложение получает WM_CHAR 'v' при зажатом Ctrl, и
+    акселератор Ctrl+V из этого не рождается — вставка либо не срабатывает,
+    либо в поле прилетает буква «v». Явный vk снимает и вторую проблему —
+    раскладка перестаёт влиять вовсе.
+
+    Возврат SendInput — единственный на Windows признак того, что ввод вообще
+    дошёл до окна: если целевое окно запущено от администратора, UIPI молча
+    режет ввод от непривилегированного процесса, и pynput об этом не узнает.
+    """
+    user32 = _get_user32()
+    n = len(events)
+    arr = (_INPUT * n)()
+    for i, (vk, is_up) in enumerate(events):
+        arr[i].type = INPUT_KEYBOARD
+        arr[i].u.ki = _KEYBDINPUT(
+            wVk=vk,
+            wScan=user32.MapVirtualKeyW(vk, 0),
+            dwFlags=(KEYEVENTF_KEYUP if is_up else 0),
+            time=0,
+            dwExtraInfo=0,
+        )
+    sent = user32.SendInput(n, arr, ctypes.sizeof(_INPUT))
+    if sent == n:
+        return True
+    err = ctypes.get_last_error()
+    if err == ERROR_ACCESS_DENIED:
+        print("[insert] Ввод заблокирован: активное окно запущено от администратора (UIPI)")
+    else:
+        print(f"[insert] SendInput отправил {sent} из {n} событий, код {err}")
+    return False
+
+
+def _send_ctrl_v():
+    """Ctrl+V. True — ушло в окно, False — система отказала, None — не смогли позвать."""
+    try:
+        return _send_keys([(VK_CONTROL, False), (VK_V, False),
+                           (VK_V, True), (VK_CONTROL, True)])
+    except Exception as e:
+        print(f"[insert] SendInput недоступен: {type(e).__name__}")
+        return None
+
+
+def mask_alt_press() -> None:
+    """Гасит меню, которое Windows открывает на ОДИНОЧНОМ Alt.
+
+    Аналога на macOS нет и взять его в эталоне неоткуда: правый Option сам
+    по себе там не делает ничего. На Windows одиночное нажатие-отпускание Alt
+    активирует строку меню или ленту активного окна (Проводник, Word, браузер),
+    а наш сценарий — ровно одиночный Alt: зажал, поговорил, отпустил, ничего
+    между. Фокус после этого уходит в меню, и Ctrl+V прилетает В МЕНЮ, а не
+    в поле ввода. Достаточно, пока Alt ещё удерживается, «нажать» вместе с ним
+    незанятую клавишу: система видит комбинацию Alt+X и меню не открывает
+    (тот же приём применяют в AutoHotkey).
+
+    Отправка идёт из отдельного потока: блокирующая работа внутри колбэка
+    низкоуровневого хука (WH_KEYBOARD_LL) может превысить LowLevelHooksTimeout,
+    после чего система перестаёт звать наш хук и клавиша умирает до перезапуска.
+    """
+    def run():
+        try:
+            _send_keys([(VK_MENU_MASK, False), (VK_MENU_MASK, True)])
+        except Exception:
+            pass
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _insert_via_pynput(text: str) -> bool:
+    """Запасная вставка, когда WinAPI позвать не удалось.
+
+    Ctrl+V здесь идёт с ЯВНЫМ vk: kb.press('v') под Windows уходит как
+    unicode-пакет и акселератором не становится (см. _send_keys). Если и это
+    не вышло — посимвольный ввод: медленно, зато не зависит ни от буфера,
+    ни от акселератора.
+    """
+    try:
+        v_key = keyboard.KeyCode.from_vk(VK_V)
+        kb.press(KeyboardKey.ctrl)
+        kb.press(v_key)
+        kb.release(v_key)
+        kb.release(KeyboardKey.ctrl)
+        return True
+    except Exception:
+        pass
+    try:
+        kb.type(text)
+        print("[insert] Вставка посимвольным вводом")
+        return True
+    except Exception:
+        return False
+
+
+def _copy_to_clipboard(text: str, attempts: int = 3) -> bool:
+    """Кладёт текст в буфер, переживая временную блокировку буфера.
+
+    OpenClipboard эксклюзивен, и его на доли секунды держат Punto Switcher,
+    менеджеры буфера (Ditto) и проброс буфера в RDP — очень частая связка.
+    pyperclip в этот момент бросает PyperclipWindowsException; раньше оно
+    уходило в общий except, и текст диктовки пропадал бесследно.
+    """
+    for i in range(attempts):
+        try:
+            pyperclip.copy(text)
+            return True
+        except Exception as e:
+            print(f"[insert] Буфер занят ({type(e).__name__}), повтор {i + 1} из {attempts}")
+            time.sleep(0.15 * (i + 1))
+    return False
+
+
 def _restore_clipboard_async(old_clipboard: str) -> None:
+    """Возврат буфера обмена в фоне — не блокирует завершение вставки."""
     def run_restore():
         try:
-            time.sleep(0.5)
+            time.sleep(CLIPBOARD_RESTORE_DELAY)
             pyperclip.copy(old_clipboard)
-        except: pass
+        except Exception as e:
+            print(f"[insert] clipboard restore error: {e}")
     threading.Thread(target=run_restore, daemon=True).start()
 
+
 def direct_insert(text: str):
-    """Windows version: Вставка через Ctrl+V."""
+    """Вставка на Windows: буфер обмена плюс настоящий Ctrl+V.
+
+    Три отличия от прежней версии, и каждое — это потерянный текст:
+      1. успех ПРОВЕРЯЕТСЯ. pynput ничего не возвращает, поэтому раньше
+         печаталось «[insert success]» даже когда окно не приняло ничего;
+      2. при неудаче буфер НЕ восстанавливается: текст остаётся в нём и
+         вставляется руками. Раньше через 0.5 с буфер затирался прежним
+         содержимым — диктовка уничтожалась дважды, и в окно не попала,
+         и из буфера стёрлась;
+      3. пустой прежний буфер не возвращается: pyperclip отдаёт '' для
+         скопированных ФАЙЛОВ (CF_HDROP) и картинок, и «восстановление»
+         затирало пользовательскую копию пустотой.
+    """
     try:
-        old_clipboard = pyperclip.paste()
-        pyperclip.copy(text)
-        time.sleep(0.1) 
-        
-        kb.press(KeyboardKey.ctrl)
-        kb.press('v')
-        kb.release('v')
-        kb.release(KeyboardKey.ctrl)
-        
-        print(f"[insert success] '{text[:30]}...'")
-        if RESTORE_CLIPBOARD:
-            _restore_clipboard_async(old_clipboard)
+        old_clipboard = ""
+        try:
+            old_clipboard = pyperclip.paste() or ""
+        except Exception as e:
+            print(f"[insert] Прежний буфер не прочитан ({type(e).__name__})")
+
+        if not _copy_to_clipboard(text):
+            print("[insert fail] Буфер обмена заблокирован — текст не скопирован")
+            notify("WhisperKey — вставка не удалась",
+                   "Буфер занят другой программой, текст потерян")
+            return
+
+        time.sleep(0.1)   # окну нужен момент, чтобы увидеть новое содержимое буфера
+
+        inserted = _send_ctrl_v()
+        if inserted is None:
+            # WinAPI недоступен — остаётся pynput. Проверить успех здесь нечем,
+            # поэтому путь именно запасной.
+            inserted = _insert_via_pynput(text)
+        # Явный отказ SendInput (inserted is False) назад не лечится, и пробовать
+        # что-то ещё нельзя: pynput на Windows шлёт ввод ТЕМ ЖЕ SendInput, значит
+        # упрётся в тот же запрет — но соврёт об успехе, и буфер будет затёрт.
+
+        if inserted:
+            print(f"[insert success] '{text[:30]}...'")
+            if RESTORE_CLIPBOARD and old_clipboard:
+                _restore_clipboard_async(old_clipboard)
+        else:
+            print("[insert fail] Текст остался в буфере обмена — нажми Ctrl+V")
+            notify("WhisperKey — вставка не удалась", "Текст в буфере, нажми Ctrl+V")
+
     except Exception as e:
         print(f"[insert error] {e}")
+        notify("WhisperKey — вставка не удалась", "Текст в буфере, нажми Ctrl+V")
+
+# ─── Снятие водяных знаков ────────────────────────────────────────────────────
+
+artifacts_removed: list[str] = []   # что вырезали в последней обработке — для уведомления
 
 def strip_asr_artifacts(text: str) -> str:
+    """Удаляет водяные знаки Whisper, НЕ трогая окружающий текст.
+
+    Два принципиальных отличия от прежней версии:
+      1. Вырезается только сам маркер, а не "маркер и всё после него". Раньше
+         cleaned[:idx] выбрасывал продолжение фразы — "Он корректор и дизайнер"
+         превращалось в "Он".
+      2. Ищем по всему тексту, а не в последних 20 символах: в реальных выдачах
+         маркеры стоят и в середине (замер по transcribe-bot — все 4 подстановки
+         были в середине текста).
+    Маркер удаляется, только когда он занимает отдельную фразу — то есть слева
+    начало текста или конец предложения, справа конец текста или знак препинания.
+    """
     cleaned = text.strip()
-    if not cleaned: return cleaned
+    if not cleaned:
+        return cleaned
+
+    # Зацикленный рассказчик: режем, только если паттерн повторился 2+ раза.
     loop_matches = list(re.finditer(NARRATOR_LOOP_PATTERN, cleaned, flags=re.IGNORECASE))
     if len(loop_matches) >= 2:
         cut_pos = loop_matches[0].start()
+        artifacts_removed.append(f"зацикливание ({len(loop_matches)} повторов)")
+        print(f"[boh] deloop cut at {cut_pos} ({len(loop_matches)} matches)")
         cleaned = cleaned[:cut_pos].strip()
-    if not cleaned: return cleaned
-    
-    # CEO Quality: Проверяем хвост на маркеры галлюцинаций.
-    lower = cleaned.lower()
-    tail_zone = lower[-20:]
-    for marker in BOH_TAIL_MARKERS:
-        if marker in tail_zone:
-            idx = lower.rfind(marker)
-            cleaned = cleaned[:idx].strip()
-            lower = cleaned.lower()
-            tail_zone = lower[-20:]
-    return cleaned.strip()
 
-def should_skip_llm(raw_text: str) -> bool:
-    words = raw_text.split()
-    if len(words) > LLAMA_SKIP_MAX_WORDS:
-        return False
-    lower = raw_text.lower()
-    if any(t in lower for t in HALLUCINATION_TRIGGERS):
-        return False
-    if any(m in lower for m in BOH_TAIL_MARKERS):
-        return False
-    if len(re.findall(NARRATOR_LOOP_PATTERN, raw_text, flags=re.IGNORECASE)) >= 2:
-        return False
-    return True
+    if not cleaned:
+        return cleaned
+
+    # Водяной знак занимает предложение целиком и обычно тащит за собой хвост
+    # ("Субтитры сделал DimaTorzok", "Редактор субтитров А.Семкин"). Удаляем от
+    # начала маркера до конца его предложения — но только если хвост короткий:
+    # это защита от сноса живого абзаца, если маркер вдруг совпал со словами речи.
+    MAX_TAIL_WORDS = 6
+    for marker in BOH_TAIL_MARKERS:
+        pattern = re.compile(
+            r'(?:(?<=^)|(?<=[.!?…]))(\s*' + re.escape(marker) + r'([^.!?…]*))',
+            flags=re.IGNORECASE,
+        )
+        while True:
+            match = pattern.search(cleaned)
+            if not match:
+                break
+            tail_words = match.group(2).split()
+            if len(tail_words) > MAX_TAIL_WORDS:
+                break  # слишком длинный хвост — это, скорее всего, живая речь
+            cleaned = (cleaned[:match.start(1)] + ' ' + cleaned[match.end(1):]).strip()
+            cleaned = re.sub(r'^\s*[.!?…]+\s*', '', cleaned)
+            artifacts_removed.append(marker)
+            print(f"[boh] водяной знак удалён: '{marker}'")
+
+    return re.sub(r'\s{2,}', ' ', cleaned).strip()
+
+# Нормализация написания названий продуктов — единственная разрешённая замена слов.
+# Слово не меняется на другое слово: приводится лишь регистр/латиница уже
+# распознанного названия. Ставь False, если не нужно даже это.
+NORMALIZE_BRAND_NAMES = True
+BRAND_NAMES = {
+    r'\bclaude\b': 'Claude',
+    r'\bcursor\b': 'Cursor',
+    r'\bgroq\b': 'Groq',
+    r'\btelegram\b': 'Telegram',
+    r'\bwhisper\b': 'Whisper',
+    r'\bgithub\b': 'GitHub',
+    r'\bapi\b': 'API',
+}
 
 def clean_noise(text: str) -> str:
-    if not text: return ""
+    """Снимает водяные знаки ASR. Слова пользователя не трогает.
+
+    Что убрано отсюда и почему:
+      - hallucination_words: одиночные "Python"/"Cursor"/"Конец" обнулялись целиком,
+        то есть односложный ответ терялся на 100% и приходило "Речь не распознана";
+      - bad_endings: срезали настоящее последнее слово фразы;
+      - business_vocabulary: переписывал живую речь ("сео" -> "CEO", "депло" -> "деплой")
+        без ведома говорящего — прямое нарушение цели системы;
+      - [фФfFaA]{4,}: смесь кириллицы и латиницы, ломала имена файлов
+        ("Открой файл AAAA.txt" -> "Открой файл. txt").
+    """
+    if not text:
+        return ""
     text = strip_asr_artifacts(text)
-    if not text: return ""
-    hallucination_words = ["КОНЕЦ", "Конец", "Конец связи", "Cursor", "Python", "CEO to CEO"]
-    if text.strip() in hallucination_words: return ""
-    text = re.sub(r'[фФfFaA]{4,}', '', text).strip()
-    text = re.sub(r'[.]{3,}', '...', text).strip()
-    bad_endings = [r"Cursor[.!?]*$", r"Python[.!?]*$", r"CEO to CEO[.!?]*$", r"Claude[.!?]*$"]
-    for pattern in bad_endings:
-        if re.search(r'[.!?]\s+' + pattern, text):
-            text = re.sub(r'\s+' + pattern, '', text).strip()
-    business_vocabulary = {
-        r'\b[Cc]laude\b': 'Claude',
-        r'\b[Cc]eo to [Cc]eo\b': 'CEO to CEO',
-        r'\b[Cc][Ee][Oo]\b': 'CEO',
-        r'\b[Сс]ело то [Сс]ело\b': 'CEO to CEO',
-        r'\b[Сс]ео то [Сс]ео\b': 'CEO to CEO',
-        r'\b[Сс]ео\b': 'CEO',
-        r'\b[Дд]ипло\b': 'деплой',
-        r'\b[Дд]епло\b': 'деплой',
-        r'\b[Dd]eplo\b': 'deploy',
-    }
-    for pattern, replacement in business_vocabulary.items():
-        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    if not text:
+        return ""
+
+    text = re.sub(r'[.]{4,}', '...', text).strip()   # только явно избыточные точки
+
+    if NORMALIZE_BRAND_NAMES:
+        for pattern, replacement in BRAND_NAMES.items():
+            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
     return text.strip()
 
 def compress_silence(audio_data, threshold=0.01, min_pause=1.5, keep_pause=0.5):
+    """Сжатие длинных пауз. НЕ ВЫЗЫВАЕТСЯ — оставлено ровно как в эталоне.
+
+    Убрано из тракта по замеру: на диктовке результат побайтово тот же,
+    на длинной записи цепочка предобработки стоила 15.6% слов.
+    """
     try:
         if len(audio_data) == 0: return audio_data
         window_size = int(SAMPLE_RATE * 0.1)
@@ -363,111 +959,264 @@ def compress_silence(audio_data, threshold=0.01, min_pause=1.5, keep_pause=0.5):
         return audio_data
 
 def create_audio_wav(audio_data):
+    """Упаковка звука в WAV без какой-либо обработки.
+
+    Всё, что здесь было раньше, снято по замерам:
+      - compress_silence: на диктовке результат побайтово тот же (совпадение 1.0000),
+        на длинной записи цепочка стоила 15.6% слов;
+      - паддинг 0.5 с тишины: приписывание чистой ЦИФРОВОЙ тишины к идентичному
+        аудио сдвигает границы 30-секундных окон модели и отнимает 8-10% слов;
+      - нормировка по пику: пользы не показала, а вместе с паддингом двигала таймлайн.
+    Остался только клип в ±1.0, чтобы не переполнить int16.
+    """
     try:
-        audio_data = compress_silence(audio_data)
-        silence_padding = np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32)
-        audio_data = np.append(audio_data, silence_padding)
+        audio_data = np.clip(np.asarray(audio_data, dtype=np.float32), -1.0, 1.0)
+
         wav_io = io.BytesIO()
         with wave.open(wav_io, 'wb') as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(SAMPLE_RATE)
-            max_v = np.max(np.abs(audio_data))
-            if max_v > 0: audio_data = audio_data / max_v
             wf.writeframes((audio_data * 32767).astype(np.int16).tobytes())
+
+        if SAVE_DEBUG_AUDIO:
+            try:
+                with open(os.path.join(BASE_DIR, "debug_audio.wav"), "wb") as f:
+                    f.write(wav_io.getvalue())
+            except Exception:
+                pass
+
         return wav_io.getvalue()
     except Exception as e:
         print(f"[wav error] {e}")
         return None
 
-def transcribe_cloud_turbo(audio_data):
+# ─── Разбор ответа модели ─────────────────────────────────────────────────────
+
+def _find_degenerate_segments(segments: list) -> list:
+    """Сегменты, где модель сорвалась: длинные и почти без слов.
+
+    no_speech_prob этот отказ не видит — у замеренных пустых сегментов он был
+    0.028 и 0.581, то есть «речь точно есть». Именно поэтому прежний фильтр
+    (no_speech_prob > 0.85) здесь удалён: он резал короткие настоящие реплики
+    и при этом пропускал мусор. Плотность слов ловит срыв надёжно:
+    3 из 3 и 4 из 4 в двух независимых проверках.
+    """
+    bad = []
+    for seg in segments:
+        try:
+            dur = float(seg.get('end', 0.0)) - float(seg.get('start', 0.0))
+        except (TypeError, ValueError):
+            continue
+        if dur < DENSITY_GATE_MIN_DURATION:
+            continue
+        n_words = len(seg.get('text', '').split())
+        if dur > 0 and (n_words / dur) < DENSITY_GATE_MIN_WORDS_PER_SEC:
+            bad.append({'start': float(seg.get('start', 0.0)),
+                        'end': float(seg.get('end', 0.0)),
+                        'words': n_words, 'dur': dur})
+    return bad
+
+def _words_in_range(words: list, start: float, end: float) -> str:
+    """Слова из words[], попадающие в интервал времени."""
+    picked = []
+    for w in words:
+        try:
+            w_start = float(w.get('start', -1))
+        except (TypeError, ValueError):
+            continue
+        if start <= w_start < end:
+            token = (w.get('word') or '').strip()
+            if token:
+                picked.append(token)
+    return ' '.join(picked)
+
+def _text_from_response(result: dict) -> tuple[str, list]:
+    """Собирает текст: пунктуация из segments[], потерянное — из words[].
+
+    Почему не одно из двух:
+      - segments[] дают читаемый текст со знаками препинания, но на длинном входе
+        модель отдаёт пустые и вырожденные окна ("95 95 95") — до 19.5% выхода
+        теряется прямо внутри успешного ответа API;
+      - words[] содержат ВСЁ распознанное (слов, которые есть в сегментах и нет
+        в словах, во всех замерах было ровно 0), но приходят без пунктуации.
+    Поэтому основа — сегменты, а words[] подставляются только туда, где сегмент
+    сорвался. Так сохраняется и читаемость, и полнота.
+    """
+    words = result.get('words') or []
+    segments = result.get('segments') or []
+    degenerate = _find_degenerate_segments(segments)
+    degenerate_spans = {(d['start'], d['end']) for d in degenerate}
+
+    if not segments:
+        if words:
+            return ' '.join((w.get('word') or '').strip()
+                            for w in words if (w.get('word') or '').strip()), degenerate
+        return (result.get('text') or '').strip(), degenerate
+
+    pieces = []
+    prev_end = 0.0
+    for seg in segments:
+        try:
+            s_start = float(seg.get('start', 0.0))
+            s_end = float(seg.get('end', 0.0))
+        except (TypeError, ValueError):
+            s_start = s_end = 0.0
+        seg_text = (seg.get('text') or '').strip()
+
+        # Слова, оставшиеся между сегментами — модель их распознала, но в текст
+        # они не попали.
+        if words and s_start > prev_end + 0.5:
+            gap = _words_in_range(words, prev_end, s_start)
+            if gap:
+                pieces.append(gap)
+
+        if (s_start, s_end) in degenerate_spans or not seg_text:
+            recovered = _words_in_range(words, s_start, s_end) if words else ''
+            if recovered:
+                print(f"[recover] окно {s_start:.1f}-{s_end:.1f}с: "
+                      f"восстановлено {len(recovered.split())} слов из words[]")
+                pieces.append(recovered)
+            elif seg_text:
+                pieces.append(seg_text)
+        elif seg_text:
+            pieces.append(seg_text)
+
+        prev_end = max(prev_end, s_end)
+
+    # Хвост после последнего сегмента
+    if words:
+        tail = _words_in_range(words, prev_end, float('inf'))
+        if tail:
+            pieces.append(tail)
+
+    text = ' '.join(p for p in pieces if p).strip()
+    return (text or (result.get('text') or '').strip()), degenerate
+
+# ─── Сеть ─────────────────────────────────────────────────────────────────────
+
+_rate_lock = threading.Lock()
+_last_request_ts = [0.0]
+
+def _throttle():
+    """Разносит запросы во времени.
+
+    Замер на 30-минутной записи: 32 куска в 4 потока без пауз словили 429 и
+    потеряли 4 куска текста насовсем. Лимит ключа — 7200 секунд аудио в час,
+    но упирается всё в частоту запросов, а не в объём.
+    """
+    with _rate_lock:
+        delta = time.time() - _last_request_ts[0]
+        if delta < MIN_REQUEST_INTERVAL:
+            time.sleep(MIN_REQUEST_INTERVAL - delta)
+        _last_request_ts[0] = time.time()
+
+def transcribe_cloud_turbo(audio_data, allow_retry: bool = True, use_prompt: bool = True,
+                           return_words: bool = False):
+    """Расшифровка через Groq whisper-large-v3.
+
+    Возвращает строку текста либо None. При return_words=True — кортеж
+    (текст, список слов с таймкодами): слова нужны для склейки перекрытий
+    по времени, текстовое сравнение на стыке ненадёжно, потому что модель
+    распознаёт один и тот же участок в разных кусках немного по-разному.
+    Сорванные окна отдаёт через cloud_status['last_degenerate'].
+
+    Нормировка входного звука отсюда убрана вместе со всей предобработкой:
+    сдвиг амплитуды двигал границы 30-секундных окон модели и стоил слов.
+    """
     global cloud_status
+
+    empty = (None, []) if return_words else None
+
     if cloud_status["is_blocked"]:
         if time.time() - cloud_status["last_check_time"] > 60:
             background_cloud_probe()
-        return None
-    if not GROQ_API_KEY: return None
-    max_val = np.max(np.abs(audio_data))
-    if max_val > 0.0001: audio_data = audio_data / max_val * 0.98
+        return empty
+
+    if not GROQ_API_KEY:
+        return empty
+
     wav_data = create_audio_wav(audio_data)
-    if not wav_data: return None
-    headers = {'Authorization': f'Bearer {GROQ_API_KEY}'}
-    files = {'file': ('audio.wav', io.BytesIO(wav_data), 'audio/wav')}
-    data = {
-        'model': CLOUD_WHISPER_MODEL,
-        'language': 'ru',
-        'prompt': ASR_CONTEXT_PROMPT,
-        'temperature': 0.0,
-        'response_format': 'verbose_json'
-    }
-    try:
-        response = http_session.post("https://api.groq.com/openai/v1/audio/transcriptions", headers=headers, files=files, data=data, timeout=15)
-        if response.status_code == 200:
-            result = response.json()
-            # CEO Fix: Фильтруем сегменты с низкой уверенностью (галлюцинации)
-            segments = result.get('segments', [])
-            valid_text = []
-            for seg in segments:
-                seg_text = seg.get('text', '').strip()
-                if not seg_text: continue
-                no_speech_prob = seg.get('no_speech_prob', 0.0)
+    if not wav_data:
+        return empty
 
-                # CEO Quality: Отсекаем только экстремально вероятный шум (p > 0.85).
-                if no_speech_prob > 0.85 and len(seg_text) < 10: continue
-
-                valid_text.append(seg_text)
-            return " ".join(valid_text) if valid_text else result.get('text', '')
-        if response.status_code == 403:
-            cloud_status["is_blocked"] = True
-            cloud_status["last_check_time"] = time.time()
-            background_cloud_probe()
-            return None
-    except: pass
-    return None
-
-def refine_text_llm(raw_text):
-    if not raw_text or len(raw_text) < 5: return raw_text
-    context_tail = last_text_context[-40:] if last_text_context else ""
     headers = {
         'Authorization': f'Bearer {GROQ_API_KEY}',
-        'Content-Type': 'application/json',
+        'User-Agent': WIN_USER_AGENT,
+        'Accept': 'application/json'
     }
-    payload = {
-        "model": "llama-3.1-70b-versatile",
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Ты - эксперт-лингвист. Твоя цель: превратить сырой ASR-текст в безупречный.\n"
-                    "ПРАВИЛА:\n"
-                    "1. Исправляй фонетику (провайдеры, может, Экхарт Толле).\n"
-                    "2. СТРОГИЙ ЗАПРЕТ на выдумку фамилий и ассоциаций (если в ASR только 'Игорь', не пиши фамилию).\n"
-                    "3. НЕ добавляй контекст (не меняй 'вендинг' на 'бизнес').\n"
-                    "4. Восстанавливай падежи, окончания и пунктуацию, сохраняя авторский порядок слов.\n"
-                    "5. Если фраза обрывается - не дописывай.\n"
-                    "Выдай ТОЛЬКО чистый исправленный текст."
-                )
-            },
-            {"role": "user", "content": f"Контекст: ...{context_tail}\nСырой текст ASR: {raw_text}"}
-        ],
-        "temperature": 0.0
-    }
-    try:
-        response = http_session.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=headers, json=payload, timeout=10
-        )
-        if response.status_code == 200:
-            refined = response.json()['choices'][0]['message']['content'].strip()
-            words_raw = len(raw_text.split())
-            words_refined = len(refined.split())
-            if words_refined >= words_raw - 1 and words_refined >= words_raw * 0.9:
-                return refined.strip('"')
-            print(f"[warn] LLM word count guard failed ({words_refined} vs {words_raw}). Using raw text.")
-    except: pass
-    return raw_text
+
+    files = {'file': ('audio.wav', io.BytesIO(wav_data), 'audio/wav')}
+    data = [
+        ('model', CLOUD_WHISPER_MODEL),
+        ('language', 'ru'),
+        ('temperature', '0.0'),
+        ('response_format', 'verbose_json'),
+        # Обе гранулярности обязательны: при запросе только 'word' Groq отдаёт
+        # segments: null, и детектор плотности остаётся слепым.
+        ('timestamp_granularities[]', 'segment'),
+        ('timestamp_granularities[]', 'word'),
+    ]
+    if use_prompt and ASR_CONTEXT_PROMPT:
+        data.append(('prompt', ASR_CONTEXT_PROMPT))
+
+    for attempt in range(4):
+        try:
+            _throttle()
+            # timeout=60, а не 15: порог нарезки теперь 15 минут, то есть в одном
+            # запросе уходит вся запись целиком. 15 секунд на её загрузку
+            # и распознавание не хватило бы гарантированно, и каждая длинная
+            # диктовка молча падала бы на локальную модель.
+            response = http_session.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers=headers, files=files, data=data, timeout=60
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                text, degenerate = _text_from_response(result)
+                cloud_status["last_degenerate"] = degenerate
+                if degenerate:
+                    total = sum(d['dur'] for d in degenerate)
+                    print(f"[gate] сорванных окон: {len(degenerate)}, суммарно {total:.1f}с")
+                if return_words:
+                    return text, (result.get('words') or [])
+                return text
+
+            if response.status_code == 403:
+                print("[!] Groq 403 (гео-блок). Ухожу на локальную модель.")
+                cloud_status["is_blocked"] = True
+                cloud_status["last_check_time"] = time.time()
+                background_cloud_probe()
+                return empty
+
+            # 429 и 5xx лечатся ожиданием. Раньше здесь был единственный POST
+            # и голый except: pass — любой такой ответ давал молчаливую дыру;
+            # на 30-минутной записи так терялось 4 куска из 32.
+            if response.status_code in (429, 500, 502, 503, 504) and allow_retry and attempt < 3:
+                wait = float(response.headers.get('retry-after', 0) or 0) or (2 ** attempt) * 2
+                wait = min(wait, 20.0)
+                print(f"[cloud] {response.status_code}, повтор через {wait:.1f}с "
+                      f"(попытка {attempt + 2} из 4)")
+                time.sleep(wait)
+                files = {'file': ('audio.wav', io.BytesIO(wav_data), 'audio/wav')}
+                continue
+
+            print(f"[cloud error] Статус: {response.status_code}")
+            return empty
+
+        except Exception as e:
+            print(f"[cloud exception] {type(e).__name__}")
+            if allow_retry and attempt < 3:
+                time.sleep(2 ** attempt)
+                files = {'file': ('audio.wav', io.BytesIO(wav_data), 'audio/wav')}
+                continue
+            return empty
+
+    return empty
 
 def _transcribe_local(chunk: np.ndarray) -> str:
+    """Локальный fallback — только когда cloud не дал пригодный текст."""
     max_val = np.max(np.abs(chunk))
     if max_val > 0.0001:
         chunk = chunk / max_val * 0.99
@@ -475,26 +1224,212 @@ def _transcribe_local(chunk: np.ndarray) -> str:
         chunk, language="ru",
         beam_size=5, patience=1.0, repetition_penalty=1.2,
         vad_filter=False, suppress_blank=True, without_timestamps=True,
-        condition_on_previous_text=False, initial_prompt=ASR_CONTEXT_PROMPT,
+        condition_on_previous_text=False,
+        initial_prompt=ASR_CONTEXT_PROMPT or None,
     )
     return " ".join(seg.text.strip() for seg in segments).strip()
 
-def _transcribe_one_chunk(chunk: np.ndarray, chunk_idx: int, n_chunks: int) -> tuple[int, str | None]:
+def _transcribe_one_chunk(chunk: np.ndarray, chunk_idx: int, n_chunks: int) -> tuple[int, str | None, str, list]:
+    """Распознаёт один кусок. Возвращает (индекс, текст|None, метка_качества, слова).
+
+    Метка качества: 'cloud' | 'cloud_retry' | 'local' | 'lost'. Она нужна выше,
+    чтобы пользователь увидел, что часть записи ушла на слабую локальную модель
+    или потерялась — раньше и то и другое проходило молча.
+    Слова с таймкодами нужны для склейки перекрытий по времени.
+    """
+    if n_chunks > 1:
+        print(f"[chunk] Сегмент {chunk_idx + 1}/{n_chunks} ({len(chunk) / SAMPLE_RATE:.1f}s)")
+
     chunk_text = None
+    chunk_words: list = []
+    quality = 'lost'
     chunk_dur = len(chunk) / SAMPLE_RATE
     use_cloud = CLOUD_ENABLED and not cloud_status.get("is_blocked")
+
     if use_cloud:
-        raw_text = transcribe_cloud_turbo(chunk)
+        raw_text, chunk_words = transcribe_cloud_turbo(chunk, return_words=True)
+        degenerate = list(cloud_status.get("last_degenerate") or [])
         if raw_text:
             lower = raw_text.lower()
             if any(t in lower for t in HALLUCINATION_TRIGGERS):
                 cleaned = strip_asr_artifacts(raw_text)
-                if cleaned and (len(cleaned.split()) >= 3 or chunk_dur <= 5.0): chunk_text = cleaned
-            else: chunk_text = raw_text
+                if cleaned and (len(cleaned.split()) >= 3 or chunk_dur <= 5.0):
+                    chunk_text, quality = cleaned, 'cloud'
+                else:
+                    print(f"[guard] Сегмент {chunk_idx + 1}: пусто после чистки")
+            else:
+                chunk_text, quality = raw_text, 'cloud'
+
+        # Переспрос без промпта — только если срыв НЕ удалось залечить словами.
+        # Если words[] уже вернули речь для сорванного окна, второй запрос лишний:
+        # он стоит квоты, а на 30-минутной записи именно перерасход запросов
+        # приводил к 429 и потере целых кусков.
+        if degenerate and ASR_CONTEXT_PROMPT and _needs_retry(degenerate, chunk_words):
+            print(f"[gate] Сегмент {chunk_idx + 1}: переспрашиваю без промпта")
+            retry_text, retry_words = transcribe_cloud_turbo(chunk, use_prompt=False, return_words=True)
+            if retry_text and len(retry_text.split()) > len((chunk_text or '').split()):
+                chunk_text, quality, chunk_words = retry_text, 'cloud_retry', retry_words
+
     if not chunk_text:
-        print(f"[local] Сегмент {chunk_idx + 1}: offline decode")
-        chunk_text = _transcribe_local(chunk) or None
-    return chunk_idx, chunk_text
+        print(f"[local] Сегмент {chunk_idx + 1}: локальная модель (качество ниже)")
+        try:
+            chunk_text = _transcribe_local(chunk) or None
+            quality = 'local' if chunk_text else 'lost'
+            chunk_words = []
+        except Exception as e:
+            print(f"[local error] Сегмент {chunk_idx + 1}: {type(e).__name__} {e}")
+            chunk_text, quality = None, 'lost'
+
+    return chunk_idx, chunk_text, quality, chunk_words
+
+def _needs_retry(degenerate: list, words: list) -> bool:
+    """Стоит ли переспрашивать окно, которое модель провалила.
+
+    Не стоит, если words[] уже дали для этого интервала осмысленную плотность
+    речи — текст спасён, повторный запрос ничего не добавит, а квоту потратит.
+    """
+    for d in degenerate:
+        span = d['end'] - d['start']
+        if span <= 0:
+            continue
+        recovered = sum(1 for w in words
+                        if d['start'] <= float(w.get('start', -1)) < d['end'])
+        if (recovered / span) < DENSITY_GATE_MIN_WORDS_PER_SEC:
+            return True
+    return False
+
+# ─── Нарезка и склейка ────────────────────────────────────────────────────────
+
+def _split_audio(audio: np.ndarray, dur: float) -> tuple[list, list]:
+    """Режет запись на куски с перекрытием. Возвращает (куски, смещения_в_секундах).
+
+    Короткие записи не режутся вовсе — это главная защита от галлюцинаций:
+    каждый разрез даёт модели ещё один «конец файла», где она склонна дописывать
+    субтитровые водяные знаки. Прежняя win-нарезка (порог 30 с, куски по 20 с,
+    поиск минимума энергии) шла БЕЗ перекрытия, поэтому слова на швах терялись
+    безвозвратно и склеить их обратно было нечем.
+    """
+    if dur <= CHUNK_THRESHOLD_SECONDS:
+        return [audio], [0.0]
+
+    size = int(SAMPLE_RATE * CHUNK_SIZE_SECONDS)
+    overlap = int(SAMPLE_RATE * CHUNK_OVERLAP_SECONDS)
+    step = max(size - overlap, size // 2)
+
+    chunks, offsets = [], []
+    pos = 0
+    while pos < len(audio):
+        end = min(pos + size, len(audio))
+        chunks.append(audio[pos:end])
+        offsets.append(pos / SAMPLE_RATE)
+        if end >= len(audio):
+            break
+        pos += step
+
+    print(f"[chunk] Длинная запись {dur:.1f}s → {len(chunks)} кусков "
+          f"по {CHUNK_SIZE_SECONDS:.0f}s с перекрытием {CHUNK_OVERLAP_SECONDS:.0f}s")
+    return chunks, offsets
+
+def _norm_word(w: str) -> str:
+    return re.sub(r'[^\w]', '', w.lower().replace('ё', 'е'))
+
+def _drop_overlap(prev_text: str, next_text: str, max_probe: int = 25) -> str:
+    """Убирает из next_text повтор, попавший в него из зоны перекрытия.
+
+    Ищется ТОЧНОЕ совпадение хвоста предыдущего куска с головой следующего,
+    длиной от трёх слов. Нечёткое сравнение сознательно не используется: на
+    замере оно один раз выбросило 12 слов настоящей речи, оставив бессмыслицу.
+    Не нашли точного совпадения — ничего не трогаем: лишний дубль пережить можно,
+    потерянные слова — нет.
+    """
+    prev_words = prev_text.split()
+    next_words = next_text.split()
+    if len(prev_words) < 3 or len(next_words) < 3:
+        return next_text
+
+    limit = min(max_probe, len(prev_words), len(next_words))
+    for n in range(limit, 2, -1):
+        tail = [_norm_word(w) for w in prev_words[-n:]]
+        head = [_norm_word(w) for w in next_words[:n]]
+        if tail == head and any(tail):
+            return ' '.join(next_words[n:])
+    return next_text
+
+def _fmt_mmss(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    return f"{m:02d}:{s:02d}"
+
+def _overlap_word_count(words: list, chunk_start: float, cut_before: float) -> int:
+    """Сколько первых слов куска попало в зону перекрытия с предыдущим.
+
+    Считаем по таймкодам, а режем потом от ТЕКСТА — иначе, пересобирая фразу
+    из words[], мы теряем пунктуацию, которая есть только в segments[].
+    Сравнение по времени надёжнее текстового: один и тот же участок в соседних
+    кусках модель распознаёт немного по-разному, и точного совпадения на стыке
+    может не быть вовсе.
+    """
+    n = 0
+    for w in words:
+        try:
+            abs_start = chunk_start + float(w.get('start', 0.0))
+        except (TypeError, ValueError):
+            break
+        if abs_start >= cut_before:
+            break
+        if (w.get('word') or '').strip():
+            n += 1
+    return n
+
+def _join_chunks(parts: list, quality: list, offsets: list,
+                 words_per_chunk: list | None = None) -> tuple[str, list]:
+    """Склеивает куски, помечая потерянные. Возвращает (текст, список_меток_потерь).
+
+    Кусок, который не распознался, раньше просто выпадал из спискового включения
+    [p for p in ordered_parts if p]: дыра склеивалась встык, и приходило бодрое
+    «Текст готов». Теперь на его месте остаётся видимая метка — текст честнее,
+    чем гладкий обман.
+
+    Перекрытие снимается по таймкодам слов, если они есть, и точным текстовым
+    совпадением в запасном варианте. Нечёткого сравнения здесь нет намеренно:
+    на замере оно уничтожило 12 слов реальной речи, оставив бессмыслицу.
+    """
+    pieces: list[str] = []
+    lost_marks: list[str] = []
+    prev_end: float | None = None
+
+    for idx, text in enumerate(parts):
+        if not text:
+            if len(parts) > 1:
+                mark = f"[не распознано {_fmt_mmss(offsets[idx])}]"
+                lost_marks.append(mark)
+                pieces.append(mark)
+            continue
+
+        chunk_words = (words_per_chunk[idx] if words_per_chunk and idx < len(words_per_chunk)
+                       else None)
+        if pieces and prev_end is not None and chunk_words:
+            n_dup = _overlap_word_count(chunk_words, offsets[idx], prev_end)
+            words_of_text = text.split()
+            # Режем от текста, а не от words[] — так остаётся пунктуация.
+            # Если перекрытие вдруг накрыло весь кусок, оставляем текст как есть:
+            # лишний дубль пережить можно, потерянные слова нет.
+            if 0 < n_dup < len(words_of_text):
+                text = ' '.join(words_of_text[n_dup:])
+        elif pieces:
+            text = _drop_overlap(pieces[-1], text)
+
+        if chunk_words:
+            try:
+                prev_end = offsets[idx] + max(float(w.get('end', 0.0)) for w in chunk_words)
+            except (TypeError, ValueError):
+                prev_end = None
+
+        if text:
+            pieces.append(text)
+
+    return ' '.join(p for p in pieces if p).strip(), lost_marks
+
+# ─── Транскрибация ────────────────────────────────────────────────────────────
 
 def process_audio(audio_snapshot: list, session_id: int):
     global processing, last_text_context, cloud_status, session_phase
@@ -503,67 +1438,172 @@ def process_audio(audio_snapshot: list, session_id: int):
         audio = np.concatenate(audio_snapshot, axis=0).flatten().astype(np.float32)
         dur = len(audio) / SAMPLE_RATE
         if dur < 0.5: return
+
+        # Windows при запрещённом микрофоне («Параметры → Конфиденциальность →
+        # Микрофон → Разрешить классическим приложениям») НЕ отдаёт ошибку
+        # захвата — он отдаёт ТИШИНУ. На macOS отказ жёсткий (TCC), поэтому
+        # в эталоне такой проверки нет и взять её оттуда неоткуда. Единственный
+        # доступный признак — нулевой пик амплитуды.
+        peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+        if peak < 1e-4:
+            print(f"[mic] В записи только тишина (пик {peak:.6f})")
+            notify("WhisperKey — микрофон молчит",
+                   "Проверь Параметры → Конфиденциальность → Микрофон")
+            return
+
         print(f"[rec] {dur:.1f}s → распознаю...")
         t_start = time.time()
-        audio_chunks = []
-        if dur > 30.0:
-            current_pos = 0
-            chunk_size_samples = int(SAMPLE_RATE * 20)
-            while current_pos < len(audio):
-                end_pos = min(current_pos + chunk_size_samples, len(audio))
-                if end_pos < len(audio):
-                    search_window = int(SAMPLE_RATE * 3)
-                    search_start = max(end_pos - search_window, current_pos + int(SAMPLE_RATE * 5))
-                    search_end = min(end_pos + search_window, len(audio) - int(SAMPLE_RATE * 1))
-                    sub_audio = audio[search_start:search_end]
-                    if len(sub_audio) > SAMPLE_RATE:
-                        win = int(SAMPLE_RATE * 0.1)
-                        energies = [np.max(np.abs(sub_audio[j:j+win])) for j in range(0, len(sub_audio)-win, win)]
-                        if energies:
-                            min_energy_idx = np.argmin(energies)
-                            end_pos = search_start + (min_energy_idx * win) + (win // 2)
-                audio_chunks.append(audio[current_pos:end_pos])
-                current_pos = end_pos
-        else: audio_chunks = [audio]
+
+        # Дробление длинной записи включается только за порогом в 15 минут:
+        # замер на записи 29:45 дал одним куском 3810 слов и полноту 79.8%
+        # против 3559 слов и 72.3% у нарезки по 60 с. Groq дробит файл у себя
+        # внутри лучше, чем мы снаружи.
+        audio_chunks, chunk_offsets = _split_audio(audio, dur)
+
         n_chunks = len(audio_chunks)
-        ordered_parts = [None] * n_chunks
-        if PARALLEL_CLOUD_CHUNKS and n_chunks > 1 and CLOUD_ENABLED and not cloud_status.get("is_blocked"):
+        t_asr_start = time.time()
+        ordered_parts: list[str | None] = [None] * n_chunks
+        chunk_quality: list[str] = ['lost'] * n_chunks
+        chunk_words: list[list] = [[] for _ in range(n_chunks)]
+
+        parallel_ok = (
+            PARALLEL_CLOUD_CHUNKS
+            and n_chunks > 1
+            and CLOUD_ENABLED
+            and not cloud_status.get("is_blocked")
+        )
+
+        if parallel_ok:
+            print(f"[fast] Параллельно: {n_chunks} сегментов, потоков {MAX_CLOUD_WORKERS}")
             with ThreadPoolExecutor(max_workers=MAX_CLOUD_WORKERS) as pool:
-                futures = [pool.submit(_transcribe_one_chunk, chunk, idx, n_chunks) for idx, chunk in enumerate(audio_chunks)]
+                # Словарь future -> idx, а не список: as_completed отдаёт futures
+                # в произвольном порядке, а у упавшего результата индекса нет вовсе.
+                futures = {
+                    pool.submit(_transcribe_one_chunk, chunk, idx, n_chunks): idx
+                    for idx, chunk in enumerate(audio_chunks)
+                }
                 for fut in as_completed(futures):
-                    idx, chunk_text = fut.result()
-                    if chunk_text: ordered_parts[idx] = chunk_text
+                    idx = futures[fut]
+                    # Исключение в ОДНОМ куске раньше убивало всю запись целиком:
+                    # fut.result() пробрасывал его наружу, общий except печатал строку
+                    # в терминал, и пользователь не получал ни текста, ни уведомления.
+                    try:
+                        idx, chunk_text, quality, words = fut.result()
+                    except Exception as e:
+                        print(f"[error] Сегмент {idx + 1} упал: {type(e).__name__} {e}")
+                        chunk_text, quality, words = None, 'lost', []
+                    ordered_parts[idx] = chunk_text
+                    chunk_quality[idx] = quality
+                    chunk_words[idx] = words
         else:
             for idx, chunk in enumerate(audio_chunks):
-                _, chunk_text = _transcribe_one_chunk(chunk, idx, n_chunks)
-                if chunk_text: ordered_parts[idx] = chunk_text
-        final_segments = [p for p in ordered_parts if p]
-        full_raw_text = " ".join(final_segments).strip()
+                try:
+                    _, chunk_text, quality, words = _transcribe_one_chunk(chunk, idx, n_chunks)
+                except Exception as e:
+                    print(f"[error] Сегмент {idx + 1} упал: {type(e).__name__} {e}")
+                    chunk_text, quality, words = None, 'lost', []
+                ordered_parts[idx] = chunk_text
+                chunk_quality[idx] = quality
+                chunk_words[idx] = words
+
+        t_asr_done = time.time()
+
+        # Склейка: перекрытие снимается по таймкодам слов, текстовое сравнение —
+        # только запасной путь. Нечёткого сравнения нет намеренно.
+        full_raw_text, lost_marks = _join_chunks(
+            ordered_parts, chunk_quality, chunk_offsets, chunk_words)
+
         if not full_raw_text:
+            print("[skip] Пустой результат")
             notify("WhisperKey", "Речь не распознана")
             return
-        if should_skip_llm(full_raw_text): text = full_raw_text
-        else: text = refine_text_llm(full_raw_text)
+
+        print(f"[raw whisper] '{full_raw_text}'")
+
+        # LLM-полировка удалена. Модель llama-3.1-70b-versatile выведена Groq из
+        # обслуживания (HTTP 400 model_decommissioned), и год вызов молча возвращал
+        # сырой текст — это и было то качество, которое всех устраивало. Рабочая
+        # llama-3.3 на замере переписывает 4.2-5.6% слов, а цель — дословность.
+        # Отдельно: LLAMA_SKIP_MAX_WORDS = 0 делал условие len(words) > 0 истинным
+        # для любого непустого текста, поэтому корректор звался НА КАЖДОЙ диктовке
+        # и каждый раз тратил лишний round-trip на мёртвую модель.
+        text = full_raw_text
+
+        elapsed = time.time() - t_start
+        asr_sec = t_asr_done - t_asr_start
+        print(
+            f"[time] total={elapsed:.1f}s | asr={asr_sec:.1f}s "
+            f"({elapsed / dur * 100:.0f}% от длины записи)"
+        )
+
+        artifacts_removed.clear()
         text = clean_noise(text)
         text = smart_grammar_fix(text)
+
         if text and len(text) > 1:
             text = apply_smart_sentence_ending(text)
+
             print(f"\n--- ФИНАЛЬНЫЙ ТЕКСТ ---\n{text}\n-----------------------\n")
+
             last_text_context = text[-40:]
             direct_insert(text + " ")
-            notify("WhisperKey", "Текст готов")
-        else: notify("WhisperKey", "Речь не распознана")
-    except Exception as e: print(f"[error] {e}")
+
+            # Любая деградация обязана быть видимой. Раньше уход на локальную
+            # модель и выпавший кусок одинаково рапортовались как «Текст готов».
+            n_local = chunk_quality.count('local')
+            n_retry = chunk_quality.count('cloud_retry')
+            problems = []
+            if lost_marks:
+                problems.append(f"потеряно кусков: {len(lost_marks)}")
+            if n_local:
+                problems.append(f"локальная модель: {n_local}")
+            if artifacts_removed:
+                problems.append("вырезан водяной знак")
+            if problems:
+                notify("WhisperKey — распознано частично", "; ".join(problems))
+                print(f"[warn] {'; '.join(problems)}")
+            else:
+                suffix = f" (переспрошено окон: {n_retry})" if n_retry else ""
+                notify("WhisperKey", "Текст готов" + suffix)
+        else:
+            print("[skip] Пустой результат")
+            notify("WhisperKey", "Речь не распознана")
+    except Exception as e:
+        # Этот except стоит после всех notify, поэтому раньше пользователь при
+        # падении не получал НИЧЕГО — ни текста, ни уведомления, только строку
+        # в терминале, куда он не смотрит.
+        import traceback
+        print(f"[error] {type(e).__name__}: {e}")
+        traceback.print_exc()
+        notify("WhisperKey — сбой", f"{type(e).__name__}. Текст не вставлен.")
     finally:
         processing = False
         with state_lock:
-            if active_session_id == session_id: session_phase = "idle"
+            if active_session_id == session_id:
+                session_phase = "idle"
+        # Диктовка закончена — заводим отсчёт до освобождения микрофона.
+        # Новое нажатие таймер сбросит, так что при серии диктовок поток живёт.
+        schedule_idle_close()
+
+# ─── Обработка клавиш (платформенная точка 7) ─────────────────────────────────
 
 def is_trigger(key):
+    """Правый Alt. Код 61 из mac-версии удалён — это vk правого Option на macOS.
+
+    На Windows правый Alt — это VK_RMENU = 165, а 61 в таблице VK не назначен
+    (VK_OEM_PLUS = 187), то есть проверка на него давала только лишний шанс
+    на ложное срабатывание от посторонней клавиши.
+
+    Про AltGr: стандартная русская раскладка Windows флага KLLF_ALTGR не имеет,
+    правый Alt в ней — обычный VK_RMENU, и триггер безопасен. На раскладках
+    с настоящим AltGr (US-International, немецкая, польская) система перед
+    RMENU подсовывает фантомный левый Ctrl — там ввод любого символа через
+    AltGr будет стартовать запись. Это ограничение, а не дефект кода.
+    """
     if key == keyboard.Key.alt_r:
         return True
     try:
-        if hasattr(key, 'vk') and key.vk in (165, 61):  # Right Alt / AltGr on Windows
+        if hasattr(key, 'vk') and key.vk == 165:
             return True
     except:
         pass
@@ -573,65 +1613,152 @@ def on_press(key):
     global is_recording, recording_data, processing, trigger_held, last_trigger_ts, session_counter, active_session_id, session_phase
     now = time.time()
     if is_trigger(key) and not trigger_held:
-        if now - last_trigger_ts < TRIGGER_DEBOUNCE_SEC: return
+        if now - last_trigger_ts < TRIGGER_DEBOUNCE_SEC:
+            return
         with state_lock:
-            if session_phase != "idle": return
+            if session_phase != "idle":
+                return
             last_trigger_ts = now
             trigger_held = True
             session_counter += 1
             active_session_id = session_counter
             session_phase = "recording"
-            notify("WhisperKey", "🎙 Запись...")
             try:
-                start_audio_stream()
+                if PREROLL_ENABLED:
+                    cancel_idle_close()
+                    # Поток мог закрыться по простою или умереть от смены устройства.
+                    # trigger_held сознательно НЕ сбрасываем: клавиша ещё
+                    # физически нажата, а on_press у pynput приходит и на
+                    # автоповторе — сброс запустил бы попытки открыть микрофон
+                    # каждые TRIGGER_DEBOUNCE_SEC, пока клавишу держат.
+                    if not ensure_audio_stream():
+                        session_phase = "idle"
+                        return
+                    # Порядок важен: буфер заполняется ДО поднятия is_recording,
+                    # иначе колбэк успевает дописать блок в старый список, и этот
+                    # блок (~32 мс речи) выбрасывается. Раньше здесь был обратный
+                    # порядок — is_recording = True, потом recording_data = [].
+                    recording_data = list(preroll_buffer)
+                    preroll_buffer.clear()
+                else:
+                    if not start_audio_stream():
+                        session_phase = "idle"
+                        return
+                    recording_data = []
+
                 is_recording = True
-                recording_data = []
+
+                # Пока Alt ещё удерживается — гасим меню активного окна,
+                # иначе Ctrl+V после диктовки уйдёт в меню (см. mask_alt_press).
+                mask_alt_press()
+
+                # Уведомление ПОСЛЕ фактического начала захвата: раньше «говори»
+                # выдавалось до того, как микрофон отдавал первый сэмпл.
+                notify("WhisperKey", "Запись...")
+                if PREROLL_ENABLED:
+                    pre = len(recording_data) * 512 / SAMPLE_RATE
+                    # Нулевая предзапись при включённом режиме — признак того, что
+                    # поток был мёртв. Молчать об этом нельзя: дальше запись уйдёт
+                    # в никуда, а пользователь увидит «слишком короткая запись».
+                    if pre <= 0:
+                        print("[audio] ВНИМАНИЕ: предзапись пуста, поток был неисправен")
+                    else:
+                        print(f"[rec] Начата (предзапись {pre * 1000:.0f} мс)")
+                else:
+                    print("[rec] Начата")
+
                 if USE_CLOUD:
                     def warm_groq():
                         try: http_session.options("https://api.groq.com/openai/v1/audio/transcriptions", timeout=1.0)
                         except: pass
                     threading.Thread(target=warm_groq, daemon=True).start()
-            except:
+
+            except Exception as e:
+                print(f"[audio error] {e}")
+                notify("WhisperKey — микрофон недоступен", str(e)[:120])
                 is_recording = False
                 session_phase = "idle"
 
 def on_release(key):
     global is_recording, processing, trigger_held, session_counter, session_phase
-    if is_trigger(key): trigger_held = False
+    if is_trigger(key):
+        trigger_held = False
     if is_trigger(key) and is_recording:
         with state_lock:
-            if session_phase != "recording": return
+            if session_phase != "recording":
+                return
             current_session_id = active_session_id
             session_phase = "processing"
+
         def delayed_stop():
             time.sleep(TAIL_CAPTURE_SECONDS)
             global is_recording
-            is_recording = False 
-            stop_audio_stream()
+            is_recording = False
+            # При включённой предзаписи поток остаётся открытым — иначе следующее
+            # нажатие снова начнётся с холодного старта и срежет первое слово.
+            if not PREROLL_ENABLED:
+                stop_audio_stream()
+
             audio_snapshot = list(recording_data)
             if len(audio_snapshot) < 10:
-                notify("WhisperKey", "⚠️ Слишком короткая запись")
+                print("[skip] Слишком коротко")
+                notify("WhisperKey", "Слишком короткая запись")
                 global processing
                 processing = False
                 with state_lock:
-                    if active_session_id == current_session_id: session_phase = "idle"
+                    if active_session_id == current_session_id:
+                        session_phase = "idle"
+                schedule_idle_close()
                 return
-            notify("WhisperKey", "⏹ Распознаю...")
+
+            notify("WhisperKey", "Распознаю...")
+            print("[rec] Остановлена (хвост захвачен)")
             threading.Thread(target=process_audio, args=(audio_snapshot, current_session_id), daemon=True).start()
+
         processing = True
         threading.Thread(target=delayed_stop, daemon=True).start()
 
-def create_desktop_launcher():
-    """Создаёт на Рабочем столе .bat, который всегда запускает проект из правильной папки."""
+# ─── Запуск ───────────────────────────────────────────────────────────────────
+
+def _desktop_path() -> str:
+    """Настоящий Рабочий стол (платформенная точка 4).
+
+    os.path.expanduser("~/Desktop") на Windows врёт при перенаправлении папок
+    в OneDrive — а оно включено по умолчанию на большинстве свежих домашних
+    систем с учёткой Microsoft. Реальный путь тогда «C:\\Users\\X\\OneDrive\\
+    Рабочий стол», а ~/Desktop не существует вовсе: ярлык не создаётся,
+    и пользователь считает установку неудавшейся. Реестр OneDrive обновляет,
+    поэтому спрашиваем систему, а не собираем путь руками.
+    """
     try:
-        desktop = os.path.expanduser("~/Desktop")
-        current_dir = os.path.dirname(os.path.abspath(__file__))
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders")
+        try:
+            value, _ = winreg.QueryValueEx(key, "Desktop")
+        finally:
+            winreg.CloseKey(key)
+        if value and os.path.isdir(value):
+            return value
+    except Exception:
+        pass
+    return os.path.expanduser("~/Desktop")
+
+def create_desktop_launcher():
+    """Создаёт на Рабочем столе .bat, который всегда запускает проект из своей папки."""
+    try:
+        desktop = _desktop_path()
+        if not os.path.isdir(desktop):
+            print(f"[setup] Рабочий стол не найден ({desktop}), ярлык не создан")
+            return
         target_path = os.path.join(desktop, "WhisperKey.bat")
         if os.path.exists(target_path):
             return
         launcher_body = f'''@echo off
+chcp 65001 >nul
 title WhisperKey
-cd /d "{current_dir}"
+cd /d "{BASE_DIR}"
 call run_whisperkey.bat
 '''
         with open(target_path, "w", encoding="utf-8") as f:
@@ -643,36 +1770,68 @@ call run_whisperkey.bat
 def main():
     global model
     if not acquire_single_instance_lock():
-        print("[FATAL] WhisperKey уже запущен.")
+        print("[FATAL] WhisperKey уже запущен. Закрой предыдущий процесс перед новым стартом.")
         return
+
     print("\n" + "="*60)
-    print(" 🎙️  WhisperKey v23.5 | Windows Edition")
+    print(" WhisperKey v24 | Windows Edition | Дословная диктовка")
     print(" Created by Егор Нищук (Telegram: @Seikatsuma)")
     print("="*60)
+
     create_desktop_launcher()
-    print(" Статус: Готов к работе.")
-    print("—"*60 + "\n")
+
     try:
         p = psutil.Process(os.getpid())
-        p.nice(psutil.HIGH_PRIORITY_CLASS)
-    except: pass
+        # ABOVE_NORMAL, а не HIGH (платформенная точка 5). HIGH выше приоритета
+        # активного окна, а рядом крутится локальный faster-whisper на двух
+        # потоках — на слабой машине это заметный лаг мыши и ввода.
+        # Строку p.nice(-10) из mac-версии сюда переносить НЕЛЬЗЯ: на Windows
+        # psutil.nice ждёт класс приоритета, а не число nice, вызов бросил бы
+        # исключение и приоритет молча не изменился бы.
+        p.nice(psutil.ABOVE_NORMAL_PRIORITY_CLASS)
+        # cpu_affinity сознательно не трогаем. На Windows он, в отличие
+        # от macOS, полноценно работает — и именно поэтому опасен: прибивание
+        # к паре ядер конкурирует с аудио-колбэком PortAudio и даёт потерю
+        # сэмплов, которую видно только на слух.
+    except Exception:
+        pass
+
+    print(f"Модель: {CLOUD_WHISPER_MODEL} | промпт: "
+          f"{'выключен' if not ASR_CONTEXT_PROMPT else 'включён'}")
     try:
-        print("Загрузка локальной модели (при первом offline-запуске ~500 МБ, подождите)...")
+        print("Загрузка локальной модели (запасной вариант, если облако недоступно)...")
         model = WhisperModel(MODEL_PATH, device="cpu", compute_type="int8", cpu_threads=2)
         print("Разогрев локальной модели...")
         model.transcribe(np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32), language="ru", beam_size=1)
+
         if USE_CLOUD:
             print("Разогрев облачного соединения...")
             def warm_network():
                 try: http_session.head("https://api.groq.com", timeout=2.0)
                 except: pass
             threading.Thread(target=warm_network, daemon=True).start()
-        print("Система готова. Зажми ПРАВЫЙ ALT (AltGr) для записи.")
-        print("Подсказка: если запись не начинается — запустите .bat от имени администратора.")
-        with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-            listener.join()
+
+        if PREROLL_ENABLED:
+            # Поток открывается сразу, чтобы первая же диктовка шла с предзаписью,
+            # но тут же заводится отсчёт: не воспользовались — микрофон отпущен.
+            # Отказ здесь не фатален: работаем по старой схеме, а не падаем.
+            if start_audio_stream():
+                print(f"Предзапись включена: {PREROLL_SECONDS * 1000:.0f} мс, "
+                      f"микрофон освобождается после {PREROLL_IDLE_TIMEOUT:.0f}с простоя")
+                schedule_idle_close()
+            else:
+                print("Предзапись недоступна — микрофон не открылся, работаю по старой схеме")
     except Exception as e:
         print(f"[FATAL] {e}")
+        return
+
+    print("Готов! Зажми ПРАВЫЙ ALT для записи.")
+    print("Если текст не вставляется в окно, запущенное от администратора —")
+    print("запусти WhisperKey тоже от администратора (ввод режет UIPI).")
+    notify("WhisperKey", "Готов к работе!")
+
+    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+        listener.join()
 
 if __name__ == "__main__":
     main()
