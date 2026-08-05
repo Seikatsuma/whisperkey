@@ -9,6 +9,7 @@
 Так тесты гоняются где угодно, включая машину без звуковой карты.
 """
 import ast
+import difflib
 import os
 import re
 import sys
@@ -23,7 +24,7 @@ WANTED_FUNCS = {
     "smart_grammar_fix", "apply_smart_sentence_ending", "strip_asr_artifacts",
     "clean_noise", "_norm_word", "_drop_overlap", "_fmt_mmss", "_join_chunks",
     "_split_audio", "_find_degenerate_segments", "_text_from_response",
-    "_words_in_range",
+    "_words_in_range", "transfer_punctuation", "_transfer_norm",
 }
 WANTED_CONSTS = {
     "SAMPLE_RATE", "NARRATOR_LOOP_PATTERN", "BOH_TAIL_MARKERS", "ASR_CONTEXT_PROMPT",
@@ -31,13 +32,15 @@ WANTED_CONSTS = {
     "BRAND_NAMES", "artifacts_removed", "CHUNK_THRESHOLD_SECONDS",
     "CHUNK_SIZE_SECONDS", "CHUNK_OVERLAP_SECONDS", "DENSITY_GATE_MIN_DURATION",
     "DENSITY_GATE_MIN_WORDS_PER_SEC", "HALLUCINATION_TRIGGERS",
+    "_TRANSFER_PUNCT", "STYLE_PROMPT", "PUNCT_TRANSFER_MIN_SECONDS",
+    "PUNCT_TRANSFER_MAX_SECONDS",
 }
 
 
 def load_module_parts():
     source = open(SRC, encoding="utf-8").read()
     tree = ast.parse(source)
-    ns = {"re": re, "np": np, "print": lambda *a, **k: None}
+    ns = {"re": re, "np": np, "difflib": difflib, "print": lambda *a, **k: None}
     keep = []
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in WANTED_FUNCS:
@@ -398,6 +401,62 @@ def test_prompt_has_no_topic():
     # причём одна фраза схлопнулась в «Да.» — слово из самого промпта.
     check("Т4 промпт пуст", prompt == "",
           f"промпт задан: {prompt!r} — на короткой диктовке это теряет текст")
+
+
+def test_punctuation_transfer_keeps_words():
+    """Перенос знаков со второго прохода не смеет тронуть ни одного слова.
+
+    Второй проход идёт С промптом — значит его текст содержит слова из промпта,
+    подставленные вместо неуслышанной речи. Ровно они и не должны просочиться.
+    """
+    tp = M["transfer_punctuation"]
+    norm = lambda t: [re.sub(r'[^\w]', '', w, flags=re.UNICODE).lower() for w in t.split()]
+
+    cases = [
+        ("привет как дела у тебя", "Привет, как дела? У тебя"),
+        ("я говорю про виспер кей и другое", "Я говорю про, да, конечно. И другое."),
+        ("совсем другой текст здесь", "Так, ну, в общем, смотри. Значит, вот."),
+        ("одно слово", "Одно слово."),
+        ("текст без пары", ""),
+        ("", "Что-то."),
+        ("слово", "слово"),
+    ]
+    for base, styled in cases:
+        out = tp(base, styled)
+        check(f"Т9 слова целы: {base[:24]!r}", norm(out) == norm(base),
+              f"{base!r} + {styled!r} → {out!r}")
+
+    out = tp("я говорю про виспер кей и другое", "Я говорю про, да, конечно. И другое.")
+    check("Т9 слово промпта не просочилось", "конечно" not in out.lower(), out)
+
+
+def test_punctuation_transfer_adds_marks():
+    """Знаки и заглавные переносятся там, где слова совпали."""
+    tp = M["transfer_punctuation"]
+    out = tp("привет как дела у тебя", "Привет, как дела? У тебя")
+    check("Т9 знаки перенесены", out == "Привет, как дела? У тебя", out)
+
+    # Заглавная не должна приезжать в середину предложения: в оформленной версии
+    # слово начинало фразу, а в полной перед ним точки нет.
+    out = tp("я говорю про виспер кей и другое", "Я говорю про, да, конечно. И другое.")
+    parts = out.split()
+    mid = [w for i, w in enumerate(parts)
+           if i and w[:1].isupper() and parts[i - 1][-1] not in '.!?…']
+    check("Т9 нет заглавной в середине фразы", not mid, f"{mid} в {out!r}")
+
+
+def test_style_prompt_is_second_pass_only():
+    """STYLE_PROMPT живёт отдельно от основного запроса и не касается слов."""
+    check("Т9 основной промпт пуст", M["ASR_CONTEXT_PROMPT"] == "",
+          "промпт в основном запросе теряет речь")
+    check("Т9 STYLE_PROMPT задан", bool(M["STYLE_PROMPT"]),
+          "без него второй проход бессмыслен")
+    # Короткие диктовки whisper оформляет сам, второй запрос там лишний.
+    check("Т9 порог не ниже 8с", M["PUNCT_TRANSFER_MIN_SECONDS"] >= 8.0,
+          str(M["PUNCT_TRANSFER_MIN_SECONDS"]))
+    # 16 кГц/16 бит — 32 КБ на секунду, предел Groq 25 МБ ≈ 780 с.
+    check("Т9 потолок ниже предела 25 МБ", M["PUNCT_TRANSFER_MAX_SECONDS"] <= 780.0,
+          str(M["PUNCT_TRANSFER_MAX_SECONDS"]))
 
 
 def test_markers_have_no_plain_words():

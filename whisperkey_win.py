@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import wave
+import difflib
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -159,6 +160,35 @@ WIN_USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
 # то есть промпт — лотерея, и проигрыш означает потерю всей фразы.
 # Заглавную букву, единственную его пользу, ставит CAPITALIZE_FIRST.
 ASR_CONTEXT_PROMPT = ""
+
+# ─── Знаки препинания вторым проходом ─────────────────────────────────────────
+# ЗАМЕР 06.08.26 на 101 реальной диктовке Егора (38 минут речи):
+#   было (промпт в основном запросе)  3880 слов, 39.6 знака/100 слов, 8 простыней
+#   без промпта                       4076 слов, 31.5 знака/100 слов, 23 простыни
+#   слияние двух проходов             4076 слов, 39.6 знака/100 слов, 5 простыней
+# «Простыня» — участок от 20 слов подряд без единого знака: полный, но нечитаемый
+# текст. Без промпта такими приходила почти четверть записей, причём все длинные.
+#
+# Почему два запроса, а не подбор одного промпта: любой промпт — лотерея.
+# Мета-инструкция («расставь знаки») срезала 160-секундную диктовку с 229 слов
+# до 45, слова-заполнители теряли до трети на других записях. Промпт не может
+# добавить знаков, не получив права подставлять свои слова.
+# Почему не отдельная модель для пунктуации: llama-3.3 переписывала слова в
+# половине кусков («вообще» → «generally», удаляла слова, «исправляла» грамматику),
+# проверку сохранности проходило 69% при задержке 6.5 с.
+# Решение: два запроса ОДНОВРЕМЕННО. Слова берутся только из прохода без промпта,
+# знаки переносятся из прохода с промптом на совпавших участках. Слово из промпта
+# в результат попасть не может — оно не совпадёт и будет отброшено.
+STYLE_PROMPT = "Так, ну, в общем, смотри. Значит, вот. И, соответственно, дальше."
+
+# Короткие диктовки whisper оформляет сам: на 47 записях до 15 секунд простыня
+# была ровно одна. Второй запрос там — лишний расход квоты без выигрыша.
+PUNCT_TRANSFER_MIN_SECONDS = 12.0
+
+# Верхняя граница: второй проход идёт одним запросом на всю запись, а Groq
+# принимает не больше 25 МБ. 16 кГц/16 бит — это 32 КБ на секунду, то есть
+# около 780 секунд на предел. Берём с запасом.
+PUNCT_TRANSFER_MAX_SECONDS = 600.0
 
 NARRATOR_LOOP_PATTERN = r'(?:спикер|смикер|speaker)\s+говорит'
 
@@ -639,6 +669,67 @@ CAPITALIZE_FIRST = True
 # ("и добавь туда" -> "И добавь туда." ломает мысль), а сам whisper-large-v3
 # ставит точку там, где она уместна.
 FORCE_TRAILING_DOT = False
+
+_TRANSFER_PUNCT = '.,!?;:—…'
+
+def _transfer_norm(w: str) -> str:
+    return re.sub(r'[^\w]', '', w, flags=re.UNICODE).lower()
+
+def transfer_punctuation(base_text: str, styled_text: str) -> str:
+    """Слова из base_text, знаки препинания — из styled_text.
+
+    base_text  — проход без промпта: полный список слов, но часто без знаков.
+    styled_text — проход с STYLE_PROMPT: знаки есть, но часть слов подменена
+                  словами из промпта.
+    Совпадающие участки находятся difflib по нормализованным словам; с каждого
+    совпавшего слова переносится только «хвост» из знаков и, если оно начинало
+    предложение, заглавная буква. Несовпавшие участки остаются как в base_text.
+    Инвариант проверяется утверждением: список слов на выходе равен входному.
+    """
+    if not base_text or not styled_text:
+        return base_text
+
+    a, b = base_text.split(), styled_text.split()
+    na = [_transfer_norm(x) for x in a]
+    nb = [_transfer_norm(x) for x in b]
+    out = list(a)
+
+    raised = set()
+    for i, j, n in difflib.SequenceMatcher(None, na, nb, autojunk=False).get_matching_blocks():
+        for k in range(n):
+            src, dst = b[j + k], out[i + k]
+            if not src or not dst:
+                continue
+            tail = ''.join(c for c in src[len(src.rstrip(_TRANSFER_PUNCT)):]
+                           if c in _TRANSFER_PUNCT)
+            if tail and dst[-1] not in _TRANSFER_PUNCT:
+                out[i + k] = dst + tail
+            # Заглавную берём, только если слово реально начинало предложение
+            # в оформленной версии, иначе она приезжает из середины чужой фразы.
+            prev_styled = b[j + k - 1] if (j + k) else ''
+            if (src[0].isupper() and dst[0].islower()
+                    and ((j + k) == 0 or (prev_styled and prev_styled[-1] in '.!?…'))):
+                out[i + k] = out[i + k][0].upper() + out[i + k][1:]
+                raised.add(i + k)
+
+    # Согласуем регистр с итоговой расстановкой знаков: заглавная стоит после
+    # точки и в начале. Перенесённая заглавная, под которой точки не оказалось
+    # (в оформленной версии предложение начиналось, а здесь — нет), снимается.
+    for i, t in enumerate(out):
+        if not t:
+            continue
+        prev = out[i - 1] if i else ''
+        starts = (i == 0) or (prev and prev[-1] in '.!?…')
+        if starts and t[0].islower():
+            out[i] = t[0].upper() + t[1:]
+        elif not starts and i in raised:
+            out[i] = t[0].lower() + t[1:]
+
+    result = ' '.join(out)
+    if [_transfer_norm(x) for x in result.split()] != na:
+        print("[punct] перенос знаков нарушил слова — оставляю текст без знаков")
+        return base_text
+    return result
 
 def apply_smart_sentence_ending(text: str) -> str:
     """Минимальное оформление: заглавная в начале, точка — по флагу."""
@@ -1245,7 +1336,7 @@ def _throttle():
         _last_request_ts[0] = time.time()
 
 def transcribe_cloud_turbo(audio_data, allow_retry: bool = True, use_prompt: bool = True,
-                           return_words: bool = False):
+                           return_words: bool = False, prompt_override: str = ""):
     """Расшифровка через Groq whisper-large-v3.
 
     Возвращает строку текста либо None. При return_words=True — кортеж
@@ -1290,8 +1381,11 @@ def transcribe_cloud_turbo(audio_data, allow_retry: bool = True, use_prompt: boo
         ('timestamp_granularities[]', 'segment'),
         ('timestamp_granularities[]', 'word'),
     ]
-    if use_prompt and ASR_CONTEXT_PROMPT:
-        data.append(('prompt', ASR_CONTEXT_PROMPT))
+    # prompt_override — для прохода за знаками препинания (STYLE_PROMPT).
+    # Его результат идёт только в transfer_punctuation и словами не распоряжается.
+    prompt = prompt_override or (ASR_CONTEXT_PROMPT if use_prompt else "")
+    if prompt:
+        data.append(('prompt', prompt))
 
     for attempt in range(4):
         try:
@@ -1594,6 +1688,16 @@ def process_audio(audio_snapshot: list, session_id: int):
         audio_chunks, chunk_offsets = _split_audio(audio, dur)
 
         n_chunks = len(audio_chunks)
+
+        # Проход за знаками препинания стартует ОДНОВРЕМЕННО с основным, поэтому
+        # ожидания не добавляет: оба запроса летят к Groq параллельно.
+        style_pool = style_future = None
+        if (PUNCT_TRANSFER_MIN_SECONDS <= dur <= PUNCT_TRANSFER_MAX_SECONDS
+                and CLOUD_ENABLED and not cloud_status.get("is_blocked")):
+            style_pool = ThreadPoolExecutor(max_workers=1)
+            style_future = style_pool.submit(
+                transcribe_cloud_turbo, audio, allow_retry=False,
+                prompt_override=STYLE_PROMPT)
         t_asr_start = time.time()
         ordered_parts: list[str | None] = [None] * n_chunks
         chunk_quality: list[str] = ['lost'] * n_chunks
@@ -1647,11 +1751,30 @@ def process_audio(audio_snapshot: list, session_id: int):
             ordered_parts, chunk_quality, chunk_offsets, chunk_words)
 
         if not full_raw_text:
+            if style_pool is not None:
+                style_pool.shutdown(wait=False)
             print("[skip] Пустой результат")
             notify("WhisperKey", "Речь не распознана")
             return
 
         print(f"[raw whisper] '{full_raw_text}'")
+
+        # Знаки препинания из второго прохода. Он уже почти наверняка завершён —
+        # шёл параллельно. Ждём не дольше 8 секунд: текст важнее оформления,
+        # и молчаливо задерживать вставку из-за знаков нельзя.
+        if style_future is not None:
+            try:
+                styled = style_future.result(timeout=8.0)
+                if styled:
+                    before = full_raw_text
+                    full_raw_text = transfer_punctuation(full_raw_text, styled)
+                    if full_raw_text != before:
+                        print(f"[punct] знаки перенесены со второго прохода")
+            except Exception as e:
+                print(f"[punct] второй проход не дошёл ({type(e).__name__}) — "
+                      f"текст остаётся без добавленных знаков")
+            finally:
+                style_pool.shutdown(wait=False)
 
         # LLM-полировка удалена. Модель llama-3.1-70b-versatile выведена Groq из
         # обслуживания (HTTP 400 model_decommissioned), и год вызов молча возвращал

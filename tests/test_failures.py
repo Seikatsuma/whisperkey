@@ -301,6 +301,69 @@ def test_idle_release_and_recovery():
     M["is_recording"] = False
 
 
+def run_short_scenario(chunk_behaviour, styled, seconds=30.0):
+    """Прогон записи, на которой работает ВТОРОЙ проход за знаками препинания.
+
+    30 секунд: выше порога PUNCT_TRANSFER_MIN_SECONDS и ниже порога нарезки,
+    то есть путь ровно тот, каким идёт обычная длинная диктовка.
+    """
+    INSERTED.clear()
+    NOTIFIED.clear()
+    M["_transcribe_one_chunk"] = chunk_behaviour
+    M["transcribe_cloud_turbo"] = styled
+    M["CLOUD_ENABLED"] = True
+    M["cloud_status"]["is_blocked"] = False
+    M["process_audio"](make_audio(seconds), session_id=1)
+    return "".join(INSERTED), list(NOTIFIED)
+
+
+def _base_chunk(chunk, idx, n):
+    return idx, "первое слово второе слово третье слово", "cloud", []
+
+
+def test_style_pass_crash_does_not_lose_text():
+    """Падение второго прохода не должно стоить пользователю текста."""
+    def boom(*a, **k):
+        raise RuntimeError("Groq недоступен")
+    text, notes = run_short_scenario(_base_chunk, boom)
+    check("Знаки: падение второго прохода — текст на месте",
+          "первое слово второе слово третье слово" in text.lower(), f"вставлено: {text!r}")
+    check("Знаки: падение второго прохода — уведомление есть",
+          any("готов" in m.lower() for _, m in notes), f"уведомления: {notes}")
+
+
+def test_style_pass_empty_does_not_lose_text():
+    """Пустой ответ второго прохода — текст остаётся без добавленных знаков."""
+    text, _ = run_short_scenario(_base_chunk, lambda *a, **k: None)
+    check("Знаки: пустой второй проход — текст на месте",
+          "первое слово второе слово третье слово" in text.lower(), f"вставлено: {text!r}")
+
+
+def test_style_pass_cannot_inject_its_words():
+    """Второй проход идёт с промптом. Его слова не имеют права попасть в текст."""
+    def styled(*a, **k):
+        return "Да, конечно. Хорошо. А что дальше?"
+    text, _ = run_short_scenario(_base_chunk, styled)
+    low = text.lower()
+    check("Знаки: слова второго прохода отброшены",
+          "конечно" not in low and "дальше" not in low, f"вставлено: {text!r}")
+    check("Знаки: свои слова сохранены",
+          "первое слово второе слово третье слово" in low, f"вставлено: {text!r}")
+
+
+def test_style_pass_marks_are_applied():
+    """Когда слова совпали — знаки со второго прохода переносятся."""
+    def styled(*a, **k):
+        return "Первое слово, второе слово. Третье слово."
+    text, _ = run_short_scenario(_base_chunk, styled)
+    check("Знаки: точка и запятая перенесены",
+          "," in text and "." in text, f"вставлено: {text!r}")
+    check("Знаки: слова не изменились",
+          [w.strip(".,!?").lower() for w in text.split()][:6]
+          == ["первое", "слово", "второе", "слово", "третье", "слово"],
+          f"вставлено: {text!r}")
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
