@@ -250,6 +250,57 @@ def test_no_preprocessing_in_wav():
           f"на входе {len(audio)} сэмплов, в WAV {frames} (разница {frames - len(audio)})")
 
 
+def test_idle_release_and_recovery():
+    """Микрофон отпускается по простою и переоткрывается, если поток умер.
+
+    Вечно открытый поток вреден не нагрузкой, а тем, что молча умирает при смене
+    аудиоустройства: объект остаётся, сэмплы не идут, запись уходит в никуда.
+    """
+    state = {"active": True, "opened": 0, "stopped": 0}
+
+    class FakeStream:
+        def __init__(self):
+            state["opened"] += 1
+        @property
+        def active(self):
+            return state["active"]
+        def start(self): pass
+        def stop(self): state["stopped"] += 1
+        def close(self): pass
+
+    M["sd"] = types.SimpleNamespace(InputStream=lambda **kw: FakeStream())
+    M["audio_stream"] = None
+    M["is_recording"] = False
+    M["session_phase"] = "idle"
+
+    # Живой поток переоткрывать не надо
+    check("Простой: поток открылся", M["ensure_audio_stream"](), "не открылся")
+    opened_after_first = state["opened"]
+    M["ensure_audio_stream"]()
+    check("Живой поток не переоткрывается", state["opened"] == opened_after_first,
+          f"открытий {state['opened']}, было {opened_after_first}")
+
+    # Поток умер (сменилось устройство) — обязан переоткрыться
+    state["active"] = False
+    M["ensure_audio_stream"]()
+    check("Мёртвый поток переоткрыт", state["opened"] == opened_after_first + 1,
+          f"открытий {state['opened']}")
+
+    # Освобождение по простою
+    state["active"] = True
+    M["_close_idle_stream"]()
+    check("Микрофон отпущен по простою", M["audio_stream"] is None,
+          f"поток остался: {M['audio_stream']}")
+
+    # Во время записи микрофон не отпускается
+    M["ensure_audio_stream"]()
+    M["is_recording"] = True
+    M["_close_idle_stream"]()
+    check("Во время записи не отпускается", M["audio_stream"] is not None,
+          "поток закрыли посреди записи")
+    M["is_recording"] = False
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

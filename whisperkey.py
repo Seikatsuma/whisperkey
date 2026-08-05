@@ -187,10 +187,16 @@ last_trigger_ts = 0.0
 # звуком. Это единственное настоящее лекарство от срезанного первого слова:
 # PortAudio не отдаёт ни одного сэмпла, пока поднимается, а уведомление «говори»
 # выдавалось ещё раньше. Буфер под это был объявлен в коде год назад и не использовался.
-# Побочный эффект: индикатор микрофона в macOS горит постоянно. Поставь False,
-# если это мешает — тогда поток открывается только на время записи, как раньше.
+#
+# Поток НЕ висит вечно: после PREROLL_IDLE_TIMEOUT секунд без диктовки он закрывается
+# сам. Пока диктуешь сериями — предзапись работает; ушёл заниматься другим — микрофон
+# отпущен и индикатор погас. Вечно открытый поток вреден не нагрузкой (она ничтожна:
+# 32 раза в секунду по 2 КБ), а тем, что умирает при смене аудиоустройства —
+# подключил наушники, и запись уходит в мёртвый поток.
+# PREROLL_ENABLED = False вернёт прежнее поведение: поток только на время записи.
 PREROLL_ENABLED = True
 PREROLL_SECONDS = 0.5
+PREROLL_IDLE_TIMEOUT = 90.0
 _PREROLL_BLOCKS = max(1, int(PREROLL_SECONDS * SAMPLE_RATE / 512))
 preroll_buffer: deque = deque(maxlen=_PREROLL_BLOCKS)
 TRIGGER_DEBOUNCE_SEC = 0.35
@@ -490,6 +496,61 @@ def start_audio_stream(raise_on_error: bool = False):
         if raise_on_error:
             raise
         return False
+
+_idle_timer: threading.Timer | None = None
+_idle_timer_lock = threading.Lock()
+
+def ensure_audio_stream() -> bool:
+    """Гарантирует живой поток захвата.
+
+    Поток умирает при смене аудиоустройства (подключил наушники — и всё), причём
+    молча: объект остаётся, а сэмплы не идут. Поэтому проверяем не только наличие
+    объекта, но и его активность.
+    """
+    global audio_stream
+    stream = audio_stream
+    if stream is not None:
+        try:
+            if stream.active:
+                return True
+        except Exception:
+            pass
+        print("[audio] Поток микрофона умер (возможно, сменилось устройство) — переоткрываю")
+        stop_audio_stream()
+        preroll_buffer.clear()
+    return start_audio_stream()
+
+def _close_idle_stream():
+    """Отпускает микрофон после простоя — чтобы индикатор не горел без дела."""
+    global audio_stream
+    if is_recording:
+        return
+    with state_lock:
+        if session_phase != "idle":
+            return
+    if audio_stream is not None:
+        print(f"[audio] Микрофон освобождён после {PREROLL_IDLE_TIMEOUT:.0f}с простоя")
+        stop_audio_stream()
+        preroll_buffer.clear()
+
+def schedule_idle_close():
+    """Заводит таймер освобождения микрофона, сбрасывая предыдущий."""
+    global _idle_timer
+    if not PREROLL_ENABLED or PREROLL_IDLE_TIMEOUT <= 0:
+        return
+    with _idle_timer_lock:
+        if _idle_timer is not None:
+            _idle_timer.cancel()
+        _idle_timer = threading.Timer(PREROLL_IDLE_TIMEOUT, _close_idle_stream)
+        _idle_timer.daemon = True
+        _idle_timer.start()
+
+def cancel_idle_close():
+    global _idle_timer
+    with _idle_timer_lock:
+        if _idle_timer is not None:
+            _idle_timer.cancel()
+            _idle_timer = None
 
 def stop_audio_stream():
     """CEO Method: Безопасное отключение микрофона без блокировки основного потока."""
@@ -1410,6 +1471,9 @@ def process_audio(audio_snapshot: list, session_id: int):
         with state_lock:
             if active_session_id == session_id:
                 session_phase = "idle"
+        # Диктовка закончена — заводим отсчёт до освобождения микрофона.
+        # Новое нажатие таймер сбросит, так что при серии диктовок поток живёт.
+        schedule_idle_close()
 
 # ─── Обработка клавиш ─────────────────────────────────────────────────────────
 
@@ -1436,14 +1500,15 @@ def on_press(key):
             session_phase = "recording"
             try:
                 if PREROLL_ENABLED:
-                    # Поток уже открыт — забираем предзапись и стартуем мгновенно.
+                    cancel_idle_close()
+                    # Поток мог закрыться по простою или умереть от смены устройства.
+                    if not ensure_audio_stream():
+                        session_phase = "idle"
+                        return
                     # Порядок важен: буфер заполняется ДО поднятия is_recording,
                     # иначе колбэк успевает дописать в старый список.
                     recording_data = list(preroll_buffer)
                     preroll_buffer.clear()
-                    if audio_stream is None and not start_audio_stream():
-                        session_phase = "idle"
-                        return
                 else:
                     if not start_audio_stream():
                         session_phase = "idle"
@@ -1498,6 +1563,7 @@ def on_release(key):
                 with state_lock:
                     if active_session_id == current_session_id:
                         session_phase = "idle"
+                schedule_idle_close()
                 return
             
             notify("WhisperKey", "⏹ Распознаю...")
@@ -1596,10 +1662,12 @@ def main():
             threading.Thread(target=warm_network, daemon=True).start()
 
         if PREROLL_ENABLED:
-            # Поток открывается один раз и живёт до выхода — так первое слово
-            # не срезается холодным стартом PortAudio при каждом нажатии.
+            # Поток открывается сразу, чтобы первая же диктовка шла с предзаписью,
+            # но тут же заводится отсчёт: не воспользовались — микрофон отпущен.
             if start_audio_stream():
-                print(f"Предзапись включена: {PREROLL_SECONDS * 1000:.0f} мс")
+                print(f"Предзапись включена: {PREROLL_SECONDS * 1000:.0f} мс, "
+                      f"микрофон освобождается после {PREROLL_IDLE_TIMEOUT:.0f}с простоя")
+                schedule_idle_close()
             else:
                 print("Предзапись недоступна — микрофон не открылся, работаю по старой схеме")
     except Exception as e:
