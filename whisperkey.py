@@ -104,7 +104,10 @@ BOH_TAIL_MARKERS = [
 ]
 CLOUD_WHISPER_MODEL = "whisper-large-v3"
 PARALLEL_CLOUD_CHUNKS = True
-MAX_CLOUD_WORKERS = 4
+# Три потока, а не четыре, и пауза между запросами: на 30-минутной записи
+# 32 куска в 4 потока без пауз словили 429 и потеряли 4 куска текста насовсем.
+MAX_CLOUD_WORKERS = 3
+MIN_REQUEST_INTERVAL = 0.7
 
 # Дробление длинной записи. Пороги замерены 05.08.26:
 # на 25 с и 60 с модель не теряет ничего (69=69, 140=140 слов), провалы начинаются
@@ -963,17 +966,19 @@ def transcribe_cloud_turbo(audio_data, allow_retry: bool = True, use_prompt: boo
     """
     global cloud_status
 
+    empty = (None, []) if return_words else None
+
     if cloud_status["is_blocked"]:
         if time.time() - cloud_status["last_check_time"] > 60:
             background_cloud_probe()
-        return None
+        return empty
 
     if not GROQ_API_KEY:
-        return None
+        return empty
 
     wav_data = create_audio_wav(audio_data)
     if not wav_data:
-        return None
+        return empty
 
     headers = {
         'Authorization': f'Bearer {GROQ_API_KEY}',
@@ -1019,31 +1024,31 @@ def transcribe_cloud_turbo(audio_data, allow_retry: bool = True, use_prompt: boo
                 cloud_status["is_blocked"] = True
                 cloud_status["last_check_time"] = time.time()
                 background_cloud_probe()
-                return None
+                return empty
 
-            # 429 и 5xx лечатся ожиданием — раньше любой такой ответ давал
-            # молчаливую дыру в тексте.
-            if response.status_code in (429, 500, 502, 503, 504) and allow_retry and attempt < 2:
-                wait = float(response.headers.get('retry-after', 0) or 0) or (2 ** attempt)
-                wait = min(wait, 10.0)
+            # 429 и 5xx лечатся ожиданием. Раньше любой такой ответ давал
+            # молчаливую дыру; на 30-минутной записи так терялось 4 куска из 32.
+            if response.status_code in (429, 500, 502, 503, 504) and allow_retry and attempt < 3:
+                wait = float(response.headers.get('retry-after', 0) or 0) or (2 ** attempt) * 2
+                wait = min(wait, 20.0)
                 print(f"[cloud] {response.status_code}, повтор через {wait:.1f}с "
-                      f"(попытка {attempt + 2} из 3)")
+                      f"(попытка {attempt + 2} из 4)")
                 time.sleep(wait)
                 files = {'file': ('audio.wav', io.BytesIO(wav_data), 'audio/wav')}
                 continue
 
             print(f"[cloud error] Статус: {response.status_code}")
-            return None
+            return empty
 
         except Exception as e:
             print(f"[cloud exception] {type(e).__name__}")
-            if allow_retry and attempt < 2:
+            if allow_retry and attempt < 3:
                 time.sleep(2 ** attempt)
                 files = {'file': ('audio.wav', io.BytesIO(wav_data), 'audio/wav')}
                 continue
-            return None
+            return empty
 
-    return None
+    return empty
 
 def _transcribe_local(chunk: np.ndarray) -> str:
     """Локальный fallback — только когда cloud не дал пригодный текст."""
@@ -1059,23 +1064,26 @@ def _transcribe_local(chunk: np.ndarray) -> str:
     )
     return " ".join(seg.text.strip() for seg in segments).strip()
 
-def _transcribe_one_chunk(chunk: np.ndarray, chunk_idx: int, n_chunks: int) -> tuple[int, str | None, str]:
-    """Распознаёт один кусок. Возвращает (индекс, текст|None, метка_качества).
+def _transcribe_one_chunk(chunk: np.ndarray, chunk_idx: int, n_chunks: int) -> tuple[int, str | None, str, list]:
+    """Распознаёт один кусок. Возвращает (индекс, текст|None, метка_качества, слова).
 
     Метка качества: 'cloud' | 'cloud_retry' | 'local' | 'lost'. Она нужна выше,
     чтобы пользователь увидел, что часть записи ушла на слабую локальную модель
     или потерялась — раньше и то и другое проходило молча.
+    Слова с таймкодами нужны для склейки перекрытий по времени.
     """
     if n_chunks > 1:
         print(f"[chunk] Сегмент {chunk_idx + 1}/{n_chunks} ({len(chunk) / SAMPLE_RATE:.1f}s)")
 
     chunk_text = None
+    chunk_words: list = []
     quality = 'lost'
     chunk_dur = len(chunk) / SAMPLE_RATE
     use_cloud = CLOUD_ENABLED and not cloud_status.get("is_blocked")
 
     if use_cloud:
-        raw_text = transcribe_cloud_turbo(chunk)
+        raw_text, chunk_words = transcribe_cloud_turbo(chunk, return_words=True)
+        degenerate = list(cloud_status.get("last_degenerate") or [])
         if raw_text:
             lower = raw_text.lower()
             if any(t in lower for t in HALLUCINATION_TRIGGERS):
@@ -1087,25 +1095,43 @@ def _transcribe_one_chunk(chunk: np.ndarray, chunk_idx: int, n_chunks: int) -> t
             else:
                 chunk_text, quality = raw_text, 'cloud'
 
-        # Модель сорвалась на этом куске — переспрашиваем БЕЗ промпта.
-        # Замер: тематическая подсказка сама порождает такие срывы
-        # (74 слова реальной речи против 3 слов "Субтитры делал DimaTorzok").
-        if cloud_status.get("last_degenerate") and ASR_CONTEXT_PROMPT:
+        # Переспрос без промпта — только если срыв НЕ удалось залечить словами.
+        # Если words[] уже вернули речь для сорванного окна, второй запрос лишний:
+        # он стоит квоты, а на 30-минутной записи именно перерасход запросов
+        # приводил к 429 и потере целых кусков.
+        if degenerate and ASR_CONTEXT_PROMPT and _needs_retry(degenerate, chunk_words):
             print(f"[gate] Сегмент {chunk_idx + 1}: переспрашиваю без промпта")
-            retry_text = transcribe_cloud_turbo(chunk, use_prompt=False)
+            retry_text, retry_words = transcribe_cloud_turbo(chunk, use_prompt=False, return_words=True)
             if retry_text and len(retry_text.split()) > len((chunk_text or '').split()):
-                chunk_text, quality = retry_text, 'cloud_retry'
+                chunk_text, quality, chunk_words = retry_text, 'cloud_retry', retry_words
 
     if not chunk_text:
         print(f"[local] Сегмент {chunk_idx + 1}: локальная модель (качество ниже)")
         try:
             chunk_text = _transcribe_local(chunk) or None
             quality = 'local' if chunk_text else 'lost'
+            chunk_words = []
         except Exception as e:
             print(f"[local error] Сегмент {chunk_idx + 1}: {type(e).__name__} {e}")
             chunk_text, quality = None, 'lost'
 
-    return chunk_idx, chunk_text, quality
+    return chunk_idx, chunk_text, quality, chunk_words
+
+def _needs_retry(degenerate: list, words: list) -> bool:
+    """Стоит ли переспрашивать окно, которое модель провалила.
+
+    Не стоит, если words[] уже дали для этого интервала осмысленную плотность
+    речи — текст спасён, повторный запрос ничего не добавит, а квоту потратит.
+    """
+    for d in degenerate:
+        span = d['end'] - d['start']
+        if span <= 0:
+            continue
+        recovered = sum(1 for w in words
+                        if d['start'] <= float(w.get('start', -1)) < d['end'])
+        if (recovered / span) < DENSITY_GATE_MIN_WORDS_PER_SEC:
+            return True
+    return False
 
 # ─── Нарезка и склейка ────────────────────────────────────────────────────────
 
@@ -1166,15 +1192,43 @@ def _fmt_mmss(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     return f"{m:02d}:{s:02d}"
 
-def _join_chunks(parts: list, quality: list, offsets: list) -> tuple[str, list]:
+def _drop_overlap_by_time(words: list, chunk_start: float, cut_before: float) -> str | None:
+    """Собирает текст куска, выбрасывая слова из зоны перекрытия по времени.
+
+    Надёжнее текстового сравнения: модель распознаёт один и тот же участок
+    в соседних кусках немного по-разному, поэтому точного совпадения слов
+    на стыке может не быть вовсе, и дубль проходит насквозь.
+    """
+    if not words:
+        return None
+    kept = []
+    for w in words:
+        try:
+            abs_start = chunk_start + float(w.get('start', 0.0))
+        except (TypeError, ValueError):
+            continue
+        if abs_start < cut_before:
+            continue
+        token = (w.get('word') or '').strip()
+        if token:
+            kept.append(token)
+    return ' '.join(kept) if kept else None
+
+def _join_chunks(parts: list, quality: list, offsets: list,
+                 words_per_chunk: list | None = None) -> tuple[str, list]:
     """Склеивает куски, помечая потерянные. Возвращает (текст, список_меток_потерь).
 
     Кусок, который не распознался, раньше просто выпадал: дыра до 23 секунд
     склеивалась встык, и приходило бодрое «Текст готов». Теперь на его месте
     остаётся видимая метка — текст честнее, чем гладкий обман.
+
+    Перекрытие снимается по таймкодам слов, если они есть, и точным текстовым
+    совпадением в запасном варианте. Нечёткого сравнения здесь нет намеренно:
+    на замере оно уничтожило 12 слов реальной речи, оставив бессмыслицу.
     """
     pieces: list[str] = []
     lost_marks: list[str] = []
+    prev_end: float | None = None
 
     for idx, text in enumerate(parts):
         if not text:
@@ -1183,8 +1237,23 @@ def _join_chunks(parts: list, quality: list, offsets: list) -> tuple[str, list]:
                 lost_marks.append(mark)
                 pieces.append(mark)
             continue
-        if pieces:
+
+        chunk_words = (words_per_chunk[idx] if words_per_chunk and idx < len(words_per_chunk)
+                       else None)
+        if pieces and prev_end is not None and chunk_words:
+            trimmed = _drop_overlap_by_time(chunk_words, offsets[idx], prev_end)
+            # Пустой результат означает, что кусок целиком лежит в перекрытии —
+            # такого быть не должно, но лучше оставить текст, чем потерять его.
+            text = trimmed if trimmed else text
+        elif pieces:
             text = _drop_overlap(pieces[-1], text)
+
+        if chunk_words:
+            try:
+                prev_end = offsets[idx] + max(float(w.get('end', 0.0)) for w in chunk_words)
+            except (TypeError, ValueError):
+                prev_end = None
+
         if text:
             pieces.append(text)
 
@@ -1217,6 +1286,7 @@ def process_audio(audio_snapshot: list, session_id: int):
         t_asr_start = time.time()
         ordered_parts: list[str | None] = [None] * n_chunks
         chunk_quality: list[str] = ['lost'] * n_chunks
+        chunk_words: list[list] = [[] for _ in range(n_chunks)]
 
         parallel_ok = (
             PARALLEL_CLOUD_CHUNKS
@@ -1238,28 +1308,30 @@ def process_audio(audio_snapshot: list, session_id: int):
                     # fut.result() пробрасывал его наружу, общий except печатал строку
                     # в терминал, и пользователь не получал ни текста, ни уведомления.
                     try:
-                        idx, chunk_text, quality = fut.result()
+                        idx, chunk_text, quality, words = fut.result()
                     except Exception as e:
                         print(f"[error] Сегмент {idx + 1} упал: {type(e).__name__} {e}")
-                        chunk_text, quality = None, 'lost'
+                        chunk_text, quality, words = None, 'lost', []
                     ordered_parts[idx] = chunk_text
                     chunk_quality[idx] = quality
+                    chunk_words[idx] = words
         else:
             for idx, chunk in enumerate(audio_chunks):
                 try:
-                    _, chunk_text, quality = _transcribe_one_chunk(chunk, idx, n_chunks)
+                    _, chunk_text, quality, words = _transcribe_one_chunk(chunk, idx, n_chunks)
                 except Exception as e:
                     print(f"[error] Сегмент {idx + 1} упал: {type(e).__name__} {e}")
-                    chunk_text, quality = None, 'lost'
+                    chunk_text, quality, words = None, 'lost', []
                 ordered_parts[idx] = chunk_text
                 chunk_quality[idx] = quality
+                chunk_words[idx] = words
 
         t_asr_done = time.time()
 
-        # Склейка. Перекрытие снимается по позиции куска, дубли на стыке —
-        # сравнением хвоста и головы по словам. Текстовый нечёткий дедуп запрещён:
-        # на замере он один раз уничтожил 12 слов реальной речи.
-        full_raw_text, lost_marks = _join_chunks(ordered_parts, chunk_quality, chunk_offsets)
+        # Склейка: перекрытие снимается по таймкодам слов, текстовое сравнение —
+        # только запасной путь. Нечёткого сравнения нет намеренно.
+        full_raw_text, lost_marks = _join_chunks(
+            ordered_parts, chunk_quality, chunk_offsets, chunk_words)
 
         if not full_raw_text:
             finalize_eval_sample_meta(session_id, dur, "", "")
