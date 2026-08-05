@@ -194,7 +194,15 @@ last_trigger_ts = 0.0
 # 32 раза в секунду по 2 КБ), а тем, что умирает при смене аудиоустройства —
 # подключил наушники, и запись уходит в мёртвый поток.
 # PREROLL_ENABLED = False вернёт прежнее поведение: поток только на время записи.
-PREROLL_ENABLED = True
+#
+# ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНА. На реальном железе постоянно открытый поток словил
+# PaMacCore (AUHAL) err=-10863 kAudioUnitErr_CannotDoInCurrentContext: CoreAudio
+# отказался работать, поток умер, предзапись обнулилась ("предзапись 0 мс"),
+# и следующая диктовка ушла в никуда с сообщением «слишком короткая запись».
+# Выигрыш предзаписи при этом НЕ ИЗМЕРЕН — величину срезания первого слова
+# проверить не удалось. Недоказанная оптимизация, ломающая основную функцию,
+# в рабочей версии не держится. Включай True, только если готов проверять.
+PREROLL_ENABLED = False
 PREROLL_SECONDS = 0.5
 PREROLL_IDLE_TIMEOUT = 90.0
 _PREROLL_BLOCKS = max(1, int(PREROLL_SECONDS * SAMPLE_RATE / 512))
@@ -476,26 +484,39 @@ def start_audio_stream(raise_on_error: bool = False):
     микрофона доходил до пользователя как «Слишком короткая запись».
     """
     global audio_stream
-    try:
-        if audio_stream:
-            try:
-                audio_stream.stop()
-                audio_stream.close()
-            except Exception:
-                pass
-        audio_stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-            latency='low', blocksize=512, callback=audio_callback
-        )
-        audio_stream.start()
-        return True
-    except Exception as e:
+    if audio_stream:
+        try:
+            audio_stream.stop()
+            audio_stream.close()
+        except Exception:
+            pass
         audio_stream = None
-        print(f"[audio start error] {e}")
-        notify("WhisperKey — микрофон недоступен", str(e)[:120])
-        if raise_on_error:
-            raise
-        return False
+
+    # CoreAudio иногда отвечает -10863 (cannot do in current context), когда
+    # система в этот момент перестраивает аудио — например, только что
+    # подключились наушники. Через долю секунды та же операция проходит,
+    # поэтому пара повторов дешевле, чем сорванная диктовка.
+    last_error = None
+    for attempt in range(3):
+        try:
+            audio_stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                latency='low', blocksize=512, callback=audio_callback
+            )
+            audio_stream.start()
+            return True
+        except Exception as e:
+            last_error = e
+            audio_stream = None
+            if attempt < 2:
+                print(f"[audio] Микрофон не открылся ({type(e).__name__}), повтор {attempt + 2} из 3")
+                time.sleep(0.25 * (attempt + 1))
+
+    print(f"[audio start error] {last_error}")
+    notify("WhisperKey — микрофон недоступен", str(last_error)[:120])
+    if raise_on_error:
+        raise last_error
+    return False
 
 _idle_timer: threading.Timer | None = None
 _idle_timer_lock = threading.Lock()
@@ -1519,8 +1540,17 @@ def on_press(key):
                 # Уведомление ПОСЛЕ фактического начала захвата: раньше «говори»
                 # выдавалось до того, как микрофон отдавал первый сэмпл.
                 notify("WhisperKey", "🎙 Запись...")
-                pre = len(recording_data) * 512 / SAMPLE_RATE
-                print(f"[rec] Начата (предзапись {pre * 1000:.0f} мс)")
+                if PREROLL_ENABLED:
+                    pre = len(recording_data) * 512 / SAMPLE_RATE
+                    # Нулевая предзапись при включённом режиме — признак того, что
+                    # поток был мёртв. Молчать об этом нельзя: дальше запись уйдёт
+                    # в никуда, а пользователь увидит «слишком короткая запись».
+                    if pre <= 0:
+                        print("[audio] ВНИМАНИЕ: предзапись пуста, поток был неисправен")
+                    else:
+                        print(f"[rec] Начата (предзапись {pre * 1000:.0f} мс)")
+                else:
+                    print("[rec] Начата")
 
                 if USE_CLOUD:
                     def warm_groq():
