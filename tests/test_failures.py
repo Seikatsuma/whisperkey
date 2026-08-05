@@ -113,7 +113,7 @@ def run_scenario(chunk_behaviour, seconds=200.0):
 
 def test_all_ok():
     def ok(chunk, idx, n):
-        return idx, f"текст_куска_{idx}", "cloud"
+        return idx, f"текст_куска_{idx}", "cloud", []
     text, notes = run_scenario(ok)
     check("Контроль: текст вставлен", "текст_куска_0" in text, f"вставлено: {text!r}")
     check("Контроль: уведомление есть", any("готов" in m.lower() for _, m in notes),
@@ -125,7 +125,7 @@ def test_exception_in_one_chunk():
     def boom(chunk, idx, n):
         if idx == 1:
             raise RuntimeError("сеть отвалилась")
-        return idx, f"текст_куска_{idx}", "cloud"
+        return idx, f"текст_куска_{idx}", "cloud", []
     text, notes = run_scenario(boom)
     check("Отказ 1 куска: остальные дошли", "текст_куска_0" in text and "текст_куска_2" in text,
           f"вставлено: {text!r}")
@@ -141,8 +141,8 @@ def test_chunk_returns_none():
     """Раньше: дыра до 23 секунд склеивалась встык и рапортовалась «Текст готов»."""
     def none_chunk(chunk, idx, n):
         if idx == 1:
-            return idx, None, "lost"
-        return idx, f"текст_куска_{idx}", "cloud"
+            return idx, None, "lost", []
+        return idx, f"текст_куска_{idx}", "cloud", []
     text, notes = run_scenario(none_chunk)
     check("Пустой кусок: метка в тексте", "[не распознано" in text, f"вставлено: {text!r}")
     check("Пустой кусок: не рапортует «готов»",
@@ -152,7 +152,7 @@ def test_chunk_returns_none():
 def test_local_fallback_is_visible():
     """Уход на слабую локальную модель должен быть виден."""
     def local(chunk, idx, n):
-        return idx, f"текст_куска_{idx}", "local" if idx == 0 else "cloud"
+        return idx, f"текст_куска_{idx}", "local" if idx == 0 else "cloud", []
     text, notes = run_scenario(local)
     check("Локальная модель: текст есть", "текст_куска_0" in text, f"вставлено: {text!r}")
     check("Локальная модель: пользователь предупреждён",
@@ -162,7 +162,7 @@ def test_local_fallback_is_visible():
 
 def test_all_chunks_lost():
     def all_lost(chunk, idx, n):
-        return idx, None, "lost"
+        return idx, None, "lost", []
     text, notes = run_scenario(all_lost)
     check("Всё потеряно: уведомление есть", len(notes) > 0, f"уведомления: {notes}")
 
@@ -172,7 +172,7 @@ def test_short_recording_not_chunked():
     calls = []
     def single(chunk, idx, n):
         calls.append(n)
-        return idx, "короткая фраза целиком", "cloud"
+        return idx, "короткая фраза целиком", "cloud", []
     text, notes = run_scenario(single, seconds=45.0)
     check("Короткая: один кусок", calls and calls[0] == 1, f"кусков: {calls}")
     check("Короткая: без меток", "[не распознано" not in text, f"вставлено: {text!r}")
@@ -235,7 +235,7 @@ def test_http_500_retries():
     M["time"].sleep = lambda s: None
     audio = np.full(int(M["SAMPLE_RATE"] * 5), 0.1, dtype=np.float32)
     result = M["transcribe_cloud_turbo"](audio)
-    check("500: исчерпаны попытки", attempts["n"] == 3, f"попыток {attempts['n']}")
+    check("500: исчерпаны попытки", attempts["n"] == 4, f"попыток {attempts['n']}")
     check("500: вернул None", result is None, f"получено {result!r}")
 
 
