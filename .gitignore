@@ -8,3 +8,9 @@ whisper_small_manual/
 *.wav
 WhisperKey-Eval-Samples/
 whisperkey.lock
+
+# Скачанные пакеты и артефакты работы — в репозитории им не место
+*.whl
+*.tar.gz
+qa/
+debug_audio.wav
