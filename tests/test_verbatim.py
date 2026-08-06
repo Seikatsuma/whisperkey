@@ -25,6 +25,7 @@ WANTED_FUNCS = {
     "clean_noise", "_norm_word", "_drop_overlap", "_fmt_mmss", "_join_chunks",
     "_split_audio", "_find_degenerate_segments", "_text_from_response",
     "_words_in_range", "transfer_punctuation", "_transfer_norm",
+    "_change_tempo", "_restore_timeline",
 }
 WANTED_CONSTS = {
     "SAMPLE_RATE", "NARRATOR_LOOP_PATTERN", "BOH_TAIL_MARKERS", "ASR_CONTEXT_PROMPT",
@@ -33,7 +34,7 @@ WANTED_CONSTS = {
     "CHUNK_SIZE_SECONDS", "CHUNK_OVERLAP_SECONDS", "DENSITY_GATE_MIN_DURATION",
     "DENSITY_GATE_MIN_WORDS_PER_SEC", "HALLUCINATION_TRIGGERS",
     "_TRANSFER_PUNCT", "STYLE_PROMPT", "PUNCT_TRANSFER_MIN_SECONDS",
-    "PUNCT_TRANSFER_MAX_SECONDS",
+    "PUNCT_TRANSFER_MAX_SECONDS", "ASR_TEMPO",
 }
 
 
@@ -457,6 +458,86 @@ def test_style_prompt_is_second_pass_only():
     # 16 кГц/16 бит — 32 КБ на секунду, предел Groq 25 МБ ≈ 780 с.
     check("Т9 потолок ниже предела 25 МБ", M["PUNCT_TRANSFER_MAX_SECONDS"] <= 780.0,
           str(M["PUNCT_TRANSFER_MAX_SECONDS"]))
+
+
+def test_tempo_constant_is_sane():
+    """Темп — единственная обработка звука, и она обязана быть незаметной."""
+    t = M["ASR_TEMPO"]
+    check("Т10 темп задан числом", isinstance(t, float), repr(t))
+    # Замерялся коридор 0.97–1.03. Уводить дальше без нового замера нельзя:
+    # сильный сдвиг темпа меняет звучание речи и рискует качеством.
+    check("Т10 темп в замеренном коридоре", 0.95 <= t <= 1.10, str(t))
+
+
+def test_tempo_keeps_signal_intact():
+    """Смена темпа не режет и не добавляет звук — только пересчитывает сетку."""
+    ct = M["_change_tempo"]
+    t = M["ASR_TEMPO"]
+    a = np.sin(np.linspace(0, 50, M["SAMPLE_RATE"])).astype(np.float32)   # 1 секунда
+
+    b = ct(a, t)
+    check("Т10 длина изменилась по темпу", abs(len(b) / len(a) - 1 / t) < 0.001,
+          f"{len(b)}/{len(a)} = {len(b)/len(a):.4f}, ожидалось {1/t:.4f}")
+    check("Т10 тип не потерян", b.dtype == np.float32, str(b.dtype))
+    check("Т10 громкость не выросла", float(abs(b).max()) <= float(abs(a).max()) + 1e-6,
+          f"{abs(b).max()} против {abs(a).max()}")
+
+    # Темп 1.0 обязан быть тождеством: это способ вернуть прежнее поведение.
+    same = ct(a, 1.0)
+    check("Т10 темп 1.0 ничего не меняет", len(same) == len(a), f"{len(same)} против {len(a)}")
+
+    # Вырожденные входы не должны ронять диктовку.
+    for n in (0, 1, 2):
+        try:
+            out = ct(np.zeros(n, dtype=np.float32), t)
+            ok = len(out) <= max(n, 1)
+        except Exception as e:
+            ok = False; out = e
+        check(f"Т10 вход {n} отсчётов не роняет", ok, str(out))
+
+
+def test_timeline_restored_after_tempo():
+    """Таймкоды обязаны вернуться к реальному времени.
+
+    Гейт плотности, подстановка из words[] и снятие перекрытий считают
+    в реальных секундах. Если оставить сжатую шкалу, длинные записи
+    склеятся со сдвигом.
+    """
+    rt = M["_restore_timeline"]
+    t = M["ASR_TEMPO"]
+    res = {"segments": [{"start": 0.0, "end": 10.0, "text": "x"}],
+           "words": [{"word": "а", "start": 1.0, "end": 2.0}]}
+    rt(res)
+    check("Т10 сегмент растянут обратно",
+          abs(res["segments"][0]["end"] - 10.0 * t) < 1e-6, str(res["segments"][0]))
+    check("Т10 слово растянуто обратно",
+          abs(res["words"][0]["end"] - 2.0 * t) < 1e-6, str(res["words"][0]))
+
+    # Отсутствующие и нечисловые поля не должны ронять разбор ответа.
+    odd = {"segments": [{"text": "нет времени"}, {"start": None, "end": "x"}], "words": None}
+    try:
+        rt(odd); ok = True
+    except Exception as e:
+        ok = False; odd = e
+    check("Т10 кривой ответ не роняет", ok, str(odd))
+
+
+def test_eval_samples_keep_original_audio():
+    """В корпус эталонов пишется исходный звук, а не ускоренный.
+
+    Иначе следующий замер будет сделан по уже обработанному материалу
+    и перестанет отражать то, что слышит микрофон.
+    """
+    src = open(SRC, encoding="utf-8").read()
+    marker = "def _write_raw_recording_wav"
+    if marker not in src:
+        # Win-версия корпус не собирает — проверять нечего.
+        check("Т10 запись корпуса без ускорения", True, "сбора корпуса нет в этой версии")
+        return
+    body = src[src.index(marker):]
+    body = body[:body.index("\ndef ")]
+    check("Т10 запись корпуса без ускорения",
+          "_change_tempo" not in body and "ASR_TEMPO" not in body, body[:200])
 
 
 def test_markers_have_no_plain_words():

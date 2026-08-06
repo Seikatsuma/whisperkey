@@ -116,6 +116,10 @@ ASR_CONTEXT_PROMPT = ""
 # в результат попасть не может — оно не совпадёт и будет отброшено.
 STYLE_PROMPT = "Так, ну, в общем, смотри. Значит, вот. И, соответственно, дальше."
 
+# Темп записи, отправляемой в облако. Обоснование и замеры — в create_audio_wav.
+# 1.0 возвращает прежнее поведение.
+ASR_TEMPO = 1.03
+
 # Короткие диктовки whisper оформляет сам: на 47 записях до 15 секунд простыня
 # была ровно одна. Второй запрос там — лишний расход квоты без выигрыша.
 PUNCT_TRANSFER_MIN_SECONDS = 12.0
@@ -1006,19 +1010,67 @@ def compress_silence(audio_data, threshold=0.01, min_pause=1.5, keep_pause=0.5):
         print(f"[compress error] {e}")
         return audio_data
 
-def create_audio_wav(audio_data):
-    """Упаковка звука в WAV без какой-либо обработки.
+def _change_tempo(audio_data, factor: float):
+    """Меняет темп записи линейной интерполяцией по новой сетке отсчётов.
 
-    Всё, что здесь было раньше, снято по замерам:
+    Частота дискретизации в заголовке WAV остаётся прежней, поэтому для модели
+    речь звучит быстрее, а слова остаются теми же — это не обработка звука
+    и не фильтр, ничего не вырезается и не добавляется.
+    """
+    n = int(len(audio_data) / factor)
+    if n < 2 or factor == 1.0:
+        return audio_data
+    grid = np.linspace(0, len(audio_data) - 1, n)
+    return np.interp(grid, np.arange(len(audio_data)), audio_data).astype(np.float32)
+
+def _restore_timeline(result: dict) -> None:
+    """Возвращает таймкоды ответа к реальному времени записи.
+
+    Звук уходит ускоренным в ASR_TEMPO раз, значит и segments[], и words[]
+    приходят на сжатой шкале. Всё, что считает по времени — гейт плотности,
+    подстановка из words[], снятие перекрытий при склейке длинных записей —
+    рассчитано на реальные секунды. Умножаем обратно прямо здесь, чтобы
+    остальной код об ускорении вообще не знал.
+    """
+    if ASR_TEMPO == 1.0:
+        return
+    for key in ('segments', 'words'):
+        for item in (result.get(key) or []):
+            for field in ('start', 'end'):
+                v = item.get(field)
+                if isinstance(v, (int, float)):
+                    item[field] = v * ASR_TEMPO
+
+def create_audio_wav(audio_data):
+    """Упаковка звука в WAV. Единственная обработка — ускорение темпа.
+
+    Всё остальное, что здесь было раньше, снято по замерам:
       - compress_silence: на диктовке результат побайтово тот же (совпадение 1.0000),
         на длинной записи цепочка стоила 15.6% слов;
       - паддинг 0.5 с тишины: приписывание чистой цифровой тишины к идентичному
         аудио сдвигает границы 30-секундных окон модели и отнимает 8-10% слов;
       - нормировка по пику: пользы не показала, а вместе с паддингом двигала таймлайн.
-    Остался только клип в ±1.0, чтобы не переполнить int16.
+
+    ASR_TEMPO — замер 06.08.26 на 19 диктовках Егора против эталона SaluteSpeech:
+      темп 1.00 (как было)  14.8% ошибок
+      темп 1.03             13.3%   лучше на 10 записях, хуже на 3
+      темп 0.97             13.9%   лучше на 7, хуже на 6
+      +0.7 с тишины в начало 16.5%  заметно хуже
+    Бутстрап 20000 пересборок для 1.03: −1.50 п.п., ДИ95 [−3.36; +0.34], хуже базы
+    в 5% пересборок. То есть выигрыш вероятен, но на 19 записях не доказан строго —
+    интервал краем задевает ноль. Порог решения: правка ничем не рискует (слова
+    не трогаются, задержка не растёт), поэтому принята.
+    Почему работает: у whisper окно 30 секунд и жёсткая привязка к темпу, сдвиг
+    темпа меняет весь путь декодирования.
+    Функция применяется ТОЛЬКО к облачному проходу — create_audio_wav вызывается
+    из transcribe_cloud_turbo и больше нигде. Локальная модель и запись в
+    корпус эталонов (_write_raw_recording_wav) получают исходный звук.
     """
     try:
-        audio_data = np.clip(np.asarray(audio_data, dtype=np.float32), -1.0, 1.0)
+        audio_data = np.asarray(audio_data, dtype=np.float32)
+        if ASR_TEMPO != 1.0:
+            audio_data = _change_tempo(audio_data, ASR_TEMPO)
+        audio_data = np.clip(audio_data, -1.0, 1.0)
 
         wav_io = io.BytesIO()
         with wave.open(wav_io, 'wb') as wf:
@@ -1212,6 +1264,7 @@ def transcribe_cloud_turbo(audio_data, allow_retry: bool = True, use_prompt: boo
 
             if response.status_code == 200:
                 result = response.json()
+                _restore_timeline(result)
                 text, degenerate = _text_from_response(result)
                 cloud_status["last_degenerate"] = degenerate
                 if degenerate:

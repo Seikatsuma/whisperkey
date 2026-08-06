@@ -240,14 +240,28 @@ def test_http_500_retries():
 
 
 def test_no_preprocessing_in_wav():
-    """WAV должен содержать ровно столько сэмплов, сколько было на входе."""
+    """В WAV попадает ровно исходный звук, изменённый только по темпу.
+
+    Раньше здесь резались паузы и дописывалась тишина — и то и другое
+    сдвигало границы 30-секундных окон модели и стоило слов. Единственная
+    оставшаяся обработка — ASR_TEMPO, и она обязана быть ровно такой,
+    какой заявлена: никакого паддинга сверх пересчёта сетки.
+    """
     import io, wave
     audio = np.full(int(M["SAMPLE_RATE"] * 3), 0.5, dtype=np.float32)
     data = M["create_audio_wav"](audio)
     with wave.open(io.BytesIO(data), "rb") as wf:
         frames = wf.getnframes()
-    check("Без паддинга", frames == len(audio),
-          f"на входе {len(audio)} сэмплов, в WAV {frames} (разница {frames - len(audio)})")
+    expected = int(len(audio) / M["ASR_TEMPO"]) if M["ASR_TEMPO"] != 1.0 else len(audio)
+    check("Только пересчёт по темпу, без паддинга", abs(frames - expected) <= 1,
+          f"на входе {len(audio)}, темп {M['ASR_TEMPO']}, ожидалось {expected}, в WAV {frames}")
+
+    # Частота дискретизации в заголовке НЕ меняется: именно поэтому речь для
+    # модели звучит быстрее. Подмена частоты вернула бы исходное звучание
+    # и обнулила бы весь эффект.
+    with wave.open(io.BytesIO(data), "rb") as wf:
+        check("Частота дискретизации не тронута", wf.getframerate() == M["SAMPLE_RATE"],
+              f"{wf.getframerate()} вместо {M['SAMPLE_RATE']}")
 
 
 def test_idle_release_and_recovery():
