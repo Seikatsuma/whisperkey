@@ -121,7 +121,28 @@ ASR_CONTEXT_PROMPT = ""
 # Решение: два запроса ОДНОВРЕМЕННО. Слова берутся только из прохода без промпта,
 # знаки переносятся из прохода с промптом на совпавших участках. Слово из промпта
 # в результат попасть не может — оно не совпадёт и будет отброшено.
-STYLE_PROMPT = "Так, ну, в общем, смотри. Значит, вот. И, соответственно, дальше."
+# Второй проход несёт две нагрузки сразу: образец пунктуации и словарь терминов.
+# Совмещение проверено 07.08.26 на калибровочной записи (эталон — текст, который
+# Егор читал вслух, 731 слово): точность 78.9% -> 80.4%, верно записанных терминов
+# 6 -> 16. Отдельный третий запрос под словарь давал 80.2% — то есть совмещение
+# не только дешевле, но и точнее.
+STYLE_PROMPT = ("Так, ну, в общем, смотри. Значит, вот. И, соответственно, дальше. "
+                "Claude Code, Claude Design, WhisperKey, Notebook LM, GitHub, Telegram, "
+                "Groq, DeepGram, CEO, API, Яндекс Маркет, Ozon, Wildberries, iPad, "
+                "промпт, токены, агенты, скиллы.")
+
+# Белый список: ТОЛЬКО эти слова могут приехать из второго прохода в текст.
+# Промпт заставляет модель писать названия латиницей, но он же съедает слова
+# (замер: 613 слов без словаря против 542 со словарём). Поэтому слова берутся
+# из основного прохода, а из словарного переносятся исключительно термины отсюда.
+# Слово, которого нет в этом списке, попасть в результат физически не может.
+TERM_CANON = {
+    "claude": "Claude", "code": "Code", "design": "Design",
+    "whisperkey": "WhisperKey", "notebook": "Notebook", "lm": "LM",
+    "github": "GitHub", "telegram": "Telegram", "groq": "Groq",
+    "deepgram": "DeepGram", "ceo": "CEO", "ipad": "iPad",
+    "ozon": "Ozon", "wildberries": "Wildberries",
+}
 
 # Темп записи, отправляемой в облако. Обоснование и замеры — в create_audio_wav.
 # 1.0 возвращает прежнее поведение.
@@ -792,6 +813,31 @@ def transfer_punctuation(base_text: str, styled_text: str) -> str:
         print("[punct] перенос знаков нарушил слова — оставляю текст без знаков")
         return base_text
     return result
+
+def transfer_terms(base_text: str, vocab_text: str) -> tuple[str, int]:
+    """Подставляет названия продуктов из словарного прохода. Пословно.
+
+    Замена участками целиком съедала соседние слова — на замере это стоило
+    +5 ошибок против +9 выигранных. Здесь слова спариваются по позиции внутри
+    участка расхождения, и подставляется ровно одно слово вместо одного,
+    причём только из TERM_CANON.
+    """
+    if not base_text or not vocab_text:
+        return base_text, 0
+    a, b = base_text.split(), vocab_text.split()
+    na = [_transfer_norm(x) for x in a]
+    nb = [_transfer_norm(x) for x in b]
+    out, used = list(a), 0
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, na, nb,
+                                                       autojunk=False).get_opcodes():
+        if tag != 'replace':
+            continue
+        for k in range(min(i2 - i1, j2 - j1)):
+            canon = TERM_CANON.get(nb[j1 + k])
+            if canon:
+                out[i1 + k] = canon
+                used += 1
+    return ' '.join(out), used
 
 def apply_smart_sentence_ending(text: str) -> str:
     """Минимальное оформление: заглавная в начале, точка — по флагу."""
@@ -1637,6 +1683,11 @@ def process_audio(audio_snapshot: list, session_id: int):
                     full_raw_text = transfer_punctuation(full_raw_text, styled)
                     if full_raw_text != before:
                         print(f"[punct] знаки перенесены со второго прохода")
+                    # Названия продуктов — из того же прохода, отдельного запроса
+                    # он не требует. Слова берутся только из белого списка.
+                    full_raw_text, n_terms = transfer_terms(full_raw_text, styled)
+                    if n_terms:
+                        print(f"[terms] названий поправлено: {n_terms}")
             except Exception as e:
                 print(f"[punct] второй проход не дошёл ({type(e).__name__}) — "
                       f"текст остаётся без добавленных знаков")
