@@ -378,6 +378,32 @@ def test_style_pass_marks_are_applied():
           f"вставлено: {text!r}")
 
 
+def test_microphone_dropouts_are_visible():
+    """Переполнение входного буфера обязано доходить до пользователя.
+
+    Это единственный класс потерь, который распознавание не лечит: сэмплы
+    выброшены железом, звука уже нет. Если промолчать, пользователь спишет
+    пропавшие слова на модель и будет крутить не ту ручку.
+    """
+    def ok(chunk, idx, n):
+        return idx, "первое слово второе слово", "cloud", []
+
+    M["audio_dropouts"].clear()
+    M["audio_dropouts"].append("input overflow")
+    text, notes = run_short_scenario(ok, lambda *a, **k: None)
+    said = " ".join(m for _, m in notes).lower()
+    check("Пропуск микрофона виден в уведомлении", "микрофон" in said,
+          f"уведомления: {notes}")
+    check("Пропуск микрофона не съел текст",
+          "первое слово" in text.lower(), f"вставлено: {text!r}")
+
+    M["audio_dropouts"].clear()
+    text, notes = run_short_scenario(ok, lambda *a, **k: None)
+    said = " ".join(m for _, m in notes).lower()
+    check("Без пропусков — обычное уведомление", "микрофон" not in said,
+          f"уведомления: {notes}")
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

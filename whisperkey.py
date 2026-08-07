@@ -69,7 +69,14 @@ def load_env_file(path: str = ".env") -> None:
 SAMPLE_RATE = 16000
 TRIGGER_KEY = keyboard.Key.alt_r
 MODEL_PATH  = "small" # CEO Upgrade: 'base' -> 'small' for significantly better Russian accuracy
-TAIL_CAPTURE_SECONDS = 0.6  # CEO Speed: 0.8 -> 0.6 (быстрее старт, риск минимален)
+TAIL_CAPTURE_SECONDS = 1.0  # Захват хвоста после отпускания клавиши.
+# Поднято с 0.6 до 1.0 (07.08.26) по жалобе: последнее слово не попадает
+# в запись, хотя клавиша отпущена позже. Прежние 0.6 с ставились ради
+# скорости, но диктовка идёт в облако 2-4 секунды, и лишние 0.4 с на фоне
+# этого не заметны, а потерянное слово заметно всегда.
+# Проверить это замером нельзя: корпус эталонов содержит УЖЕ записанный
+# звук, и то, что не попало в файл, в нём отсутствует у всех одинаково.
+# Проверка — на калибровочном тексте, где известно, что было сказано.
 RESTORE_CLIPBOARD = True
 SAVE_DEBUG_AUDIO = False  # Speed: без записи WAV на диск (качество 5/5)
 
@@ -514,6 +521,12 @@ def audio_callback(indata, frames, time_info, status):
     """
     if status:
         print(f"[audio] PortAudio: {status}")
+        # Переполнение входного буфера — это выброшенные железом сэмплы, то есть
+        # речь, которой в записи уже не будет. Считаем их во время диктовки,
+        # чтобы такую потерю нельзя было спутать с ошибкой распознавания:
+        # модель тут ни при чём, до неё звук просто не дошёл.
+        if is_recording:
+            audio_dropouts.append(str(status))
     block = indata.copy()
     if is_recording:
         recording_data.append(block)
@@ -872,6 +885,8 @@ def direct_insert(text: str):
         print(f"[insert error] {e}")
 
 artifacts_removed: list[str] = []   # что вырезали в последней обработке — для уведомления
+audio_dropouts: list[str] = []      # переполнения входного буфера за время записи
+                                    # (сэмплы, выброшенные железом до распознавания)
 
 def strip_asr_artifacts(text: str) -> str:
     """Удаляет водяные знаки Whisper, НЕ трогая окружающий текст.
@@ -1665,6 +1680,10 @@ def process_audio(audio_snapshot: list, session_id: int):
                 problems.append(f"локальная модель: {n_local}")
             if artifacts_removed:
                 problems.append("вырезан водяной знак")
+            if audio_dropouts:
+                # Это единственный класс потерь, который распознавание не лечит:
+                # звука уже нет. Пользователь должен видеть разницу.
+                problems.append(f"микрофон не успевал: пропусков {len(audio_dropouts)}")
             if problems:
                 notify("WhisperKey — распознано частично", "; ".join(problems))
                 print(f"[warn] {'; '.join(problems)}")
@@ -1732,6 +1751,7 @@ def on_press(key):
                         return
                     recording_data = []
 
+                audio_dropouts.clear()
                 is_recording = True
                 # Уведомление ПОСЛЕ фактического начала захвата: раньше «говори»
                 # выдавалось до того, как микрофон отдавал первый сэмпл.
