@@ -25,7 +25,7 @@ WANTED_FUNCS = {
     "clean_noise", "_norm_word", "_drop_overlap", "_fmt_mmss", "_join_chunks",
     "_split_audio", "_find_degenerate_segments", "_text_from_response",
     "_words_in_range", "transfer_punctuation", "_transfer_norm",
-    "_change_tempo", "_restore_timeline",
+    "_change_tempo", "_restore_timeline", "transfer_terms",
 }
 WANTED_CONSTS = {
     "SAMPLE_RATE", "NARRATOR_LOOP_PATTERN", "BOH_TAIL_MARKERS", "ASR_CONTEXT_PROMPT",
@@ -34,7 +34,7 @@ WANTED_CONSTS = {
     "CHUNK_SIZE_SECONDS", "CHUNK_OVERLAP_SECONDS", "DENSITY_GATE_MIN_DURATION",
     "DENSITY_GATE_MIN_WORDS_PER_SEC", "HALLUCINATION_TRIGGERS",
     "_TRANSFER_PUNCT", "STYLE_PROMPT", "PUNCT_TRANSFER_MIN_SECONDS",
-    "PUNCT_TRANSFER_MAX_SECONDS", "ASR_TEMPO",
+    "PUNCT_TRANSFER_MAX_SECONDS", "ASR_TEMPO", "TERM_CANON",
 }
 
 
@@ -538,6 +538,45 @@ def test_eval_samples_keep_original_audio():
     body = body[:body.index("\ndef ")]
     check("Т10 запись корпуса без ускорения",
           "_change_tempo" not in body and "ASR_TEMPO" not in body, body[:200])
+
+
+def test_term_transfer_whitelist_only():
+    """Из словарного прохода в текст попадают ТОЛЬКО слова белого списка.
+
+    Промпт со словарём заставляет модель писать названия латиницей, но он же
+    подставляет свои слова вместо неуслышанных. Белый список — единственное,
+    что отделяет одно от другого.
+    """
+    tt = M["transfer_terms"]
+    out, n = tt("открой клади код и зайди в гроб", "открой Claude Code и зайди в Groq")
+    check("Т11 названия подставлены", out == "открой Claude Code и зайди в Groq", out)
+    check("Т11 счётчик верен", n == 3, str(n))
+
+    # Слово не из списка не имеет права просочиться.
+    out, n = tt("я говорю про это", "я говорю про совершенно другое")
+    check("Т11 постороннее слово не прошло", out == "я говорю про это", out)
+    check("Т11 подстановок нет", n == 0, str(n))
+
+    # Длина текста не меняется никогда: замена ровно одно слово на одно.
+    for base, vocab in [("а б в г д", "а Claude в Groq д"),
+                        ("одно", "Claude"), ("", "Claude Code"), ("текст", "")]:
+        out, _ = tt(base, vocab)
+        check(f"Т11 длина сохранена: {base[:18]!r}",
+              len(out.split()) == len(base.split()), f"{base!r} -> {out!r}")
+
+
+def test_style_prompt_carries_vocabulary():
+    """Словарь едет во втором проходе — отдельного запроса он не стоит."""
+    p = M["STYLE_PROMPT"]
+    for term in ("Claude Code", "WhisperKey", "GitHub", "Groq"):
+        check(f"Т11 в промпте есть {term}", term in p, p[:120])
+    # Образец пунктуации обязан остаться: второй проход отвечает и за знаки.
+    check("Т11 образец знаков на месте", "." in p and "," in p, p[:60])
+    # Белый список не должен содержать обычных русских слов: подстановка
+    # «кода» вместо «код» в живой речи была бы прямой порчей текста.
+    plain = {"код", "дизайн", "агент", "промпт", "токен", "скилл"}
+    bad = plain & set(M["TERM_CANON"])
+    check("Т11 в списке нет обычных слов", not bad, f"найдено {bad}")
 
 
 def test_markers_have_no_plain_words():
