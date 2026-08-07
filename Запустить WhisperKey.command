@@ -68,6 +68,41 @@ fi
 # Запомнили — в следующий раз найдётся сразу.
 pwd > "$CONFIG"
 
+# ─── Самообновление ──────────────────────────────────────────────────────────
+# Обновление приезжает при каждом запуске, чтобы не переносить папку руками.
+# Правила, без которых это опасно:
+#   --ff-only  — если в папке есть свои правки, обновление просто не применится
+#                вместо того, чтобы их затереть;
+#   BatchMode  — ssh не станет спрашивать пароль и ждать ответа вечно;
+#   любая неудача — запускаемся на том, что уже лежит: диктовка важнее свежести.
+# Отключить: запусти с WHISPERKEY_NO_UPDATE=1 или создай файл .no-update рядом.
+if [ -z "${WHISPERKEY_NO_UPDATE:-}" ] && [ ! -f ".no-update" ] && [ -d ".git" ]; then
+  if command -v git >/dev/null 2>&1; then
+    BEFORE="$(git rev-parse --short HEAD 2>/dev/null)"
+    echo "Проверяю обновление..."
+    if GIT_TERMINAL_PROMPT=0 \
+       GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new" \
+       git pull --ff-only --quiet 2>/tmp/whisperkey_update.log; then
+      AFTER="$(git rev-parse --short HEAD 2>/dev/null)"
+      if [ "$BEFORE" != "$AFTER" ]; then
+        echo "Обновлено: $BEFORE → $AFTER"
+        git log --oneline "$BEFORE..$AFTER" 2>/dev/null | sed 's/^/   • /'
+      else
+        echo "Уже последняя версия."
+      fi
+    else
+      # Частые причины: нет сети, свои правки в папке, ключ SSH недоступен.
+      echo "Обновиться не вышло — работаю на текущей версии."
+      sed 's/^/   /' /tmp/whisperkey_update.log 2>/dev/null | head -3
+    fi
+  fi
+elif [ ! -d ".git" ]; then
+  echo "Папка не подключена к репозиторию — обновляться неоткуда."
+  echo "Один раз выполни в Терминале, и дальше всё будет само:"
+  echo "   git clone git@github.com:Seikatsuma/whisperkey.git ~/Desktop/WhisperKey"
+  echo "   и перенеси в новую папку файл .env со своим ключом."
+fi
+
 export KMP_DUPLICATE_LIB_OK=TRUE
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
