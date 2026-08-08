@@ -40,5 +40,7 @@ echo "═══ КУДА СМОТРИТ ПРОГРАММА ═══"
 [ -f "$HOME/.whisperkey_path" ] && echo "запомненный путь: $(cat "$HOME/.whisperkey_path")" || echo "путь ещё не запомнен"
 echo
 echo "═══ ЧТО ЗАПУЩЕНО ПРЯМО СЕЙЧАС ═══"
-ps aux | grep "[Pp]ython.*[w]hisperkey.py" | awk '{for(i=11;i<=NF;i++) printf "%s ", $i; print ""}' | head -3
-[ -z "$(ps aux | grep '[Pp]ython.*[w]hisperkey.py')" ] && echo "(не запущено)"
+# Ищем именно процесс питона с whisperkey.py, а не любую строку с этим словом:
+# иначе в отчёт попадают собственные команды диагностики.
+RUN=$(ps -eo pid=,command= 2>/dev/null | grep -i "python" | grep "whisperkey\.py" | grep -v "grep")
+if [ -n "$RUN" ]; then printf '%s\n' "$RUN" | head -3; else echo "(не запущено)"; fi
