@@ -74,7 +74,11 @@ def build_module():
         def options(self, *a, **k):
             return None
 
-    ns["requests"] = types.SimpleNamespace(Session=FakeSession, get=lambda *a, **k: None)
+    class FakeTimeout(Exception):
+        pass
+
+    ns["requests"] = types.SimpleNamespace(Session=FakeSession, get=lambda *a, **k: None,
+                                           Timeout=FakeTimeout)
 
     exec(compile(ast.Module(body=body, type_ignores=[]), SRC, "exec"), ns)
     return ns
@@ -467,6 +471,167 @@ def test_clipboard_restore_skipped_if_user_copied_own():
     finally:
         M["subprocess"].run, M["_clipboard_now"] = orig_run, orig_now
     check("Чужую копию не затираем", not restored, f"записано: {restored}")
+
+
+# ─── Каскад движков ───────────────────────────────────────────────────────────
+# Deepgram — первая ступень, Groq — вторая, локальная модель — третья.
+# Проверяется главное свойство каскада: отказ ЛЮБОЙ ступени не должен стоить
+# человеку диктовки. Все переходы обязаны быть молчаливыми для результата
+# и видимыми в терминале.
+
+class DGResp:
+    """Ответ Deepgram, каким его видит transcribe_deepgram."""
+    def __init__(self, code, transcript=None, broken=False):
+        self.status_code = code
+        self.headers = {}
+        self.text = "тело ответа"
+        self._transcript = transcript
+        self._broken = broken
+
+    def json(self):
+        if self._broken:
+            return {"неожиданная": "форма"}
+        return {"results": {"channels": [{"alternatives": [
+            {"transcript": self._transcript}]}]}}
+
+
+def run_cascade(dg_behaviour, whisper_text="запасной путь сработал", seconds=45.0):
+    """Прогон process_audio с подменённым ответом Deepgram.
+
+    Возвращает (вставленный текст, уведомления, сколько раз звали whisper).
+    """
+    INSERTED.clear()
+    NOTIFIED.clear()
+    whisper_calls = []
+
+    def fake_chunk(chunk, idx, n):
+        whisper_calls.append(idx)
+        return idx, whisper_text, "cloud", []
+
+    M["_transcribe_one_chunk"] = fake_chunk
+    orig_post = M["http_session"].post
+    M["http_session"].post = dg_behaviour
+    M["DEEPGRAM_ENABLED"] = True
+    M["deepgram_status"]["blocked_until"] = 0.0
+    try:
+        M["process_audio"](make_audio(seconds), session_id=1)
+    finally:
+        M["http_session"].post = orig_post
+        M["DEEPGRAM_ENABLED"] = False
+        M["deepgram_status"]["blocked_until"] = 0.0
+    return "".join(INSERTED), list(NOTIFIED), whisper_calls
+
+
+def test_deepgram_goes_first_and_whisper_stays_idle():
+    """Когда первая ступень отвечает, вторая не должна тратить ни запроса.
+
+    Это не только деньги: на пятиминутной записи Groq отвечает 5.6 с против
+    1.6 с у Deepgram, и лишний вызов был бы прямой задержкой вставки.
+    """
+    text, notes, whisper = run_cascade(
+        lambda *a, **k: DGResp(200, "текст от первой ступени"))
+    check("Каскад: текст от Deepgram вставлен", "текст от первой ступени" in text.lower(),
+          f"вставлено: {text!r}")
+    check("Каскад: whisper не вызывался", not whisper, f"вызовов whisper: {whisper}")
+
+
+def test_deepgram_empty_falls_back_to_whisper():
+    """Пустой ответ — не повод объявлять диктовку нераспознанной."""
+    text, notes, whisper = run_cascade(lambda *a, **k: DGResp(200, ""))
+    check("Пустой Deepgram: ушли на whisper", bool(whisper), "whisper не вызвался")
+    check("Пустой Deepgram: текст всё равно есть", "запасной путь сработал" in text.lower(),
+          f"вставлено: {text!r}")
+
+
+def test_deepgram_broken_json_falls_back():
+    """Неожиданная форма ответа не должна ронять диктовку."""
+    text, notes, whisper = run_cascade(lambda *a, **k: DGResp(200, None, broken=True))
+    check("Битый ответ: ушли на whisper", bool(whisper), "whisper не вызвался")
+    check("Битый ответ: текст доставлен", "запасной путь сработал" in text.lower(),
+          f"вставлено: {text!r}")
+
+
+def test_deepgram_out_of_money_blocks_and_warns():
+    """Кончились деньги — работаем дальше, но человек об этом узнаёт.
+
+    402 повтором не лечится, поэтому движок отключается на четверть часа:
+    иначе каждая следующая диктовка платила бы ожиданием за мёртвый запрос.
+    """
+    text, notes, whisper = run_cascade(lambda *a, **k: DGResp(402))
+    said = " ".join(f"{n} {m}" for n, m in notes).lower()
+    check("Нет денег: текст доставлен", "запасной путь сработал" in text.lower(),
+          f"вставлено: {text!r}")
+    check("Нет денег: whisper подхватил", bool(whisper), "whisper не вызвался")
+    check("Нет денег: человек предупреждён", "deepgram" in said or "движок" in said,
+          f"уведомления: {notes}")
+
+
+def test_deepgram_blocked_makes_no_request():
+    """Пока действует блокировка, к Deepgram не должно уходить ни одного запроса."""
+    import time as _time
+    calls = []
+
+    def counting_post(url=None, *a, **k):
+        # Считаем ТОЛЬКО запросы к Deepgram: по этому же http_session идёт
+        # стилевой проход whisper, и без разделения тест ловил бы его.
+        if url and M["DEEPGRAM_URL"] in str(url):
+            calls.append(1)
+        return DGResp(200, "не должно быть вызвано")
+
+    INSERTED.clear()
+    NOTIFIED.clear()
+    M["_transcribe_one_chunk"] = lambda chunk, idx, n: (idx, "через whisper", "cloud", [])
+    orig_post = M["http_session"].post
+    M["http_session"].post = counting_post
+    M["DEEPGRAM_ENABLED"] = True
+    M["deepgram_status"]["blocked_until"] = _time.time() + 600
+    try:
+        M["process_audio"](make_audio(45.0), session_id=1)
+    finally:
+        M["http_session"].post = orig_post
+        M["DEEPGRAM_ENABLED"] = False
+        M["deepgram_status"]["blocked_until"] = 0.0
+    check("Блокировка: ни одного запроса", not calls, f"запросов: {len(calls)}")
+    check("Блокировка: текст всё равно доставлен", "через whisper" in "".join(INSERTED).lower(),
+          f"вставлено: {INSERTED}")
+
+
+def test_deepgram_timeout_falls_back():
+    """Молчание движка не должно превращаться в молчание программы."""
+    class FakeTimeout(Exception):
+        pass
+    orig_timeout = M["requests"].Timeout
+    M["requests"].Timeout = FakeTimeout
+
+    def timing_out(*a, **k):
+        raise FakeTimeout("не дождались")
+
+    try:
+        text, notes, whisper = run_cascade(timing_out)
+    finally:
+        M["requests"].Timeout = orig_timeout
+    check("Таймаут: ушли на whisper", bool(whisper), "whisper не вызвался")
+    check("Таймаут: текст доставлен", "запасной путь сработал" in text.lower(),
+          f"вставлено: {text!r}")
+
+
+def test_deepgram_params_stay_verbatim():
+    """Настройки движка — часть требования дословности, а не вкусовщина.
+
+    smart_format переписывает «двадцать пять» в «25» и стоил 2.8 пункта
+    на замере; filler_words выкидывает «ну» и «вот», которые Егор произносит.
+    Обе настройки менялись замером, поэтому закреплены проверкой.
+    """
+    p = M["DEEPGRAM_PARAMS"]
+    check("Дословность: smart_format выключен", p.get("smart_format") == "false",
+          f"smart_format={p.get('smart_format')}")
+    check("Дословность: filler_words включён", p.get("filler_words") == "true",
+          f"filler_words={p.get('filler_words')}")
+    check("Дословность: числа не переписываются", p.get("numerals") == "false",
+          f"numerals={p.get('numerals')}")
+    check("Модель nova-2 (nova-3 на русском слабее)", p.get("model") == "nova-2",
+          f"model={p.get('model')}")
+    check("Язык задан явно", p.get("language") == "ru", f"language={p.get('language')}")
 
 
 def main():
