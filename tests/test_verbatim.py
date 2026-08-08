@@ -25,7 +25,7 @@ WANTED_FUNCS = {
     "clean_noise", "_norm_word", "_drop_overlap", "_fmt_mmss", "_join_chunks",
     "_split_audio", "_find_degenerate_segments", "_text_from_response",
     "_words_in_range", "transfer_punctuation", "_transfer_norm",
-    "_change_tempo", "_restore_timeline", "transfer_terms", "transfer_endings",
+    "_change_tempo", "_restore_timeline", "transfer_terms", "transfer_endings", "fix_known_terms",
 }
 WANTED_CONSTS = {
     "SAMPLE_RATE", "NARRATOR_LOOP_PATTERN", "BOH_TAIL_MARKERS", "ASR_CONTEXT_PROMPT",
@@ -34,7 +34,7 @@ WANTED_CONSTS = {
     "CHUNK_SIZE_SECONDS", "CHUNK_OVERLAP_SECONDS", "DENSITY_GATE_MIN_DURATION",
     "DENSITY_GATE_MIN_WORDS_PER_SEC", "HALLUCINATION_TRIGGERS",
     "_TRANSFER_PUNCT", "STYLE_PROMPT", "PUNCT_TRANSFER_MIN_SECONDS",
-    "PUNCT_TRANSFER_MAX_SECONDS", "ASR_TEMPO", "TERM_CANON", "ENDING_MIN_STEM",
+    "PUNCT_TRANSFER_MAX_SECONDS", "ASR_TEMPO", "TERM_CANON", "ENDING_MIN_STEM", "TERM_FIX", "_TERM_FIX_RX",
 }
 
 
@@ -615,6 +615,43 @@ def test_style_prompt_carries_imperatives():
     check("Т12 образцы команд в промпте", len(found) >= 4, f"нашлось {found}")
     check("Т12 порог основы разумный", 3 <= M["ENDING_MIN_STEM"] <= 6,
           str(M["ENDING_MIN_STEM"]))
+
+
+def test_term_table_cannot_touch_real_words():
+    """Таблица названий не имеет права трогать живую русскую речь.
+
+    «код», «клад», «рок» — обычные слова, и подстановка на них была бы прямой
+    порчей текста. Именно поэтому их нет в таблице, и это проверяется здесь,
+    а не оставляется на внимательность того, кто будет её пополнять.
+    """
+    fx = M["fix_known_terms"]
+    for phrase in ["сам код тупит", "папку из VS код", "нашёл клад",
+                   "это рок музыка", "кода не хватает", "он клал на стол",
+                   "русский рок играет", "код дизайн"]:
+        out, n = fx(phrase)
+        check(f"Т13 не тронуто: {phrase!r}", out == phrase and n == 0, f"{phrase!r} -> {out!r}")
+
+    # В самой таблице тоже не должно оказаться обычных слов.
+    plain = {"код", "клад", "рок", "кода", "клада", "дизайн", "агент", "токен"}
+    bad = [p for p, _ in M["TERM_FIX"]
+           for w in plain if re.fullmatch(r"\\\\b" + w + r"\\\\b", p)]
+    check("Т13 в таблице нет обычных слов", not bad, f"найдено {bad}")
+
+
+def test_term_table_fixes_known_names():
+    """Названия, записанные по звучанию, приводятся к правильному виду."""
+    fx = M["fix_known_terms"]
+    cases = [("докрути виспер", "WhisperKey"), ("виспро.кей работает", "WhisperKey"),
+             ("как seo to seo", "CEO"), ("джимми 2.5", "Gemini"),
+             ("выложи на гитхаб", "GitHub"), ("клоуда открой", "Claude")]
+    for phrase, want in cases:
+        out, n = fx(phrase)
+        check(f"Т13 исправлено: {phrase!r}", want in out and n > 0, f"{phrase!r} -> {out!r}")
+
+    # Пустой вход не роняет.
+    for empty in ("", None):
+        out, n = fx(empty)
+        check(f"Т13 пустой вход: {empty!r}", n == 0, str(out))
 
 
 def test_markers_have_no_plain_words():

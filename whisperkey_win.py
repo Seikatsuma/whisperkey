@@ -789,6 +789,51 @@ def transfer_punctuation(base_text: str, styled_text: str) -> str:
         return base_text
     return result
 
+# ─── Таблица названий ────────────────────────────────────────────────────────
+TERM_FIX = [
+    # WhisperKey — модель ломает название шестью разными способами
+    (r"\b(?:виспер\s?кей|висперкей|виспро[\s.]?кей|wispro[\s.]?ke[yй]|wisperk|whisper\s?key)\b", "WhisperKey"),
+    (r"\bвиспр[оа]\b", "WhisperKey"),
+    (r"\bвиспер\b", "WhisperKey"),
+    # Gemini
+    (r"\b(?:jiminy|джимм?и|джемини|гемини)\b", "Gemini"),
+    # Claude. «клад» и «код» НЕ трогаем — это настоящие слова.
+    (r"\bкл[оа]уд\w*\b", "Claude"),
+    (r"\bклод\b", "Claude"),
+    # Маркетплейсы
+    (r"\badaxmarket\b", "Яндекс Маркет"),
+    (r"\b(?:valberis|валберис|вайлдберриз|вайлдберис)\b", "Wildberries"),
+    (r"\b(?:озон|ozon)\b", "Ozon"),
+    # Прочее из корпуса
+    (r"\bюджайл\w*\b", "Yougile"),
+    (r"\bгитхаб\w*\b", "GitHub"),
+    (r"\bдипграм\w*\b", "DeepGram"),
+    (r"\bтелеграм\b", "Telegram"),
+    # CEO. В корпусе Егора 23 из 23 вхождений «seo» — это «CEO to CEO».
+    # Настоящего SEO у него нет ни разу; если появится — строку убрать.
+    (r"\bseo\b", "CEO"),
+]
+_RX = [(re.compile(p, re.IGNORECASE), r) for p, r in TERM_FIX]
+
+_TERM_FIX_RX: list = []   # компилируется при первом вызове
+
+def fix_known_terms(text: str) -> tuple[str, int]:
+    """Заменяет названия, записанные по звучанию, на правильные.
+
+    Работает без обращения к сети и без второго прохода: чистая таблица.
+    Замер 08.08.26 — на живом корпусе Егора (213 записей, 8590 слов) исправлено
+    46 названий в 26 записях; на калибровке точность 79.3% -> 80.2%.
+    """
+    if not text:
+        return text, 0
+    if not _TERM_FIX_RX:
+        _TERM_FIX_RX.extend((re.compile(p, re.IGNORECASE), r) for p, r in TERM_FIX)
+    n = 0
+    for rx, rep in _TERM_FIX_RX:
+        text, k = rx.subn(rep, text)
+        n += k
+    return text, n
+
 def transfer_terms(base_text: str, vocab_text: str) -> tuple[str, int]:
     """Подставляет названия продуктов из словарного прохода. Пословно.
 
@@ -1951,6 +1996,12 @@ def process_audio(audio_snapshot: list, session_id: int):
                       f"текст остаётся без добавленных знаков")
             finally:
                 style_pool.shutdown(wait=False)
+
+        # Таблица названий работает ВСЕГДА, даже когда второго прохода не было:
+        # короткая диктовка, отказ сети, исчерпанная квота. Сети не требует.
+        full_raw_text, n_fix = fix_known_terms(full_raw_text)
+        if n_fix:
+            print(f"[terms] по таблице поправлено: {n_fix}")
 
         # LLM-полировка удалена. Модель llama-3.1-70b-versatile выведена Groq из
         # обслуживания (HTTP 400 model_decommissioned), и год вызов молча возвращал
