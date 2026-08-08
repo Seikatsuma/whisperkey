@@ -404,6 +404,65 @@ def test_microphone_dropouts_are_visible():
           f"уведомления: {notes}")
 
 
+def test_paste_never_fires_on_unconfirmed_clipboard():
+    """Главное правило вставки: не подтвердился буфер — не жмём Cmd+V.
+
+    Именно эта гонка приводила к тому, что в документ приезжал СТАРЫЙ буфер
+    вместо продиктованного текста: программа клала текст, спала 0.1 с наугад
+    и жала вставку, не проверив, что система успела.
+    """
+    import types as _t
+    calls = []
+
+    class FakeProc:
+        returncode = 0
+        stdout = "ЧУЖОЙ СТАРЫЙ ТЕКСТ".encode("utf-8")
+
+    def fake_run(cmd, *a, **k):
+        calls.append(cmd[0] if isinstance(cmd, (list, tuple)) else str(cmd))
+        return FakeProc()
+
+    orig_run, orig_now, orig_type = M["subprocess"].run, M["_clipboard_now"], M["kb"].type
+    typed = []
+    try:
+        M["subprocess"].run = fake_run
+        # Буфер всегда отдаёт чужое — подтверждения не будет никогда.
+        M["_clipboard_now"] = lambda: "ЧУЖОЙ СТАРЫЙ ТЕКСТ".encode("utf-8")
+        M["kb"].type = lambda t: typed.append(t)
+        M["CLIPBOARD_WAIT_SEC"] = 0.05          # чтобы тест не ждал полторы секунды
+        NOTIFIED.clear()
+        M["direct_insert"]("мой продиктованный текст")
+    finally:
+        M["subprocess"].run, M["_clipboard_now"], M["kb"].type = orig_run, orig_now, orig_type
+
+    check("Буфер не подтверждён — Cmd+V не отправлен",
+          "/usr/bin/osascript" not in calls, f"вызовы: {calls}")
+    check("Текст не потерян — набран напрямую",
+          typed and "мой продиктованный текст" in typed[0], f"набрано: {typed}")
+
+
+def test_clipboard_restore_skipped_if_user_copied_own():
+    """Прежний буфер не возвращается, если человек успел скопировать своё.
+
+    Возврат через 0.5 с обгонял медленные приложения, и они забирали уже
+    восстановленный старый текст. Теперь пауза дольше, а перед возвратом
+    проверяется, что в буфере всё ещё наш текст.
+    """
+    import time as _time
+    restored = []
+    orig_run = M["subprocess"].run
+    orig_now = M["_clipboard_now"]
+    try:
+        M["subprocess"].run = lambda cmd, *a, **k: restored.append(k.get("input"))
+        M["_clipboard_now"] = lambda: "ЧЕЛОВЕК СКОПИРОВАЛ СВОЁ".encode("utf-8")
+        M["CLIPBOARD_RESTORE_SEC"] = 0.05
+        M["_restore_clipboard_async"]("старый буфер".encode("utf-8"), "наш текст".encode("utf-8"))
+        _time.sleep(0.3)
+    finally:
+        M["subprocess"].run, M["_clipboard_now"] = orig_run, orig_now
+    check("Чужую копию не затираем", not restored, f"записано: {restored}")
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

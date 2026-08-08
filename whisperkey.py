@@ -963,76 +963,118 @@ def apply_smart_sentence_ending(text: str) -> str:
         return text
     return text + '.'
 
-def _restore_clipboard_async(old_clipboard: bytes) -> None:
-    """Возврат буфера обмена в фоне — не блокирует завершение вставки."""
+CLIPBOARD_WAIT_SEC = 1.5      # сколько ждём, пока система реально обновит буфер
+CLIPBOARD_RESTORE_SEC = 2.5   # через сколько возвращаем прежний буфер
+
+def _clipboard_now() -> bytes:
+    try:
+        return subprocess.run(['pbpaste'], capture_output=True, timeout=2).stdout
+    except Exception:
+        return b''
+
+def _put_clipboard(data: bytes) -> bool:
+    """Кладёт в буфер и ЖДЁТ подтверждения, что там оказалось именно это.
+
+    Прежний код клал и спал 0.1 с наугад. Если система не успевала, следующий
+    Cmd+V вставлял ПРЕЖНЕЕ содержимое буфера — текст диктовки пропадал,
+    а на экран приезжало то, что человек копировал до этого.
+    """
+    try:
+        subprocess.run(['pbcopy'], input=data, check=True, timeout=5)
+    except Exception as e:
+        print(f"[insert] буфер не записался: {e}")
+        return False
+    deadline = time.time() + CLIPBOARD_WAIT_SEC
+    while time.time() < deadline:
+        if _clipboard_now() == data:
+            return True
+        time.sleep(0.02)
+    print("[insert] буфер не подтвердился за отведённое время")
+    return False
+
+def _restore_clipboard_async(old_clipboard: bytes, ours: bytes) -> None:
+    """Возвращает прежний буфер — но только когда это безопасно.
+
+    Две защиты, которых не было:
+      • пауза 2.5 с вместо 0.5 — медленные приложения (браузер, Slack, Notion)
+        успевают забрать вставку. Раньше буфер возвращался раньше, чем
+        приложение читало его, и вставлялся старый текст;
+      • возврат только если в буфере всё ещё НАШ текст. Если человек за это
+        время скопировал своё, его копия важнее — не трогаем.
+    """
     def run_restore():
         try:
-            time.sleep(0.5)
-            process = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
-            process.communicate(input=old_clipboard)
+            time.sleep(CLIPBOARD_RESTORE_SEC)
+            if _clipboard_now() != ours:
+                return            # буфер уже чей-то — не наше дело
+            subprocess.run(['pbcopy'], input=old_clipboard, timeout=5)
         except Exception as e:
             print(f"[insert] clipboard restore error: {e}")
 
     threading.Thread(target=run_restore, daemon=True).start()
 
 def direct_insert(text: str):
-    """CEO Method: Вставка через буфер с максимальной совместимостью."""
-    try:
-        # 1. Сохраняем старый буфер
-        old_clipboard = subprocess.run(['pbpaste'], capture_output=True).stdout
+    """Вставка через буфер обмена с подтверждением на каждом шаге.
 
-        # Подготавливаем текст заранее
+    Порядок важен: сначала убеждаемся, что в буфере лежит наш текст, и только
+    потом жмём Cmd+V. Если подтверждения нет — НЕ вставляем вовсе: вставка
+    в этот момент означала бы, что человеку в документ приедет его старый
+    буфер вместо продиктованного.
+    """
+    try:
+        old_clipboard = _clipboard_now()
         text_bytes = text.encode('utf-8')
 
         inserted = False
         for attempt in range(1, 4):
-            # Копируем текст в буфер
-            subprocess.run(['pbcopy'], input=text_bytes, check=True)
-            time.sleep(0.1) # Даем macOS время обновить буфер
-            
-            # Попытка А: AppleScript через key code 9 (v) - самый надежный метод на Mac
+            if not _put_clipboard(text_bytes):
+                time.sleep(0.15)
+                continue
+
+            # Проверка А: AppleScript — самый надёжный путь на macOS.
             script = 'tell application "System Events" to key code 9 using command down'
-            result = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True)
-            
+            result = subprocess.run(["/usr/bin/osascript", "-e", script],
+                                    capture_output=True, timeout=10)
             if result.returncode == 0:
                 inserted = True
                 break
-                
-            # Попытка Б: pynput native
+
+            # Проверка Б: pynput, если System Events недоступен.
             try:
-                kb.press(KeyboardKey.cmd)
-                kb.press('v')
-                kb.release('v')
-                kb.release(KeyboardKey.cmd)
+                kb.press(KeyboardKey.cmd); kb.press('v')
+                kb.release('v'); kb.release(KeyboardKey.cmd)
                 inserted = True
                 break
-            except:
+            except Exception:
                 pass
-            
             time.sleep(0.2)
 
         if not inserted:
-            # Попытка В: Прямой ввод текста (медленно, но работает без Cmd+V)
+            # Набор посимвольно: медленно, зато не зависит ни от буфера, ни от
+            # Cmd+V. Буфер при этом уже содержит текст — вставить можно и руками.
             try:
                 kb.type(text)
                 inserted = True
-                print("[insert] Fallback to typing")
-            except:
+                print("[insert] вставка набором текста")
+            except Exception:
                 pass
 
         if inserted:
             print(f"[insert success] '{text[:30]}...'")
             if RESTORE_CLIPBOARD:
-                _restore_clipboard_async(old_clipboard)
+                _restore_clipboard_async(old_clipboard, text_bytes)
         else:
-            # Буфер СОЗНАТЕЛЬНО не восстанавливаем: текст остаётся в нём, и его
-            # можно вставить руками. Раньше через 0.5 с буфер затирался прежним
-            # содержимым, и результат диктовки пропадал совсем.
+            # Буфер СОЗНАТЕЛЬНО не восстанавливаем: текст остаётся в нём и его
+            # можно вставить руками. Раньше буфер затирался прежним содержимым,
+            # и результат диктовки пропадал совсем.
             print("[insert fail] Текст остался в буфере обмена — нажми Cmd+V")
             notify("WhisperKey — вставка не удалась", "Текст в буфере, нажми Cmd+V")
 
     except Exception as e:
+        # Текст к этому моменту уже в буфере — сообщаем, а не молчим: молчание
+        # здесь означало бы потерянную диктовку без всякого следа.
         print(f"[insert error] {e}")
+        notify("WhisperKey — вставка не удалась", "Текст в буфере, нажми Cmd+V")
 
 artifacts_removed: list[str] = []   # что вырезали в последней обработке — для уведомления
 audio_dropouts: list[str] = []      # переполнения входного буфера за время записи
