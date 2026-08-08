@@ -26,7 +26,19 @@ import threading
 import time
 import wave
 import difflib
+import warnings
 from collections import deque
+
+# Системный питон macOS собран с LibreSSL, и urllib3 при каждом старте печатает
+# об этом предупреждение на три строки. На работу оно не влияет — запросы к Groq
+# идут нормально, — но выводится ПЕРЕД приветствием и выглядит как ошибка.
+# Глушим точечно: только это предупреждение, остальные видны как раньше.
+warnings.filterwarnings("ignore", message=r".*OpenSSL 1\.1\.1\+.*")
+try:
+    from urllib3.exceptions import NotOpenSSLWarning
+    warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
+except Exception:
+    pass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ─── Консоль Windows (платформенная точка 6) ──────────────────────────────────
