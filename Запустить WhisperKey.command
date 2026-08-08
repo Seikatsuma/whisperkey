@@ -99,7 +99,7 @@ if [ -z "${WHISPERKEY_NO_UPDATE:-}" ] && [ ! -f ".no-update" ] && [ -d ".git" ];
 elif [ ! -d ".git" ]; then
   echo "Папка не подключена к репозиторию — обновляться неоткуда."
   echo "Один раз выполни в Терминале, и дальше всё будет само:"
-  echo "   git clone git@github.com:Seikatsuma/whisperkey.git ~/Desktop/WhisperKey"
+  echo "   git clone https://github.com/Seikatsuma/whisperkey.git ~/Desktop/WhisperKey"
   echo "   и перенеси в новую папку файл .env со своим ключом."
 fi
 

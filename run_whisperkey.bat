@@ -22,7 +22,7 @@ if exist ".no-update" goto :skip_update
 if not exist ".git" (
     echo Папка не подключена к репозиторию — обновляться неоткуда.
     echo Один раз выполните, и дальше всё будет само:
-    echo    git clone git@github.com:Seikatsuma/whisperkey.git WhisperKey
+    echo    git clone https://github.com/Seikatsuma/whisperkey.git WhisperKey
     echo    и перенесите в новую папку файл .env со своим ключом.
     echo.
     goto :skip_update
