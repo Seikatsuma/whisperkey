@@ -25,7 +25,7 @@ WANTED_FUNCS = {
     "clean_noise", "_norm_word", "_drop_overlap", "_fmt_mmss", "_join_chunks",
     "_split_audio", "_find_degenerate_segments", "_text_from_response",
     "_words_in_range", "transfer_punctuation", "_transfer_norm",
-    "_change_tempo", "_restore_timeline", "transfer_terms",
+    "_change_tempo", "_restore_timeline", "transfer_terms", "transfer_endings",
 }
 WANTED_CONSTS = {
     "SAMPLE_RATE", "NARRATOR_LOOP_PATTERN", "BOH_TAIL_MARKERS", "ASR_CONTEXT_PROMPT",
@@ -34,7 +34,7 @@ WANTED_CONSTS = {
     "CHUNK_SIZE_SECONDS", "CHUNK_OVERLAP_SECONDS", "DENSITY_GATE_MIN_DURATION",
     "DENSITY_GATE_MIN_WORDS_PER_SEC", "HALLUCINATION_TRIGGERS",
     "_TRANSFER_PUNCT", "STYLE_PROMPT", "PUNCT_TRANSFER_MIN_SECONDS",
-    "PUNCT_TRANSFER_MAX_SECONDS", "ASR_TEMPO", "TERM_CANON",
+    "PUNCT_TRANSFER_MAX_SECONDS", "ASR_TEMPO", "TERM_CANON", "ENDING_MIN_STEM",
 }
 
 
@@ -577,6 +577,44 @@ def test_style_prompt_carries_vocabulary():
     plain = {"код", "дизайн", "агент", "промпт", "токен", "скилл"}
     bad = plain & set(M["TERM_CANON"])
     check("Т11 в списке нет обычных слов", not bad, f"найдено {bad}")
+
+
+def test_ending_transfer_cannot_swap_words():
+    """Слово может сменить окончание, но не может стать другим словом.
+
+    Whisper слышит команду верно и ошибается только формой: «сохрани» пишет
+    как «сохраняет». Это чинится по совпадению основы — и ровно это условие
+    не даёт подставить постороннее слово вместо услышанного.
+    """
+    te = M["transfer_endings"]
+
+    out, n = te("он сохраняет это и реализует", "он сохрани это и реализуй")
+    check("Т12 формы команд исправлены", out == "он сохрани это и реализуй", out)
+    check("Т12 счётчик верен", n == 2, str(n))
+
+    # Разные слова с одинаковым началом короче основы меняться не должны.
+    for base, donor in [("длинными фразами говорю", "тебе фразами говорю"),
+                        ("кот сел", "пёс сел"),
+                        ("работа идёт", "радость идёт")]:
+        out, n = te(base, donor)
+        check(f"Т12 подмена слова не прошла: {base[:20]!r}", out == base and n == 0,
+              f"{base!r} -> {out!r}")
+
+    # Длина текста не меняется никогда: замена одно слово на одно.
+    for base, donor in [("а б в г", "а б в г"), ("сохраняет", "сохрани"),
+                        ("", "сохрани"), ("сохраняет", "")]:
+        out, _ = te(base, donor)
+        check(f"Т12 длина сохранена: {base[:16]!r}",
+              len(out.split()) == len(base.split()), f"{base!r} -> {out!r}")
+
+
+def test_style_prompt_carries_imperatives():
+    """Второй проход несёт образцы команд — из-за них модель и выбирает форму."""
+    p = M["STYLE_PROMPT"]
+    found = [w for w in ("Сохрани", "Раздели", "Выстрой", "Реализуй", "Проверь") if w in p]
+    check("Т12 образцы команд в промпте", len(found) >= 4, f"нашлось {found}")
+    check("Т12 порог основы разумный", 3 <= M["ENDING_MIN_STEM"] <= 6,
+          str(M["ENDING_MIN_STEM"]))
 
 
 def test_markers_have_no_plain_words():

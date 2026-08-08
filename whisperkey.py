@@ -129,7 +129,15 @@ ASR_CONTEXT_PROMPT = ""
 STYLE_PROMPT = ("Так, ну, в общем, смотри. Значит, вот. И, соответственно, дальше. "
                 "Claude Code, Claude Design, WhisperKey, Notebook LM, GitHub, Telegram, "
                 "Groq, DeepGram, CEO, API, Яндекс Маркет, Ozon, Wildberries, iPad, "
-                "промпт, токены, агенты, скиллы.")
+                "промпт, токены, агенты, скиллы. "
+                # Команды в повелительном наклонении — самый частый класс ошибок:
+                # модель слышит звук верно, но выбирает форму из субтитровой привычки
+                # («сохрани» -> «сохраняет», «реализуй» -> «реализует»). Образцы
+                # императивов в промпте смещают выбор формы: 34 верных команды
+                # из 51 без них против 40 с ними (замер 08.08.26 на калибровке).
+                "Сохрани. Раздели. Выстрой. Реализуй. Проверь. Покажи. Открой. "
+                "Запусти. Найди. Убери. Оставь. Пришли. Собери. Напиши. Сделай. "
+                "Отметь. Скинь. Запиши. Продолжай. Добавляй.")
 
 # Белый список: ТОЛЬКО эти слова могут приехать из второго прохода в текст.
 # Промпт заставляет модель писать названия латиницей, но он же съедает слова
@@ -836,6 +844,45 @@ def transfer_terms(base_text: str, vocab_text: str) -> tuple[str, int]:
             canon = TERM_CANON.get(nb[j1 + k])
             if canon:
                 out[i1 + k] = canon
+                used += 1
+    return ' '.join(out), used
+
+ENDING_MIN_STEM = 4   # короче — слишком легко совпасть случайно
+
+def transfer_endings(base_text: str, donor_text: str) -> tuple[str, int]:
+    """Правит окончание слова по донорскому проходу. Слово другим стать не может.
+
+    Whisper слышит команду верно, но ставит форму по привычке субтитровых
+    корпусов: «сохрани» -> «сохраняет», «выстрой» -> «выстроить»,
+    «реализуй» -> «реализует». Основа при этом всегда совпадает — на неё
+    и опираемся: замена разрешена, только если начала слов совпали минимум
+    на ENDING_MIN_STEM букв и расходятся не более чем в трёх последних.
+    Поэтому «длинными» -> «тебе» невозможно по построению.
+
+    Замер 08.08.26 на калибровке (эталон — прочитанный вслух текст):
+    перенесено 12 окончаний, исправлено 9 слов, испорчено 1, длина не изменилась.
+    """
+    if not base_text or not donor_text:
+        return base_text, 0
+    a, b = base_text.split(), donor_text.split()
+    na = [_transfer_norm(x) for x in a]
+    nb = [_transfer_norm(x) for x in b]
+    out, used = list(a), 0
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, na, nb,
+                                                       autojunk=False).get_opcodes():
+        if tag != 'replace':
+            continue
+        for k in range(min(i2 - i1, j2 - j1)):
+            x, y = na[i1 + k], nb[j1 + k]
+            if x == y or len(x) < ENDING_MIN_STEM or len(y) < ENDING_MIN_STEM:
+                continue
+            common = 0
+            for c1, c2 in zip(x, y):
+                if c1 != c2:
+                    break
+                common += 1
+            if common >= ENDING_MIN_STEM and common >= min(len(x), len(y)) - 3:
+                out[i1 + k] = b[j1 + k]
                 used += 1
     return ' '.join(out), used
 
@@ -1688,6 +1735,10 @@ def process_audio(audio_snapshot: list, session_id: int):
                     full_raw_text, n_terms = transfer_terms(full_raw_text, styled)
                     if n_terms:
                         print(f"[terms] названий поправлено: {n_terms}")
+                    # Формы команд — оттуда же. Слово может сменить только окончание.
+                    full_raw_text, n_end = transfer_endings(full_raw_text, styled)
+                    if n_end:
+                        print(f"[forms] окончаний поправлено: {n_end}")
             except Exception as e:
                 print(f"[punct] второй проход не дошёл ({type(e).__name__}) — "
                       f"текст остаётся без добавленных знаков")
