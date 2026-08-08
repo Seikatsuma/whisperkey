@@ -315,6 +315,40 @@ else:
 
 CLOUD_ENABLED = USE_CLOUD
 
+# ─── Deepgram — первая ступень каскада ────────────────────────────────────────
+# Замер 08.08.26 на калибровке Егора. Эталон настоящий: текст, который он читал
+# вслух с листа, — не вывод другой машины, поэтому согласованные ошибки двух
+# движков не могут выдать себя за правильные слова. 808 слов эталона:
+#     боевой конвейер на whisper        78.6%   173 ошибки
+#     Deepgram nova-2 + таблица имён    86.5%   109 ошибок
+# Он же и быстрее: 369 секунд аудио — 5.5 с против 8.9 с у Groq, на пятиминутной
+# записи 1.6 с против 5.6 с. То есть вторая ступень не только не нужна для
+# качества — она и по времени проигрывает.
+#
+# Модель именно nova-2, хотя nova-3 новее: третья версия обучена прежде всего
+# под английский, русский идёт у неё через multilingual и стоит пяти пунктов
+# (80.9% против 86.1% на том же материале). Проверено обеими.
+#
+# smart_format выключен намеренно: он переписывает «двадцать пять» в «25»
+# и «пятое августа» в «05.08», а Егор просил дословность — «не форматируй».
+# На замере он стоит 2.8 пункта (83.3% против 86.1%). filler_words наоборот
+# включён: «ну», «вот», «значит» — часть его речи, а не мусор.
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
+DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
+DEEPGRAM_MODEL = "nova-2"
+DEEPGRAM_PARAMS = {
+    "model": DEEPGRAM_MODEL,
+    "language": "ru",
+    "punctuate": "true",
+    "smart_format": "false",
+    "filler_words": "true",
+    "numerals": "false",
+}
+DEEPGRAM_ENABLED = bool(DEEPGRAM_API_KEY)
+DEEPGRAM_TIMEOUT = 20.0
+DEEPGRAM_RETRIES = 2
+DEEPGRAM_BLOCK_SECONDS = 900.0
+
 # Создаем глобальную сессию для Keep-Alive
 http_session = requests.Session()
 
@@ -368,8 +402,13 @@ cloud_status = {
     "last_check_time": 0,
     "check_in_progress": False,
     "consecutive_success": 0,
-    "last_degenerate": [],
-    "last_api_text": "",       # собственный текст модели до нашей сборки     # окна, где модель сорвалась (гейт плотности)
+    "last_degenerate": [],     # окна, где модель сорвалась (гейт плотности)
+    "last_api_text": "",       # собственный текст модели до нашей сборки
+}
+deepgram_status = {
+    "blocked_until": 0.0,
+    "last_reason": "",
+    "last_seconds": 0.0,
 }
 kb = KeyboardController()
 _instance_lock_handle = None
@@ -1547,6 +1586,84 @@ def _throttle():
             time.sleep(MIN_REQUEST_INTERVAL - delta)
         _last_request_ts[0] = time.time()
 
+def transcribe_deepgram(audio_data) -> str | None:
+    """Первая ступень каскада. Возвращает текст либо None — тогда работает Groq.
+
+    Возврат None здесь никогда не означает потерю диктовки: вызывающий код
+    молча уходит на whisper, и человек видит разницу только в строке [engine].
+
+    Отказы разделены намеренно. Кончившиеся деньги, отозванный ключ и запрет
+    по правам (401, 402, 403) лечиться повтором не могут — движок отключается
+    на DEEPGRAM_BLOCK_SECONDS, чтобы каждая следующая диктовка не платила
+    секундой ожидания за заведомо мёртвый запрос. Перегрузка и сбои сервера
+    (429, 5xx) — наоборот, проходят сами, и здесь уместен короткий повтор.
+    """
+    if not DEEPGRAM_ENABLED:
+        return None
+    if time.time() < deepgram_status["blocked_until"]:
+        return None
+
+    wav_data = create_audio_wav(audio_data)
+    if not wav_data:
+        return None
+
+    headers = {
+        "Authorization": f"Token {DEEPGRAM_API_KEY}",
+        "Content-Type": "audio/wav",
+    }
+
+    t0 = time.time()
+    for attempt in range(DEEPGRAM_RETRIES):
+        try:
+            response = http_session.post(
+                DEEPGRAM_URL, params=DEEPGRAM_PARAMS, headers=headers,
+                data=wav_data, timeout=DEEPGRAM_TIMEOUT
+            )
+
+            if response.status_code == 200:
+                try:
+                    alt = response.json()["results"]["channels"][0]["alternatives"][0]
+                except (KeyError, IndexError, ValueError) as e:
+                    print(f"[deepgram] ответ не разобран ({type(e).__name__}) — ухожу на Groq")
+                    return None
+                text = (alt.get("transcript") or "").strip()
+                deepgram_status["last_seconds"] = time.time() - t0
+                if not text:
+                    print("[deepgram] пусто — ухожу на Groq")
+                    return None
+                return text
+
+            if response.status_code in (401, 402, 403):
+                reason = {401: "ключ не принят", 402: "кончились деньги на счёте",
+                          403: "доступ запрещён"}[response.status_code]
+                deepgram_status["blocked_until"] = time.time() + DEEPGRAM_BLOCK_SECONDS
+                deepgram_status["last_reason"] = reason
+                mins = int(DEEPGRAM_BLOCK_SECONDS / 60)
+                print(f"[deepgram] {reason} (HTTP {response.status_code}). "
+                      f"Перехожу на Groq, повторю попытку через {mins} мин.")
+                notify("WhisperKey — сменил движок",
+                       f"Deepgram: {reason}. Работаю на Groq.")
+                return None
+
+            if response.status_code in (429, 500, 502, 503, 504) and attempt + 1 < DEEPGRAM_RETRIES:
+                time.sleep(0.5)
+                continue
+
+            print(f"[deepgram] статус {response.status_code} — ухожу на Groq")
+            return None
+
+        except requests.Timeout:
+            print(f"[deepgram] не ответил за {DEEPGRAM_TIMEOUT:.0f}с — ухожу на Groq")
+            return None
+        except Exception as e:
+            if attempt + 1 < DEEPGRAM_RETRIES:
+                time.sleep(0.5)
+                continue
+            print(f"[deepgram] {type(e).__name__} — ухожу на Groq")
+            return None
+
+    return None
+
 def transcribe_cloud_turbo(audio_data, allow_retry: bool = True, use_prompt: bool = True,
                            return_words: bool = False, prompt_override: str = ""):
     """Расшифровка через Groq whisper-large-v3.
@@ -1875,6 +1992,121 @@ def _join_chunks(parts: list, quality: list, offsets: list,
 
 # ─── Транскрибация ────────────────────────────────────────────────────────────
 
+def _recognize_with_whisper(audio: np.ndarray, dur: float) -> tuple[str, str, list, list]:
+    """Вторая и третья ступени каскада: Groq, а при его отказе — локальная модель.
+
+    Здесь живёт всё, что построено вокруг whisper: дробление длинных записей,
+    гейт плотности, восстановление сорванных окон из words[], стилевой проход
+    за знаками препинания и переносы названий и форм с него.
+
+    Deepgram ничего этого не требует — он отдаёт готовый текст со знаками, —
+    поэтому путь вынесен отдельно и при работающей первой ступени не трогается
+    вовсе: ни одного лишнего запроса, ни одной лишней секунды.
+
+    Возвращает (текст, текст до переносов, потерянные куски, качество кусков).
+    """
+    # Дробление длинной записи включается только за порогом в 15 минут:
+    # замер на записи 29:45 дал одним куском 3810 слов и полноту 79.8%
+    # против 3559 слов и 72.3% у нарезки по 60 с. Groq дробит файл у себя
+    # внутри лучше, чем мы снаружи.
+    audio_chunks, chunk_offsets = _split_audio(audio, dur)
+    n_chunks = len(audio_chunks)
+
+    # Проход за знаками препинания стартует ОДНОВРЕМЕННО с основным, поэтому
+    # ожидания не добавляет: оба запроса летят к Groq параллельно.
+    style_pool = style_future = None
+    if (PUNCT_TRANSFER_MIN_SECONDS <= dur <= PUNCT_TRANSFER_MAX_SECONDS
+            and CLOUD_ENABLED and not cloud_status.get("is_blocked")):
+        style_pool = ThreadPoolExecutor(max_workers=1)
+        style_future = style_pool.submit(
+            transcribe_cloud_turbo, audio, allow_retry=False,
+            prompt_override=STYLE_PROMPT)
+
+    ordered_parts: list[str | None] = [None] * n_chunks
+    chunk_quality: list[str] = ['lost'] * n_chunks
+    chunk_words: list[list] = [[] for _ in range(n_chunks)]
+
+    parallel_ok = (
+        PARALLEL_CLOUD_CHUNKS
+        and n_chunks > 1
+        and CLOUD_ENABLED
+        and not cloud_status.get("is_blocked")
+    )
+
+    if parallel_ok:
+        print(f"[fast] Параллельно: {n_chunks} сегментов, потоков {MAX_CLOUD_WORKERS}")
+        with ThreadPoolExecutor(max_workers=MAX_CLOUD_WORKERS) as pool:
+            # Словарь future -> idx, а не список: as_completed отдаёт futures
+            # в произвольном порядке, а у упавшего результата индекса нет вовсе.
+            futures = {
+                pool.submit(_transcribe_one_chunk, chunk, idx, n_chunks): idx
+                for idx, chunk in enumerate(audio_chunks)
+            }
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                # Исключение в ОДНОМ куске раньше убивало всю запись целиком:
+                # fut.result() пробрасывал его наружу, общий except печатал строку
+                # в терминал, и пользователь не получал ни текста, ни уведомления.
+                try:
+                    idx, chunk_text, quality, words = fut.result()
+                except Exception as e:
+                    print(f"[error] Сегмент {idx + 1} упал: {type(e).__name__} {e}")
+                    chunk_text, quality, words = None, 'lost', []
+                ordered_parts[idx] = chunk_text
+                chunk_quality[idx] = quality
+                chunk_words[idx] = words
+    else:
+        for idx, chunk in enumerate(audio_chunks):
+            try:
+                _, chunk_text, quality, words = _transcribe_one_chunk(chunk, idx, n_chunks)
+            except Exception as e:
+                print(f"[error] Сегмент {idx + 1} упал: {type(e).__name__} {e}")
+                chunk_text, quality, words = None, 'lost', []
+            ordered_parts[idx] = chunk_text
+            chunk_quality[idx] = quality
+            chunk_words[idx] = words
+
+    # Склейка: перекрытие снимается по таймкодам слов, текстовое сравнение —
+    # только запасной путь. Нечёткого сравнения нет намеренно.
+    text, lost_marks = _join_chunks(
+        ordered_parts, chunk_quality, chunk_offsets, chunk_words)
+
+    if not text:
+        if style_pool is not None:
+            style_pool.shutdown(wait=False)
+        return "", "", lost_marks, chunk_quality
+
+    assembled = text                       # до переносов знаков/названий/форм
+    print(f"[raw whisper] '{text}'")
+
+    # Знаки препинания из второго прохода. Он уже почти наверняка завершён —
+    # шёл параллельно. Ждём не дольше 8 секунд: текст важнее оформления,
+    # и молчаливо задерживать вставку из-за знаков нельзя.
+    if style_future is not None:
+        try:
+            styled = style_future.result(timeout=8.0)
+            if styled:
+                before = text
+                text = transfer_punctuation(text, styled)
+                if text != before:
+                    print(f"[punct] знаки перенесены со второго прохода")
+                # Названия продуктов — из того же прохода, отдельного запроса
+                # он не требует. Слова берутся только из белого списка.
+                text, n_terms = transfer_terms(text, styled)
+                if n_terms:
+                    print(f"[terms] названий поправлено: {n_terms}")
+                # Формы команд — оттуда же. Слово может сменить только окончание.
+                text, n_end = transfer_endings(text, styled)
+                if n_end:
+                    print(f"[forms] окончаний поправлено: {n_end}")
+        except Exception as e:
+            print(f"[punct] второй проход не дошёл ({type(e).__name__}) — "
+                  f"текст остаётся без добавленных знаков")
+        finally:
+            style_pool.shutdown(wait=False)
+
+    return text, assembled, lost_marks, chunk_quality
+
 def process_audio(audio_snapshot: list, session_id: int):
     global processing, last_text_context, cloud_status, session_phase
     try:
@@ -1898,110 +2130,35 @@ def process_audio(audio_snapshot: list, session_id: int):
         print(f"[rec] {dur:.1f}s → распознаю...")
         t_start = time.time()
 
-        # Дробление длинной записи включается только за порогом в 15 минут:
-        # замер на записи 29:45 дал одним куском 3810 слов и полноту 79.8%
-        # против 3559 слов и 72.3% у нарезки по 60 с. Groq дробит файл у себя
-        # внутри лучше, чем мы снаружи.
-        audio_chunks, chunk_offsets = _split_audio(audio, dur)
-
-        n_chunks = len(audio_chunks)
-
-        # Проход за знаками препинания стартует ОДНОВРЕМЕННО с основным, поэтому
-        # ожидания не добавляет: оба запроса летят к Groq параллельно.
-        style_pool = style_future = None
-        if (PUNCT_TRANSFER_MIN_SECONDS <= dur <= PUNCT_TRANSFER_MAX_SECONDS
-                and CLOUD_ENABLED and not cloud_status.get("is_blocked")):
-            style_pool = ThreadPoolExecutor(max_workers=1)
-            style_future = style_pool.submit(
-                transcribe_cloud_turbo, audio, allow_retry=False,
-                prompt_override=STYLE_PROMPT)
+        # ─── Каскад из трёх ступеней ─────────────────────────────────────────
+        # 1. Deepgram — точнее на 8 пунктов и вдвое быстрее (замер в шапке файла);
+        # 2. Groq whisper со всей нашей обвязкой — когда Deepgram молчит,
+        #    отключён, исчерпан или не отвечает;
+        # 3. локальная модель внутри второй ступени — когда интернета нет вовсе.
+        # Ступени идут ПО ОЧЕРЕДИ, а не одновременно: первая справляется быстрее,
+        # чем вторая успела бы стартовать, и платить за оба движка сразу незачем.
         t_asr_start = time.time()
-        ordered_parts: list[str | None] = [None] * n_chunks
-        chunk_quality: list[str] = ['lost'] * n_chunks
-        chunk_words: list[list] = [[] for _ in range(n_chunks)]
-
-        parallel_ok = (
-            PARALLEL_CLOUD_CHUNKS
-            and n_chunks > 1
-            and CLOUD_ENABLED
-            and not cloud_status.get("is_blocked")
-        )
-
-        if parallel_ok:
-            print(f"[fast] Параллельно: {n_chunks} сегментов, потоков {MAX_CLOUD_WORKERS}")
-            with ThreadPoolExecutor(max_workers=MAX_CLOUD_WORKERS) as pool:
-                # Словарь future -> idx, а не список: as_completed отдаёт futures
-                # в произвольном порядке, а у упавшего результата индекса нет вовсе.
-                futures = {
-                    pool.submit(_transcribe_one_chunk, chunk, idx, n_chunks): idx
-                    for idx, chunk in enumerate(audio_chunks)
-                }
-                for fut in as_completed(futures):
-                    idx = futures[fut]
-                    # Исключение в ОДНОМ куске раньше убивало всю запись целиком:
-                    # fut.result() пробрасывал его наружу, общий except печатал строку
-                    # в терминал, и пользователь не получал ни текста, ни уведомления.
-                    try:
-                        idx, chunk_text, quality, words = fut.result()
-                    except Exception as e:
-                        print(f"[error] Сегмент {idx + 1} упал: {type(e).__name__} {e}")
-                        chunk_text, quality, words = None, 'lost', []
-                    ordered_parts[idx] = chunk_text
-                    chunk_quality[idx] = quality
-                    chunk_words[idx] = words
+        full_raw_text = transcribe_deepgram(audio)
+        if full_raw_text:
+            engine = "deepgram"
+            assembled_text = full_raw_text
+            lost_marks: list = []
+            chunk_quality: list[str] = ['deepgram']
+            print(f"[engine] Deepgram {DEEPGRAM_MODEL}, "
+                  f"{deepgram_status['last_seconds']:.1f}с")
+            print(f"[raw deepgram] '{full_raw_text}'")
         else:
-            for idx, chunk in enumerate(audio_chunks):
-                try:
-                    _, chunk_text, quality, words = _transcribe_one_chunk(chunk, idx, n_chunks)
-                except Exception as e:
-                    print(f"[error] Сегмент {idx + 1} упал: {type(e).__name__} {e}")
-                    chunk_text, quality, words = None, 'lost', []
-                ordered_parts[idx] = chunk_text
-                chunk_quality[idx] = quality
-                chunk_words[idx] = words
+            engine = "whisper"
+            print("[engine] Groq whisper (запасной путь)")
+            full_raw_text, assembled_text, lost_marks, chunk_quality = \
+                _recognize_with_whisper(audio, dur)
 
         t_asr_done = time.time()
 
-        # Склейка: перекрытие снимается по таймкодам слов, текстовое сравнение —
-        # только запасной путь. Нечёткого сравнения нет намеренно.
-        full_raw_text, lost_marks = _join_chunks(
-            ordered_parts, chunk_quality, chunk_offsets, chunk_words)
-
         if not full_raw_text:
-            if style_pool is not None:
-                style_pool.shutdown(wait=False)
             print("[skip] Пустой результат")
             notify("WhisperKey", "Речь не распознана")
             return
-
-        assembled_text = full_raw_text          # до переносов знаков/названий/форм
-        print(f"[raw whisper] '{full_raw_text}'")
-
-        # Знаки препинания из второго прохода. Он уже почти наверняка завершён —
-        # шёл параллельно. Ждём не дольше 8 секунд: текст важнее оформления,
-        # и молчаливо задерживать вставку из-за знаков нельзя.
-        if style_future is not None:
-            try:
-                styled = style_future.result(timeout=8.0)
-                if styled:
-                    before = full_raw_text
-                    full_raw_text = transfer_punctuation(full_raw_text, styled)
-                    if full_raw_text != before:
-                        print(f"[punct] знаки перенесены со второго прохода")
-                    # Названия продуктов — из того же прохода, отдельного запроса
-                    # он не требует. Слова берутся только из белого списка.
-                    full_raw_text, n_terms = transfer_terms(full_raw_text, styled)
-                    if n_terms:
-                        print(f"[terms] названий поправлено: {n_terms}")
-                    # Формы команд — оттуда же. Слово может сменить только окончание.
-                    full_raw_text, n_end = transfer_endings(full_raw_text, styled)
-                    if n_end:
-                        print(f"[forms] окончаний поправлено: {n_end}")
-            except Exception as e:
-                print(f"[punct] второй проход не дошёл ({type(e).__name__}) — "
-                      f"текст остаётся без добавленных знаков")
-            finally:
-                style_pool.shutdown(wait=False)
 
         # Таблица названий работает ВСЕГДА, даже когда второго прохода не было:
         # короткая диктовка, отказ сети, исчерпанная квота. Сети не требует.
@@ -2334,19 +2491,31 @@ def main():
     except Exception:
         pass
 
-    print(f"Модель: {CLOUD_WHISPER_MODEL} | промпт: "
-          f"{'выключен' if not ASR_CONTEXT_PROMPT else 'включён'}")
+    if DEEPGRAM_ENABLED:
+        print(f"Распознавание: 1) Deepgram {DEEPGRAM_MODEL} → 2) {CLOUD_WHISPER_MODEL} "
+              f"→ 3) локальная модель")
+    else:
+        # Молчаливая работа на второй ступени — худший исход: качество ниже на
+        # восемь пунктов, а человек об этом не знает и винит распознавание.
+        print(f"Распознавание: {CLOUD_WHISPER_MODEL} (Deepgram не подключён — "
+              f"он точнее на 8 пунктов и вдвое быстрее)")
+        print("   Чтобы включить: допиши в файл .env строку DEEPGRAM_API_KEY=<ключ>")
+    print(f"   промпт: {'выключен' if not ASR_CONTEXT_PROMPT else 'включён'}")
     try:
         print("Загрузка локальной модели (запасной вариант, если облако недоступно)...")
         model = WhisperModel(MODEL_PATH, device="cpu", compute_type="int8", cpu_threads=2)
         print("Разогрев локальной модели...")
         model.transcribe(np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32), language="ru", beam_size=1)
 
-        if USE_CLOUD:
+        if USE_CLOUD or DEEPGRAM_ENABLED:
             print("Разогрев облачного соединения...")
             def warm_network():
-                try: http_session.head("https://api.groq.com", timeout=2.0)
-                except: pass
+                for host in (("https://api.deepgram.com" if DEEPGRAM_ENABLED else None),
+                             ("https://api.groq.com" if USE_CLOUD else None)):
+                    if not host:
+                        continue
+                    try: http_session.head(host, timeout=2.0)
+                    except Exception: pass
             threading.Thread(target=warm_network, daemon=True).start()
 
         if PREROLL_ENABLED:
