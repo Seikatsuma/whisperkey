@@ -233,7 +233,7 @@ HALLUCINATION_TRIGGERS = [
 # экстраполяцией. Сбор идёт EVAL_COLLECT_DAYS дней от первого запуска, потом
 # выключается сам и при старте показывает баннер.
 EVAL_SAMPLES_ENABLED = True
-EVAL_COLLECT_DAYS = 7
+EVAL_COLLECT_DAYS = 3   # 08.08.26: по просьбе Егора — корпус набирается быстрее
 EVAL_SAMPLES_ROOT = os.path.expanduser("~/Desktop/WhisperKey-Eval-Samples")
 EVAL_STATE_FILE = os.path.join(EVAL_SAMPLES_ROOT, "state.json")
 EVAL_MIN_DURATION = 1.0          # короче — не показательно
