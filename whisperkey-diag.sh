@@ -2,22 +2,33 @@
 # Диагностика установки WhisperKey: что где лежит и куда смотрит ярлык.
 # Запуск: curl -fsSL https://raw.githubusercontent.com/Seikatsuma/whisperkey/main/whisperkey-diag.sh | bash
 echo "═══ ЧТО ГДЕ ЛЕЖИТ ═══"
-FOUND="$HOME/Desktop/WhisperKey"
+# Пути с пробелами и эмодзи в названиях — норма (у Егора «Проэкты 📈»),
+# поэтому список собирается через файл, а не через подстановку в for.
+LIST=$(mktemp)
+echo "$HOME/Desktop/WhisperKey" >> "$LIST"
 for r in "$HOME/Desktop" "$HOME/Documents" "$HOME/Downloads" "$HOME"; do
   [ -d "$r" ] || continue
-  while IFS= read -r f; do
-    [ -n "$f" ] && FOUND="$FOUND
-$(dirname "$f")"
-  done <<< "$(find "$r" -maxdepth 6 -name whisperkey.py 2>/dev/null)"
+  find "$r" -maxdepth 6 -name whisperkey.py 2>/dev/null | while IFS= read -r f; do
+    dirname "$f" >> "$LIST"
+  done
 done
-for d in $(printf '%s\n' "$FOUND" | awk '!seen[$0]++'); do
-  if [ -d "$d" ]; then
-    printf '%-34s ' "$(basename "$d")"
-    [ -d "$d/.git" ] && printf 'подключена к GitHub, версия %s' "$(git -C "$d" rev-parse --short HEAD 2>/dev/null)" || printf 'НЕ подключена (обновляться не будет)'
-    [ -f "$d/.env" ] && printf ' | ключ есть' || printf ' | КЛЮЧА НЕТ'
-    echo
+sort -u "$LIST" -o "$LIST"
+while IFS= read -r d; do
+  [ -d "$d" ] || continue
+  printf '%s\n' "$d"
+  printf '    '
+  if [ -d "$d/.git" ] && git -C "$d" rev-parse --short HEAD >/dev/null 2>&1; then
+    printf 'подключена к GitHub, версия %s' "$(git -C "$d" rev-parse --short HEAD 2>/dev/null)"
+  elif [ -d "$d/.git" ]; then
+    printf 'клон НЕПОЛНЫЙ — обновляться не будет'
+  else
+    printf 'НЕ подключена — обновляться не будет'
   fi
-done
+  [ -f "$d/.env" ] && printf ' | ключ есть' || printf ' | КЛЮЧА НЕТ'
+  echo
+done < "$LIST"
+rm -f "$LIST"
+
 echo
 echo "═══ ЯРЛЫК НА РАБОЧЕМ СТОЛЕ ═══"
 L="$HOME/Desktop/Запустить WhisperKey.command"
