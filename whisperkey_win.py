@@ -368,7 +368,8 @@ cloud_status = {
     "last_check_time": 0,
     "check_in_progress": False,
     "consecutive_success": 0,
-    "last_degenerate": [],     # окна, где модель сорвалась (гейт плотности)
+    "last_degenerate": [],
+    "last_api_text": "",       # собственный текст модели до нашей сборки     # окна, где модель сорвалась (гейт плотности)
 }
 kb = KeyboardController()
 _instance_lock_handle = None
@@ -1613,6 +1614,10 @@ def transcribe_cloud_turbo(audio_data, allow_retry: bool = True, use_prompt: boo
             if response.status_code == 200:
                 result = response.json()
                 _restore_timeline(result)
+                # Текст самой модели — до нашей сборки. Нужен, чтобы при пропаже
+                # куска было видно, кто его потерял: модель или конвейер.
+                if not prompt:
+                    cloud_status["last_api_text"] = (result.get('text') or '').strip()
                 text, degenerate = _text_from_response(result)
                 cloud_status["last_degenerate"] = degenerate
                 if degenerate:
@@ -1969,6 +1974,7 @@ def process_audio(audio_snapshot: list, session_id: int):
             notify("WhisperKey", "Речь не распознана")
             return
 
+        assembled_text = full_raw_text          # до переносов знаков/названий/форм
         print(f"[raw whisper] '{full_raw_text}'")
 
         # Знаки препинания из второго прохода. Он уже почти наверняка завершён —

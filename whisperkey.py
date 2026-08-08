@@ -313,6 +313,7 @@ cloud_status = {
     "check_in_progress": False,
     "consecutive_success": 0,  # CEO Fix: Счетчик стабильных запросов
     "last_degenerate": [],     # окна, где модель сорвалась (гейт плотности)
+    "last_api_text": "",       # собственный текст модели до нашей сборки
 }
 kb = KeyboardController()
 _instance_lock_handle = None
@@ -517,7 +518,8 @@ def schedule_eval_sample_collect(audio: np.ndarray, dur: float, session_id: int)
     ).start()
 
 def finalize_eval_sample_meta(
-    session_id: int, dur: float, raw_text: str, final_text: str
+    session_id: int, dur: float, raw_text: str, final_text: str,
+    stages: dict | None = None
 ) -> None:
     with _eval_lock:
         wav_path = _eval_pending_paths.pop(session_id, None)
@@ -530,8 +532,14 @@ def finalize_eval_sample_meta(
                 {
                     "duration_sec": round(dur, 2),
                     "bucket": _eval_bucket_for_duration(dur),
+                    # Текст на каждом шаге — иначе при пропаже предложения нельзя
+                    # понять, потеряла его модель, сборка или правки.
+                    "api_text": (stages or {}).get("api_text", ""),
+                    "assembled": (stages or {}).get("assembled", ""),
                     "raw_whisper": raw_text or "",
                     "final_text": final_text or "",
+                    "degenerate": (stages or {}).get("degenerate", []),
+                    "dropouts": (stages or {}).get("dropouts", 0),
                     "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 },
                 f,
@@ -1472,6 +1480,10 @@ def transcribe_cloud_turbo(audio_data, allow_retry: bool = True, use_prompt: boo
             if response.status_code == 200:
                 result = response.json()
                 _restore_timeline(result)
+                # Текст самой модели — до нашей сборки. Нужен, чтобы при пропаже
+                # куска было видно, кто его потерял: модель или конвейер.
+                if not prompt:
+                    cloud_status["last_api_text"] = (result.get('text') or '').strip()
                 text, degenerate = _text_from_response(result)
                 cloud_status["last_degenerate"] = degenerate
                 if degenerate:
@@ -1816,6 +1828,7 @@ def process_audio(audio_snapshot: list, session_id: int):
             notify("WhisperKey", "Речь не распознана")
             return
 
+        assembled_text = full_raw_text          # до переносов знаков/названий/форм
         print(f"[raw whisper] '{full_raw_text}'")
 
         # Знаки препинания из второго прохода. Он уже почти наверняка завершён —
@@ -1874,7 +1887,14 @@ def process_audio(audio_snapshot: list, session_id: int):
 
             last_text_context = text[-40:]
             direct_insert(text + " ")
-            finalize_eval_sample_meta(session_id, dur, full_raw_text, text)
+            finalize_eval_sample_meta(
+                session_id, dur, full_raw_text, text,
+                stages={
+                    "api_text": cloud_status.get("last_api_text", ""),
+                    "assembled": assembled_text,
+                    "degenerate": cloud_status.get("last_degenerate", []),
+                    "dropouts": len(audio_dropouts),
+                })
 
             # Любая деградация обязана быть видимой. Раньше уход на локальную
             # модель и выпавший кусок одинаково рапортовались как «Текст готов».
