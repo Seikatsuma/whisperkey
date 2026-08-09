@@ -3,10 +3,25 @@
 
 Запуск:  python3 tests/test_verbatim.py
 
-Тесты работают с НАСТОЯЩИМИ функциями из whisperkey.py — они вытаскиваются
-через ast и выполняются в изолированном пространстве имён. Импортировать модуль
-целиком нельзя: он на старте открывает микрофон и грузит модель распознавания.
-Так тесты гоняются где угодно, включая машину без звуковой карты.
+09.08.26 — перенос каскада (transcribe_deepgram, _recognize_with_whisper и всё,
+от чего они зависят: гейт плотности, склейка кусков, перенос знаков/терминов/форм,
+таблица названий, водяные знаки) в общий пакет ~/speech-engine/ (профиль dictation).
+Тест адаптирован, а не переписан: те же 31 функция test_*, те же проверки, тот же
+корпус CORPUS/ANCHORS/WATERMARKS. Изменился только СПОСОБ добычи логики —
+
+  - что осталось в whisperkey.py (smart_grammar_fix, apply_smart_sentence_ending,
+    clean_noise и десяток констант формата/буфера) — по-прежнему вытаскивается
+    через ast из whisperkey.py и выполняется в изолированном пространстве имён
+    (модуль целиком не импортируется: на старте открывает микрофон и грузит модель);
+  - что переехало в speech_engine — импортируется НАПРАВУЮ, обычным import: пакет
+    не трогает ни микрофон, ни модель при импорте, изолировать нечего. Часть
+    перенесённых функций поменяла сигнатуру (принимают профиль/параметры явно
+    вместо чтения модульных констант WhisperKey) — обёрнуты лямбдами на DICTATION
+    ниже, чтобы вызовы в теле тестов (M["_split_audio"](audio, dur) и т.п.)
+    остались прежними.
+
+Числа и пороги не изменились — они просто теперь читаются из
+speech_engine.DICTATION, а не из глобальных констант этого файла.
 """
 import ast
 import difflib
@@ -18,30 +33,34 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "..", "whisperkey.py")
+SPEECH_ENGINE_HOME = os.path.expanduser("~/speech-engine")
+if SPEECH_ENGINE_HOME not in sys.path:
+    sys.path.insert(0, SPEECH_ENGINE_HOME)
+import speech_engine
+from speech_engine import chunking as se_chunking
+from speech_engine import density_gate as se_density_gate
+from speech_engine import audio as se_audio
+from speech_engine import terms as se_terms
+from speech_engine import transfer as se_transfer
 
-# Что берём из модуля: чистая логика без сети, микрофона и модели.
+DICTATION = speech_engine.DICTATION
+
+# Что берём АСТ-экстракцией из whisperkey.py: то, что там реально осталось.
 WANTED_FUNCS = {
-    "smart_grammar_fix", "apply_smart_sentence_ending", "strip_asr_artifacts",
-    "clean_noise", "_norm_word", "_drop_overlap", "_fmt_mmss", "_join_chunks",
-    "_split_audio", "_find_degenerate_segments", "_text_from_response",
-    "_words_in_range", "transfer_punctuation", "_transfer_norm",
-    "_change_tempo", "_restore_timeline", "transfer_terms", "transfer_endings", "fix_known_terms",
+    "smart_grammar_fix", "apply_smart_sentence_ending", "clean_noise",
 }
 WANTED_CONSTS = {
-    "SAMPLE_RATE", "NARRATOR_LOOP_PATTERN", "BOH_TAIL_MARKERS", "ASR_CONTEXT_PROMPT",
-    "_INCOMPLETE_ENDING_RE", "CAPITALIZE_FIRST", "FORCE_TRAILING_DOT", "NORMALIZE_BRAND_NAMES",
-    "BRAND_NAMES", "artifacts_removed", "CHUNK_THRESHOLD_SECONDS",
-    "CHUNK_SIZE_SECONDS", "CHUNK_OVERLAP_SECONDS", "DENSITY_GATE_MIN_DURATION",
-    "DENSITY_GATE_MIN_WORDS_PER_SEC", "HALLUCINATION_TRIGGERS",
-    "_TRANSFER_PUNCT", "STYLE_PROMPT", "PUNCT_TRANSFER_MIN_SECONDS",
-    "PUNCT_TRANSFER_MAX_SECONDS", "ASR_TEMPO", "TERM_CANON", "ENDING_MIN_STEM", "TERM_FIX", "_TERM_FIX_RX",
+    "SAMPLE_RATE", "_INCOMPLETE_ENDING_RE", "CAPITALIZE_FIRST", "FORCE_TRAILING_DOT",
+    "artifacts_removed",
 }
 
 
 def load_module_parts():
     source = open(SRC, encoding="utf-8").read()
     tree = ast.parse(source)
-    ns = {"re": re, "np": np, "difflib": difflib, "print": lambda *a, **k: None}
+    # speech_engine нужен в ns: extracted clean_noise зовёт speech_engine.watermarks.*
+    ns = {"re": re, "np": np, "difflib": difflib, "print": lambda *a, **k: None,
+          "speech_engine": speech_engine}
     keep = []
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in WANTED_FUNCS:
@@ -56,6 +75,46 @@ def load_module_parts():
                 keep.append(ast.Assign(targets=[node.target], value=node.value,
                                        lineno=node.lineno, col_offset=node.col_offset))
     exec(compile(ast.Module(body=keep, type_ignores=[]), SRC, "exec"), ns)
+
+    # Переехавшее в speech_engine — прямой импорт, подставлено под старые имена
+    # теста. Сигнатуры _split_audio/_find_degenerate_segments/_text_from_response/
+    # _restore_timeline поменялись (профиль передаётся явно) — оборачиваем
+    # параметрами DICTATION, чтобы вызовы в тестах ниже не менялись.
+    ns["_norm_word"] = se_chunking.norm_word
+    ns["_drop_overlap"] = se_chunking.drop_overlap
+    ns["_fmt_mmss"] = se_chunking.fmt_mmss
+    ns["_join_chunks"] = se_chunking.join_chunks
+    ns["_split_audio"] = lambda audio, dur: se_chunking.split_audio(
+        audio, dur, ns["SAMPLE_RATE"], DICTATION.chunk_threshold_seconds,
+        DICTATION.chunk_size_seconds, DICTATION.chunk_overlap_seconds)
+    ns["_find_degenerate_segments"] = lambda segments: se_density_gate.find_degenerate_segments(
+        segments, DICTATION.density_gate_min_duration, DICTATION.density_gate_min_words_per_sec)
+    ns["_text_from_response"] = lambda result: se_density_gate.text_from_response(
+        result, DICTATION.density_gate_min_duration, DICTATION.density_gate_min_words_per_sec)
+    ns["_words_in_range"] = se_density_gate.words_in_range
+    ns["transfer_punctuation"] = se_transfer.transfer_punctuation
+    ns["_transfer_norm"] = se_terms._transfer_norm
+    ns["_change_tempo"] = se_audio.change_tempo
+    ns["_restore_timeline"] = lambda result: se_audio.restore_timeline(result, DICTATION.asr_tempo)
+    ns["transfer_terms"] = se_terms.transfer_terms
+    ns["transfer_endings"] = se_transfer.transfer_endings
+    ns["fix_known_terms"] = se_terms.fix_known_terms
+
+    # Константы, теперь профильные — под старыми именами теста.
+    ns["ASR_TEMPO"] = DICTATION.asr_tempo
+    ns["STYLE_PROMPT"] = DICTATION.style_prompt
+    ns["TERM_CANON"] = se_terms.TERM_CANON
+    ns["TERM_FIX"] = se_terms.TERM_FIX
+    ns["PUNCT_TRANSFER_MIN_SECONDS"] = DICTATION.punct_transfer_min_seconds
+    ns["PUNCT_TRANSFER_MAX_SECONDS"] = DICTATION.punct_transfer_max_seconds
+    ns["CHUNK_THRESHOLD_SECONDS"] = DICTATION.chunk_threshold_seconds
+    ns["CHUNK_SIZE_SECONDS"] = DICTATION.chunk_size_seconds
+    ns["CHUNK_OVERLAP_SECONDS"] = DICTATION.chunk_overlap_seconds
+    ns["DENSITY_GATE_MIN_DURATION"] = DICTATION.density_gate_min_duration
+    ns["DENSITY_GATE_MIN_WORDS_PER_SEC"] = DICTATION.density_gate_min_words_per_sec
+    ns["ENDING_MIN_STEM"] = se_transfer.ENDING_MIN_STEM
+    ns["ASR_CONTEXT_PROMPT"] = DICTATION.groq_context_prompt
+    ns["BOH_TAIL_MARKERS"] = speech_engine.watermarks.BOH_TAIL_MARKERS
     return ns
 
 

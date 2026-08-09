@@ -58,6 +58,21 @@ from faster_whisper import WhisperModel
 from pynput import keyboard
 from pynput.keyboard import Controller as KeyboardController, Key as KeyboardKey
 
+# Каскад распознавания (Deepgram/Groq/локальная модель, гейт плотности, перенос
+# знаков/терминов/форм) вынесен в общий пакет ~/speech-engine/ — тот же движок
+# используют thoughts-bot и transcribe-bot (см. speech-engine/agent.md). Здесь
+# остаётся только платформенная часть: микрофон, клавиша, вставка, уведомления.
+#
+# Доставка на этот Mac: пока НЕ решена окончательно (открытый вопрос Егору —
+# см. отчёт о сдаче унификации, 09.08.26). До решения — sys.path на абсолютный
+# путь; работает на сервере, где разрабатывался перенос, но НЕ на Mac Егора без
+# отдельного клонирования репозитория speech-engine туда же.
+try:
+    import speech_engine
+except ImportError:
+    sys.path.insert(0, os.path.expanduser("~/speech-engine"))
+    import speech_engine
+
 
 def load_env_file(path: str = ".env") -> None:
     """Минимальная загрузка .env без внешних зависимостей."""
@@ -138,94 +153,18 @@ ASR_CONTEXT_PROMPT = ""
 # Егор читал вслух, 731 слово): точность 78.9% -> 80.4%, верно записанных терминов
 # 6 -> 16. Отдельный третий запрос под словарь давал 80.2% — то есть совмещение
 # не только дешевле, но и точнее.
-STYLE_PROMPT = ("Так, ну, в общем, смотри. Значит, вот. И, соответственно, дальше. "
-                "Claude Code, Claude Design, WhisperKey, Notebook LM, GitHub, Telegram, "
-                "Groq, DeepGram, CEO, API, Яндекс Маркет, Ozon, Wildberries, iPad, "
-                "промпт, токены, агенты, скиллы. "
-                # Команды в повелительном наклонении — самый частый класс ошибок:
-                # модель слышит звук верно, но выбирает форму из субтитровой привычки
-                # («сохрани» -> «сохраняет», «реализуй» -> «реализует»). Образцы
-                # императивов в промпте смещают выбор формы: 34 верных команды
-                # из 51 без них против 40 с ними (замер 08.08.26 на калибровке).
-                "Сохрани. Раздели. Выстрой. Реализуй. Проверь. Покажи. Открой. "
-                "Запусти. Найди. Убери. Оставь. Пришли. Собери. Напиши. Сделай. "
-                "Отметь. Скинь. Запиши. Продолжай. Добавляй.")
-
-# Белый список: ТОЛЬКО эти слова могут приехать из второго прохода в текст.
-# Промпт заставляет модель писать названия латиницей, но он же съедает слова
-# (замер: 613 слов без словаря против 542 со словарём). Поэтому слова берутся
-# из основного прохода, а из словарного переносятся исключительно термины отсюда.
-# Слово, которого нет в этом списке, попасть в результат физически не может.
-TERM_CANON = {
-    "claude": "Claude", "code": "Code", "design": "Design",
-    "whisperkey": "WhisperKey", "notebook": "Notebook", "lm": "LM",
-    "github": "GitHub", "telegram": "Telegram", "groq": "Groq",
-    "deepgram": "DeepGram", "ceo": "CEO", "ipad": "iPad",
-    "ozon": "Ozon", "wildberries": "Wildberries",
-}
-
-# Темп записи, отправляемой в облако. Обоснование и замеры — в create_audio_wav.
-# 1.0 возвращает прежнее поведение.
-ASR_TEMPO = 1.03
-
-# Короткие диктовки whisper оформляет сам: на 47 записях до 15 секунд простыня
-# была ровно одна. Второй запрос там — лишний расход квоты без выигрыша.
-PUNCT_TRANSFER_MIN_SECONDS = 12.0
-
-# Верхняя граница: второй проход идёт одним запросом на всю запись, а Groq
-# принимает не больше 25 МБ. 16 кГц/16 бит — это 32 КБ на секунду, то есть
-# около 780 секунд на предел. Берём с запасом.
-PUNCT_TRANSFER_MAX_SECONDS = 600.0
-
-NARRATOR_LOOP_PATTERN = r'(?:спикер|смикер|speaker)\s+говорит'
-
-# Только водяные знаки Whisper из субтитровых корпусов. Обычные слова русского языка
-# сюда попадать НЕ должны: "корректор" и "продолжение следует" съедали до 75% фразы
-# ("Он корректор и дизайнер" -> "Он.").
-BOH_TAIL_MARKERS = [
-    "редактор субтитров",
-    "субтитры сделал",
-    "субтитры сделала",
-    "субтитры подогнал",
-    "субтитры делал",
-    "субтитры создавал",
-    "subtitles by",
-    "thanks for watching",
-    "dimatorzok",
-    "ссылка на сайт в описании",
-]
-CLOUD_WHISPER_MODEL = "whisper-large-v3"
-PARALLEL_CLOUD_CHUNKS = True
-# Три потока, а не четыре, и пауза между запросами: на 30-минутной записи
-# 32 куска в 4 потока без пауз словили 429 и потеряли 4 куска текста насовсем.
-MAX_CLOUD_WORKERS = 3
-MIN_REQUEST_INTERVAL = 0.7
-
-# Дробление длинной записи — крайняя мера, а не норма.
 #
-# Замер 05.08.26 на реальной записи 29:45, сравнение с эталонной расшифровкой:
-#   одним куском целиком        3810 слов, полнота 79.8%, точность 92.3%
-#   нарезка 60 с + перекрытие   3559 слов, полнота 72.3%, точность 89.4%
-# Groq режет длинный файл у себя внутри и делает это лучше, чем мы снаружи:
-# наша нарезка добавляет швы, дубли на стыках и лишние запросы, упирающиеся
-# в лимит. Поэтому порог поднят выше любой реальной диктовки — до 15 минут.
-# Всё, что короче, уходит в облако одним запросом: максимум качества,
-# ни одного шва. Нарезка остаётся только для записей, которые иначе
-# не влезут в ограничение API по размеру файла.
-CHUNK_THRESHOLD_SECONDS = 900.0
-CHUNK_SIZE_SECONDS = 60.0
-CHUNK_OVERLAP_SECONDS = 3.0
-
-# Детектор провала распознавания. no_speech_prob его НЕ ловит (у пустых сегментов
-# замерено 0.028 и 0.581), плотность слов ловит 3 из 3 и 4 из 4 в двух проверках.
-DENSITY_GATE_MIN_DURATION = 8.0
-DENSITY_GATE_MIN_WORDS_PER_SEC = 0.5
-
-HALLUCINATION_TRIGGERS = [
-    "спикер говорит",
-    "смикер говорит",
-    "голос за кадром",
-]
+# STYLE_PROMPT, TERM_CANON, ASR_TEMPO, PUNCT_TRANSFER_MIN/MAX_SECONDS,
+# NARRATOR_LOOP_PATTERN, BOH_TAIL_MARKERS, CLOUD_WHISPER_MODEL, PARALLEL_CLOUD_CHUNKS,
+# MAX_CLOUD_WORKERS, MIN_REQUEST_INTERVAL, CHUNK_*_SECONDS, DENSITY_GATE_*,
+# HALLUCINATION_TRIGGERS — всё это переехало в speech_engine.DICTATION (Profile),
+# см. ~/speech-engine/speech_engine/profiles.py. Числа и замеры не изменились,
+# изменилось только место, где они лежат — общее для всех проектов вместо
+# копии в одном файле. DICTATION ниже — короткий псевдоним для тех мест этого
+# файла, которым нужно прочитать значение (стартовые печати, диагностика).
+DICTATION = speech_engine.DICTATION
+CLOUD_WHISPER_MODEL = DICTATION.groq_model
+DEEPGRAM_MODEL = DICTATION.deepgram_model
 
 # ─── Сбор корпуса реальных диктовок ───────────────────────────────────────────
 # Все замеры качества сделаны на чужом материале (получасовой созвон, дальний
@@ -262,46 +201,16 @@ else:
 CLOUD_ENABLED = USE_CLOUD
 
 # ─── Deepgram — первая ступень каскада ────────────────────────────────────────
-# Замер 08.08.26 на калибровке Егора. Эталон настоящий: текст, который он читал
-# вслух с листа, — не вывод другой машины, поэтому согласованные ошибки двух
-# движков не могут выдать себя за правильные слова. 808 слов эталона:
-#     боевой конвейер на whisper        78.6%   173 ошибки
-#     Deepgram nova-2 + таблица имён    86.5%   109 ошибок
-# Он же и быстрее: 369 секунд аудио — 5.5 с против 8.9 с у Groq, на пятиминутной
-# записи 1.6 с против 5.6 с. То есть вторая ступень не только не нужна для
-# качества — она и по времени проигрывает.
-#
-# Модель именно nova-2, хотя nova-3 новее: третья версия обучена прежде всего
-# под английский, русский идёт у неё через multilingual и стоит пяти пунктов
-# (80.9% против 86.1% на том же материале). Проверено обеими.
-#
-# smart_format выключен намеренно: он переписывает «двадцать пять» в «25»
-# и «пятое августа» в «05.08», а Егор просил дословность — «не форматируй».
-# На замере он стоит 2.8 пункта (83.3% против 86.1%). filler_words наоборот
-# включён: «ну», «вот», «значит» — часть его речи, а не мусор.
-# keywords проверены и отброшены: качества не дали (113 ошибок против 112),
-# а первый запрос с ними растягивается до 4.5 секунды.
+# Параметры (модель nova-2, DEEPGRAM_PARAMS, тайминги, порог блокировки) —
+# в speech_engine.DICTATION (см. правку выше и agent.md пакета, там же цифры
+# замера 08.08.26: 86.5% против 78.6% на калибровке, nova-2 против nova-3 и т.д.).
+# Здесь остаётся только чтение ключа — он нужен локально, чтобы решить, включать
+# ли ступень вообще, и для стартовой печати.
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
-DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
-DEEPGRAM_MODEL = "nova-2"
-DEEPGRAM_PARAMS = {
-    "model": DEEPGRAM_MODEL,
-    "language": "ru",
-    "punctuate": "true",
-    "smart_format": "false",
-    "filler_words": "true",
-    "numerals": "false",
-}
 DEEPGRAM_ENABLED = bool(DEEPGRAM_API_KEY)
-# Порог терпения. Ответ приходит за секунду-две, поэтому 20 секунд — это уже
-# явная поломка, и ждать дольше бессмысленно: рядом стоит рабочий запасной путь.
-DEEPGRAM_TIMEOUT = 20.0
-DEEPGRAM_RETRIES = 2
-# Через сколько пробовать снова после отказа по деньгам или ключу. Пока пауза
-# не вышла, каждая диктовка идёт на Groq без единого лишнего запроса.
-DEEPGRAM_BLOCK_SECONDS = 900.0
 
-# Создаем глобальную сессию для Keep-Alive
+# Создаем глобальную сессию для Keep-Alive. Общая и для локальных warm-up вызовов
+# (ниже), и для каскада speech_engine — единственный пул соединений на процесс.
 http_session = requests.Session()
 
 # ─── Состояние ────────────────────────────────────────────────────────────────
@@ -346,23 +255,17 @@ session_phase = "idle"   # idle -> recording -> processing
 active_session_id = 0
 audio_stream = None # CEO Fix: Инициализируем при нажатии
 
-# CEO Cloud Management: Динамическое управление состоянием облака
-cloud_status = {
-    "is_blocked": False,
-    "last_check_time": 0,
-    "check_in_progress": False,
-    "consecutive_success": 0,  # CEO Fix: Счетчик стабильных запросов
-    "last_degenerate": [],     # окна, где модель сорвалась (гейт плотности)
-    "last_api_text": "",       # собственный текст модели до нашей сборки
-}
-# Состояние первой ступени. blocked_until нужен, чтобы кончившийся кредит или
-# отозванный ключ не превращали каждую диктовку в лишний запрос с ожиданием:
-# один отказ — и четверть часа всё идёт сразу на Groq.
-deepgram_status = {
-    "blocked_until": 0.0,
-    "last_reason": "",
-    "last_seconds": 0.0,
-}
+# Состояние облачных ступеней (было: модульные словари cloud_status/deepgram_status)
+# теперь живёт внутри _engine.ctx (speech_engine.Context) — тот же смысл, тот же
+# набор полей (is_blocked/last_degenerate/blocked_until/last_seconds/...), просто
+# инкапсулировано в объект пакета вместо двух глобальных словарей файла.
+# local_model=None здесь: модель грузится позже в main() (дорогая операция,
+# должна идти после баннера сбора корпуса) — присваивается в _engine.ctx.local_model
+# по готовности, см. main().
+_engine = speech_engine.Engine(
+    profile=DICTATION, groq_api_key=GROQ_API_KEY, deepgram_api_key=DEEPGRAM_API_KEY,
+    sample_rate=SAMPLE_RATE, session=http_session,
+)
 kb = KeyboardController()
 _instance_lock_handle = None
 _eval_lock = threading.Lock()
@@ -746,37 +649,9 @@ def stop_audio_stream():
     except Exception as e:
         print(f"[audio stop error] {e}")
 
-def background_cloud_probe():
-    """CEO Method: Фоновая проверка доступности облака с подтверждением стабильности."""
-    global cloud_status
-    if cloud_status["check_in_progress"]: return
-    
-    def probe():
-        cloud_status["check_in_progress"] = True
-        try:
-            headers = {
-                'Authorization': f'Bearer {GROQ_API_KEY}',
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-            }
-            response = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=5)
-            if response.status_code == 200:
-                # CEO Fix: Требуем 2 успешных проверки подряд для выхода из блока, если были "прыжки"
-                cloud_status["consecutive_success"] += 1
-                if cloud_status["consecutive_success"] >= 1: # Можно поднять до 2 если будет дергаться
-                    if cloud_status["is_blocked"]:
-                        print("[radar] Связь стабильна. Возвращаю Cloud Turbo.")
-                    cloud_status["is_blocked"] = False
-            else:
-                cloud_status["is_blocked"] = True
-                cloud_status["consecutive_success"] = 0
-        except:
-            cloud_status["is_blocked"] = True
-            cloud_status["consecutive_success"] = 0
-        finally:
-            cloud_status["last_check_time"] = time.time()
-            cloud_status["check_in_progress"] = False
-
-    threading.Thread(target=probe, daemon=True).start()
+# background_cloud_probe (фоновая проверка доступности Groq) переехала в
+# speech_engine.groq_engine — вызывается изнутри каскада автоматически, отдельно
+# звать её отсюда больше не нужно.
 
 # ─── Утилиты ──────────────────────────────────────────────────────────────────
 
@@ -832,175 +707,10 @@ CAPITALIZE_FIRST = True
 # ставит точку там, где она уместна.
 FORCE_TRAILING_DOT = False
 
-_TRANSFER_PUNCT = '.,!?;:—…'
-
-def _transfer_norm(w: str) -> str:
-    return re.sub(r'[^\w]', '', w, flags=re.UNICODE).lower()
-
-def transfer_punctuation(base_text: str, styled_text: str) -> str:
-    """Слова из base_text, знаки препинания — из styled_text.
-
-    base_text  — проход без промпта: полный список слов, но часто без знаков.
-    styled_text — проход с STYLE_PROMPT: знаки есть, но часть слов подменена
-                  словами из промпта.
-    Совпадающие участки находятся difflib по нормализованным словам; с каждого
-    совпавшего слова переносится только «хвост» из знаков и, если оно начинало
-    предложение, заглавная буква. Несовпавшие участки остаются как в base_text.
-    Инвариант проверяется утверждением: список слов на выходе равен входному.
-    """
-    if not base_text or not styled_text:
-        return base_text
-
-    a, b = base_text.split(), styled_text.split()
-    na = [_transfer_norm(x) for x in a]
-    nb = [_transfer_norm(x) for x in b]
-    out = list(a)
-
-    raised = set()
-    for i, j, n in difflib.SequenceMatcher(None, na, nb, autojunk=False).get_matching_blocks():
-        for k in range(n):
-            src, dst = b[j + k], out[i + k]
-            if not src or not dst:
-                continue
-            tail = ''.join(c for c in src[len(src.rstrip(_TRANSFER_PUNCT)):]
-                           if c in _TRANSFER_PUNCT)
-            if tail and dst[-1] not in _TRANSFER_PUNCT:
-                out[i + k] = dst + tail
-            # Заглавную берём, только если слово реально начинало предложение
-            # в оформленной версии, иначе она приезжает из середины чужой фразы.
-            prev_styled = b[j + k - 1] if (j + k) else ''
-            if (src[0].isupper() and dst[0].islower()
-                    and ((j + k) == 0 or (prev_styled and prev_styled[-1] in '.!?…'))):
-                out[i + k] = out[i + k][0].upper() + out[i + k][1:]
-                raised.add(i + k)
-
-    # Согласуем регистр с итоговой расстановкой знаков: заглавная стоит после
-    # точки и в начале. Перенесённая заглавная, под которой точки не оказалось
-    # (в оформленной версии предложение начиналось, а здесь — нет), снимается.
-    for i, t in enumerate(out):
-        if not t:
-            continue
-        prev = out[i - 1] if i else ''
-        starts = (i == 0) or (prev and prev[-1] in '.!?…')
-        if starts and t[0].islower():
-            out[i] = t[0].upper() + t[1:]
-        elif not starts and i in raised:
-            out[i] = t[0].lower() + t[1:]
-
-    result = ' '.join(out)
-    if [_transfer_norm(x) for x in result.split()] != na:
-        print("[punct] перенос знаков нарушил слова — оставляю текст без знаков")
-        return base_text
-    return result
-
-# ─── Таблица названий ────────────────────────────────────────────────────────
-TERM_FIX = [
-    # WhisperKey — модель ломает название шестью разными способами
-    (r"\b(?:виспер\s?кей|висперкей|виспро[\s.]?кей|wispro[\s.]?ke[yй]|wisperk|whisper\s?key)\b", "WhisperKey"),
-    (r"\bвиспр[оа]\b", "WhisperKey"),
-    (r"\bвиспер\b", "WhisperKey"),
-    # Gemini
-    (r"\b(?:jiminy|джимм?и|джемини|гемини)\b", "Gemini"),
-    # Claude. «клад» и «код» НЕ трогаем — это настоящие слова.
-    (r"\bкл[оа]уд\w*\b", "Claude"),
-    (r"\bклод\b", "Claude"),
-    # Маркетплейсы
-    (r"\badaxmarket\b", "Яндекс Маркет"),
-    (r"\b(?:valberis|валберис|вайлдберриз|вайлдберис)\b", "Wildberries"),
-    (r"\b(?:озон|ozon)\b", "Ozon"),
-    # Прочее из корпуса
-    (r"\bюджайл\w*\b", "Yougile"),
-    (r"\bгитхаб\w*\b", "GitHub"),
-    (r"\bдипграм\w*\b", "DeepGram"),
-    (r"\bтелеграм\b", "Telegram"),
-    # CEO. В корпусе Егора 23 из 23 вхождений «seo» — это «CEO to CEO».
-    # Настоящего SEO у него нет ни разу; если появится — строку убрать.
-    (r"\bseo\b", "CEO"),
-]
-_RX = [(re.compile(p, re.IGNORECASE), r) for p, r in TERM_FIX]
-
-_TERM_FIX_RX: list = []   # компилируется при первом вызове
-
-def fix_known_terms(text: str) -> tuple[str, int]:
-    """Заменяет названия, записанные по звучанию, на правильные.
-
-    Работает без обращения к сети и без второго прохода: чистая таблица.
-    Замер 08.08.26 — на живом корпусе Егора (213 записей, 8590 слов) исправлено
-    46 названий в 26 записях; на калибровке точность 79.3% -> 80.2%.
-    """
-    if not text:
-        return text, 0
-    if not _TERM_FIX_RX:
-        _TERM_FIX_RX.extend((re.compile(p, re.IGNORECASE), r) for p, r in TERM_FIX)
-    n = 0
-    for rx, rep in _TERM_FIX_RX:
-        text, k = rx.subn(rep, text)
-        n += k
-    return text, n
-
-def transfer_terms(base_text: str, vocab_text: str) -> tuple[str, int]:
-    """Подставляет названия продуктов из словарного прохода. Пословно.
-
-    Замена участками целиком съедала соседние слова — на замере это стоило
-    +5 ошибок против +9 выигранных. Здесь слова спариваются по позиции внутри
-    участка расхождения, и подставляется ровно одно слово вместо одного,
-    причём только из TERM_CANON.
-    """
-    if not base_text or not vocab_text:
-        return base_text, 0
-    a, b = base_text.split(), vocab_text.split()
-    na = [_transfer_norm(x) for x in a]
-    nb = [_transfer_norm(x) for x in b]
-    out, used = list(a), 0
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, na, nb,
-                                                       autojunk=False).get_opcodes():
-        if tag != 'replace':
-            continue
-        for k in range(min(i2 - i1, j2 - j1)):
-            canon = TERM_CANON.get(nb[j1 + k])
-            if canon:
-                out[i1 + k] = canon
-                used += 1
-    return ' '.join(out), used
-
-ENDING_MIN_STEM = 4   # короче — слишком легко совпасть случайно
-
-def transfer_endings(base_text: str, donor_text: str) -> tuple[str, int]:
-    """Правит окончание слова по донорскому проходу. Слово другим стать не может.
-
-    Whisper слышит команду верно, но ставит форму по привычке субтитровых
-    корпусов: «сохрани» -> «сохраняет», «выстрой» -> «выстроить»,
-    «реализуй» -> «реализует». Основа при этом всегда совпадает — на неё
-    и опираемся: замена разрешена, только если начала слов совпали минимум
-    на ENDING_MIN_STEM букв и расходятся не более чем в трёх последних.
-    Поэтому «длинными» -> «тебе» невозможно по построению.
-
-    Замер 08.08.26 на калибровке (эталон — прочитанный вслух текст):
-    перенесено 12 окончаний, исправлено 9 слов, испорчено 1, длина не изменилась.
-    """
-    if not base_text or not donor_text:
-        return base_text, 0
-    a, b = base_text.split(), donor_text.split()
-    na = [_transfer_norm(x) for x in a]
-    nb = [_transfer_norm(x) for x in b]
-    out, used = list(a), 0
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, na, nb,
-                                                       autojunk=False).get_opcodes():
-        if tag != 'replace':
-            continue
-        for k in range(min(i2 - i1, j2 - j1)):
-            x, y = na[i1 + k], nb[j1 + k]
-            if x == y or len(x) < ENDING_MIN_STEM or len(y) < ENDING_MIN_STEM:
-                continue
-            common = 0
-            for c1, c2 in zip(x, y):
-                if c1 != c2:
-                    break
-                common += 1
-            if common >= ENDING_MIN_STEM and common >= min(len(x), len(y)) - 3:
-                out[i1 + k] = b[j1 + k]
-                used += 1
-    return ' '.join(out), used
+# transfer_punctuation/transfer_terms/transfer_endings/fix_known_terms/TERM_FIX/
+# TERM_CANON переехали в speech_engine (terms.py/transfer.py) — дословно, см.
+# правку в начале файла. Локальных копий больше нет: раньше расхождение здесь
+# и в transcribe-bot было ровно тем дублированием, которое убирает этот перенос.
 
 def apply_smart_sentence_ending(text: str) -> str:
     """Минимальное оформление: заглавная в начале, точка — по флагу."""
@@ -1139,97 +849,19 @@ artifacts_removed: list[str] = []   # что вырезали в последн�
 audio_dropouts: list[str] = []      # переполнения входного буфера за время записи
                                     # (сэмплы, выброшенные железом до распознавания)
 
-def strip_asr_artifacts(text: str) -> str:
-    """Удаляет водяные знаки Whisper, НЕ трогая окружающий текст.
-
-    Два принципиальных отличия от прежней версии:
-      1. Вырезается только сам маркер, а не "маркер и всё после него". Раньше
-         cleaned[:idx] выбрасывал продолжение фразы — "Он корректор и дизайнер"
-         превращалось в "Он".
-      2. Ищем по всему тексту, а не в последних 20 символах: в реальных выдачах
-         маркеры стоят и в середине (замер по transcribe-bot — все 4 подстановки
-         были в середине текста).
-    Маркер удаляется, только когда он занимает отдельную фразу — то есть слева
-    начало текста или конец предложения, справа конец текста или знак препинания.
-    """
-    cleaned = text.strip()
-    if not cleaned:
-        return cleaned
-
-    # Зацикленный рассказчик: режем, только если паттерн повторился 2+ раза.
-    loop_matches = list(re.finditer(NARRATOR_LOOP_PATTERN, cleaned, flags=re.IGNORECASE))
-    if len(loop_matches) >= 2:
-        cut_pos = loop_matches[0].start()
-        artifacts_removed.append(f"зацикливание ({len(loop_matches)} повторов)")
-        print(f"[boh] deloop cut at {cut_pos} ({len(loop_matches)} matches)")
-        cleaned = cleaned[:cut_pos].strip()
-
-    if not cleaned:
-        return cleaned
-
-    # Водяной знак занимает предложение целиком и обычно тащит за собой хвост
-    # ("Субтитры сделал DimaTorzok", "Редактор субтитров А.Семкин"). Удаляем от
-    # начала маркера до конца его предложения — но только если хвост короткий:
-    # это защита от сноса живого абзаца, если маркер вдруг совпал со словами речи.
-    MAX_TAIL_WORDS = 6
-    for marker in BOH_TAIL_MARKERS:
-        pattern = re.compile(
-            r'(?:(?<=^)|(?<=[.!?…]))(\s*' + re.escape(marker) + r'([^.!?…]*))',
-            flags=re.IGNORECASE,
-        )
-        while True:
-            match = pattern.search(cleaned)
-            if not match:
-                break
-            tail_words = match.group(2).split()
-            if len(tail_words) > MAX_TAIL_WORDS:
-                break  # слишком длинный хвост — это, скорее всего, живая речь
-            cleaned = (cleaned[:match.start(1)] + ' ' + cleaned[match.end(1):]).strip()
-            cleaned = re.sub(r'^\s*[.!?…]+\s*', '', cleaned)
-            artifacts_removed.append(marker)
-            print(f"[boh] водяной знак удалён: '{marker}'")
-
-    return re.sub(r'\s{2,}', ' ', cleaned).strip()
-
-# Нормализация написания названий продуктов — единственная разрешённая замена слов.
-# Слово не меняется на другое слово: приводится лишь регистр/латиница уже
-# распознанного названия. Ставь False, если не нужно даже это.
-NORMALIZE_BRAND_NAMES = True
-BRAND_NAMES = {
-    r'\bclaude\b': 'Claude',
-    r'\bcursor\b': 'Cursor',
-    r'\bgroq\b': 'Groq',
-    r'\btelegram\b': 'Telegram',
-    r'\bwhisper\b': 'Whisper',
-    r'\bgithub\b': 'GitHub',
-    r'\bapi\b': 'API',
-}
-
+# strip_asr_artifacts/NARRATOR_LOOP_PATTERN/BOH_TAIL_MARKERS/BRAND_NAMES переехали
+# в speech_engine.watermarks (тот же алгоритм, дословно) — единственное отличие:
+# там функция ВОЗВРАЩАЕТ список того, что вырезала, вместо мутации глобального
+# artifacts_removed (нужно было для безопасности при нескольких процессах на
+# один пакет, см. speech-engine/agent.md). clean_noise ниже — прежний вызов
+# на прежнем месте, просто docstring короче: подробности теперь в пакете.
 def clean_noise(text: str) -> str:
-    """Снимает водяные знаки ASR. Слова пользователя не трогает.
-
-    Что убрано отсюда и почему:
-      - hallucination_words: одиночные "Python"/"Cursor"/"Конец" обнулялись целиком,
-        то есть односложный ответ терялся на 100% и приходило "Речь не распознана";
-      - bad_endings: срезали настоящее последнее слово фразы;
-      - business_vocabulary: переписывал живую речь ("сео" -> "CEO", "депло" -> "деплой")
-        без ведома говорящего;
-      - [фФfFaA]{4,}: смесь кириллицы и латиницы, ломала имена файлов
-        ("Открой файл AAAA.txt" -> "Открой файл. txt").
-    """
+    """Снимает водяные знаки ASR и нормализует написание брендов. Слова не трогает."""
     if not text:
         return ""
-    text = strip_asr_artifacts(text)
-    if not text:
-        return ""
-
-    text = re.sub(r'[.]{4,}', '...', text).strip()   # только явно избыточные точки
-
-    if NORMALIZE_BRAND_NAMES:
-        for pattern, replacement in BRAND_NAMES.items():
-            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-
-    return text.strip()
+    text, removed = speech_engine.watermarks.clean_noise(text)
+    artifacts_removed.extend(removed)
+    return text
 
 def compress_silence(audio_data, threshold=0.01, min_pause=1.5, keep_pause=0.5):
     """CEO Method: Сжатие длинных пауз до фиксированной длины (векторизовано)."""
@@ -1276,715 +908,19 @@ def compress_silence(audio_data, threshold=0.01, min_pause=1.5, keep_pause=0.5):
         print(f"[compress error] {e}")
         return audio_data
 
-def _change_tempo(audio_data, factor: float):
-    """Меняет темп записи линейной интерполяцией по новой сетке отсчётов.
-
-    Частота дискретизации в заголовке WAV остаётся прежней, поэтому для модели
-    речь звучит быстрее, а слова остаются теми же — это не обработка звука
-    и не фильтр, ничего не вырезается и не добавляется.
-    """
-    n = int(len(audio_data) / factor)
-    if n < 2 or factor == 1.0:
-        return audio_data
-    grid = np.linspace(0, len(audio_data) - 1, n)
-    return np.interp(grid, np.arange(len(audio_data)), audio_data).astype(np.float32)
-
-def _restore_timeline(result: dict) -> None:
-    """Возвращает таймкоды ответа к реальному времени записи.
-
-    Звук уходит ускоренным в ASR_TEMPO раз, значит и segments[], и words[]
-    приходят на сжатой шкале. Всё, что считает по времени — гейт плотности,
-    подстановка из words[], снятие перекрытий при склейке длинных записей —
-    рассчитано на реальные секунды. Умножаем обратно прямо здесь, чтобы
-    остальной код об ускорении вообще не знал.
-    """
-    if ASR_TEMPO == 1.0:
-        return
-    for key in ('segments', 'words'):
-        for item in (result.get(key) or []):
-            for field in ('start', 'end'):
-                v = item.get(field)
-                if isinstance(v, (int, float)):
-                    item[field] = v * ASR_TEMPO
-
-def create_audio_wav(audio_data):
-    """Упаковка звука в WAV. Единственная обработка — ускорение темпа.
-
-    Всё остальное, что здесь было раньше, снято по замерам:
-      - compress_silence: на диктовке результат побайтово тот же (совпадение 1.0000),
-        на длинной записи цепочка стоила 15.6% слов;
-      - паддинг 0.5 с тишины: приписывание чистой цифровой тишины к идентичному
-        аудио сдвигает границы 30-секундных окон модели и отнимает 8-10% слов;
-      - нормировка по пику: пользы не показала, а вместе с паддингом двигала таймлайн.
-
-    ASR_TEMPO — замер 06.08.26 на 19 диктовках Егора против эталона SaluteSpeech:
-      темп 1.00 (как было)  14.8% ошибок
-      темп 1.03             13.3%   лучше на 10 записях, хуже на 3
-      темп 0.97             13.9%   лучше на 7, хуже на 6
-      +0.7 с тишины в начало 16.5%  заметно хуже
-    Бутстрап 20000 пересборок для 1.03: −1.50 п.п., ДИ95 [−3.36; +0.34], хуже базы
-    в 5% пересборок. То есть выигрыш вероятен, но на 19 записях не доказан строго —
-    интервал краем задевает ноль. Порог решения: правка ничем не рискует (слова
-    не трогаются, задержка не растёт), поэтому принята.
-    Почему работает: у whisper окно 30 секунд и жёсткая привязка к темпу, сдвиг
-    темпа меняет весь путь декодирования.
-    Функция применяется ТОЛЬКО к облачному проходу — create_audio_wav вызывается
-    из transcribe_cloud_turbo и больше нигде. Локальная модель и запись в
-    корпус эталонов (_write_raw_recording_wav) получают исходный звук.
-    """
-    try:
-        audio_data = np.asarray(audio_data, dtype=np.float32)
-        if ASR_TEMPO != 1.0:
-            audio_data = _change_tempo(audio_data, ASR_TEMPO)
-        audio_data = np.clip(audio_data, -1.0, 1.0)
-
-        wav_io = io.BytesIO()
-        with wave.open(wav_io, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes((audio_data * 32767).astype(np.int16).tobytes())
-
-        if SAVE_DEBUG_AUDIO:
-            try:
-                with open("debug_audio.wav", "wb") as f:
-                    f.write(wav_io.getvalue())
-            except Exception:
-                pass
-
-        return wav_io.getvalue()
-    except Exception as e:
-        print(f"[wav error] {e}")
-        return None
-
-def _find_degenerate_segments(segments: list) -> list:
-    """Сегменты, где модель сорвалась: длинные и почти без слов.
-
-    no_speech_prob этот отказ не видит — у замеренных пустых сегментов он был
-    0.028 и 0.581, то есть «речь точно есть». Плотность слов ловит его надёжно:
-    3 из 3 и 4 из 4 в двух независимых проверках.
-    """
-    bad = []
-    for seg in segments:
-        try:
-            dur = float(seg.get('end', 0.0)) - float(seg.get('start', 0.0))
-        except (TypeError, ValueError):
-            continue
-        if dur < DENSITY_GATE_MIN_DURATION:
-            continue
-        n_words = len(seg.get('text', '').split())
-        if dur > 0 and (n_words / dur) < DENSITY_GATE_MIN_WORDS_PER_SEC:
-            bad.append({'start': float(seg.get('start', 0.0)),
-                        'end': float(seg.get('end', 0.0)),
-                        'words': n_words, 'dur': dur})
-    return bad
-
-def _words_in_range(words: list, start: float, end: float) -> str:
-    """Слова из words[], попадающие в интервал времени."""
-    picked = []
-    for w in words:
-        try:
-            w_start = float(w.get('start', -1))
-        except (TypeError, ValueError):
-            continue
-        if start <= w_start < end:
-            token = (w.get('word') or '').strip()
-            if token:
-                picked.append(token)
-    return ' '.join(picked)
-
-def _text_from_response(result: dict) -> tuple[str, list]:
-    """Собирает текст: пунктуация из segments[], потерянное — из words[].
-
-    Почему не одно из двух:
-      - segments[] дают читаемый текст со знаками препинания, но на длинном входе
-        модель отдаёт пустые и вырожденные окна ("95 95 95") — до 19.5% выхода
-        теряется прямо внутри успешного ответа API;
-      - words[] содержат ВСЁ распознанное (слов, которые есть в сегментах и нет
-        в словах, во всех замерах было ровно 0), но приходят без пунктуации.
-    Поэтому основа — сегменты, а words[] подставляются только туда, где сегмент
-    сорвался. Так сохраняется и читаемость, и полнота.
-    """
-    words = result.get('words') or []
-    segments = result.get('segments') or []
-    degenerate = _find_degenerate_segments(segments)
-    degenerate_spans = {(d['start'], d['end']) for d in degenerate}
-
-    if not segments:
-        if words:
-            return ' '.join((w.get('word') or '').strip()
-                            for w in words if (w.get('word') or '').strip()), degenerate
-        return (result.get('text') or '').strip(), degenerate
-
-    pieces = []
-    prev_end = 0.0
-    for seg in segments:
-        try:
-            s_start = float(seg.get('start', 0.0))
-            s_end = float(seg.get('end', 0.0))
-        except (TypeError, ValueError):
-            s_start = s_end = 0.0
-        seg_text = (seg.get('text') or '').strip()
-
-        # Слова, оставшиеся между сегментами — модель их распознала, но в текст
-        # они не попали.
-        if words and s_start > prev_end + 0.5:
-            gap = _words_in_range(words, prev_end, s_start)
-            if gap:
-                pieces.append(gap)
-
-        if (s_start, s_end) in degenerate_spans or not seg_text:
-            recovered = _words_in_range(words, s_start, s_end) if words else ''
-            if recovered:
-                print(f"[recover] окно {s_start:.1f}-{s_end:.1f}с: "
-                      f"восстановлено {len(recovered.split())} слов из words[]")
-                pieces.append(recovered)
-            elif seg_text:
-                pieces.append(seg_text)
-        elif seg_text:
-            pieces.append(seg_text)
-
-        prev_end = max(prev_end, s_end)
-
-    # Хвост после последнего сегмента
-    if words:
-        tail = _words_in_range(words, prev_end, float('inf'))
-        if tail:
-            pieces.append(tail)
-
-    text = ' '.join(p for p in pieces if p).strip()
-    return (text or (result.get('text') or '').strip()), degenerate
-
-_rate_lock = threading.Lock()
-_last_request_ts = [0.0]
-
-def _throttle():
-    """Разносит запросы во времени.
-
-    Замер на 30-минутной записи: 32 куска в 4 потока без пауз словили 429 и
-    потеряли 4 куска текста насовсем. Лимит ключа — 7200 секунд аудио в час,
-    но упирается всё в частоту запросов, а не в объём.
-    """
-    with _rate_lock:
-        delta = time.time() - _last_request_ts[0]
-        if delta < MIN_REQUEST_INTERVAL:
-            time.sleep(MIN_REQUEST_INTERVAL - delta)
-        _last_request_ts[0] = time.time()
-
-def transcribe_deepgram(audio_data) -> str | None:
-    """Первая ступень каскада. Возвращает текст либо None — тогда работает Groq.
-
-    Возврат None здесь никогда не означает потерю диктовки: вызывающий код
-    молча уходит на whisper, и человек видит разницу только в строке [engine].
-
-    Отказы разделены намеренно. Кончившиеся деньги, отозванный ключ и запрет
-    по правам (401, 402, 403) лечиться повтором не могут — движок отключается
-    на DEEPGRAM_BLOCK_SECONDS, чтобы каждая следующая диктовка не платила
-    секундой ожидания за заведомо мёртвый запрос. Перегрузка и сбои сервера
-    (429, 5xx) — наоборот, проходят сами, и здесь уместен короткий повтор.
-    """
-    if not DEEPGRAM_ENABLED:
-        return None
-    if time.time() < deepgram_status["blocked_until"]:
-        return None
-
-    wav_data = create_audio_wav(audio_data)
-    if not wav_data:
-        return None
-
-    headers = {
-        "Authorization": f"Token {DEEPGRAM_API_KEY}",
-        "Content-Type": "audio/wav",
-    }
-
-    t0 = time.time()
-    for attempt in range(DEEPGRAM_RETRIES):
-        try:
-            response = http_session.post(
-                DEEPGRAM_URL, params=DEEPGRAM_PARAMS, headers=headers,
-                data=wav_data, timeout=DEEPGRAM_TIMEOUT
-            )
-
-            if response.status_code == 200:
-                try:
-                    alt = response.json()["results"]["channels"][0]["alternatives"][0]
-                except (KeyError, IndexError, ValueError) as e:
-                    print(f"[deepgram] ответ не разобран ({type(e).__name__}) — ухожу на Groq")
-                    return None
-                text = (alt.get("transcript") or "").strip()
-                deepgram_status["last_seconds"] = time.time() - t0
-                if not text:
-                    # Пустой ответ на непустом звуке — повод отдать запись whisper,
-                    # а не объявлять диктовку нераспознанной.
-                    print("[deepgram] пусто — ухожу на Groq")
-                    return None
-                return text
-
-            if response.status_code in (401, 402, 403):
-                reason = {401: "ключ не принят", 402: "кончились деньги на счёте",
-                          403: "доступ запрещён"}[response.status_code]
-                deepgram_status["blocked_until"] = time.time() + DEEPGRAM_BLOCK_SECONDS
-                deepgram_status["last_reason"] = reason
-                mins = int(DEEPGRAM_BLOCK_SECONDS / 60)
-                print(f"[deepgram] {reason} (HTTP {response.status_code}). "
-                      f"Перехожу на Groq, повторю попытку через {mins} мин.")
-                notify("WhisperKey — сменил движок",
-                       f"Deepgram: {reason}. Работаю на Groq.")
-                return None
-
-            if response.status_code in (429, 500, 502, 503, 504) and attempt + 1 < DEEPGRAM_RETRIES:
-                time.sleep(0.5)
-                continue
-
-            print(f"[deepgram] статус {response.status_code} — ухожу на Groq")
-            return None
-
-        except requests.Timeout:
-            print(f"[deepgram] не ответил за {DEEPGRAM_TIMEOUT:.0f}с — ухожу на Groq")
-            return None
-        except Exception as e:
-            if attempt + 1 < DEEPGRAM_RETRIES:
-                time.sleep(0.5)
-                continue
-            print(f"[deepgram] {type(e).__name__} — ухожу на Groq")
-            return None
-
-    return None
-
-def transcribe_cloud_turbo(audio_data, allow_retry: bool = True, use_prompt: bool = True,
-                           return_words: bool = False, prompt_override: str = ""):
-    """Расшифровка через Groq whisper-large-v3.
-
-    Возвращает строку текста либо None. При return_words=True — кортеж
-    (текст, список слов с таймкодами): слова нужны для склейки перекрытий
-    по времени, текстовое сравнение на стыке ненадёжно, потому что модель
-    распознаёт один и тот же участок в разных кусках немного по-разному.
-    Сорванные окна отдаёт через cloud_status['last_degenerate'].
-    """
-    global cloud_status
-
-    empty = (None, []) if return_words else None
-
-    if cloud_status["is_blocked"]:
-        if time.time() - cloud_status["last_check_time"] > 60:
-            background_cloud_probe()
-        return empty
-
-    if not GROQ_API_KEY:
-        return empty
-
-    wav_data = create_audio_wav(audio_data)
-    if not wav_data:
-        return empty
-
-    headers = {
-        'Authorization': f'Bearer {GROQ_API_KEY}',
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'application/json'
-    }
-
-    files = {'file': ('audio.wav', io.BytesIO(wav_data), 'audio/wav')}
-    data = [
-        ('model', CLOUD_WHISPER_MODEL),
-        ('language', 'ru'),
-        ('temperature', '0.0'),
-        ('response_format', 'verbose_json'),
-        # Обе гранулярности обязательны: при запросе только 'word' Groq отдаёт
-        # segments: null, и детектор плотности остаётся слепым.
-        ('timestamp_granularities[]', 'segment'),
-        ('timestamp_granularities[]', 'word'),
-    ]
-    # prompt_override — для прохода за знаками препинания (STYLE_PROMPT).
-    # Его результат идёт только в transfer_punctuation и словами не распоряжается.
-    prompt = prompt_override or (ASR_CONTEXT_PROMPT if use_prompt else "")
-    if prompt:
-        data.append(('prompt', prompt))
-
-    for attempt in range(4):
-        try:
-            _throttle()
-            response = http_session.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers=headers, files=files, data=data, timeout=60
-            )
-
-            if response.status_code == 200:
-                result = response.json()
-                _restore_timeline(result)
-                # Текст самой модели — до нашей сборки. Нужен, чтобы при пропаже
-                # куска было видно, кто его потерял: модель или конвейер.
-                if not prompt:
-                    cloud_status["last_api_text"] = (result.get('text') or '').strip()
-                text, degenerate = _text_from_response(result)
-                cloud_status["last_degenerate"] = degenerate
-                if degenerate:
-                    total = sum(d['dur'] for d in degenerate)
-                    print(f"[gate] сорванных окон: {len(degenerate)}, суммарно {total:.1f}с")
-                if return_words:
-                    return text, (result.get('words') or [])
-                return text
-
-            if response.status_code == 403:
-                print("[!] Groq 403 (гео-блок). Ухожу на локальную модель.")
-                cloud_status["is_blocked"] = True
-                cloud_status["last_check_time"] = time.time()
-                background_cloud_probe()
-                return empty
-
-            # 429 и 5xx лечатся ожиданием. Раньше любой такой ответ давал
-            # молчаливую дыру; на 30-минутной записи так терялось 4 куска из 32.
-            if response.status_code in (429, 500, 502, 503, 504) and allow_retry and attempt < 3:
-                wait = float(response.headers.get('retry-after', 0) or 0) or (2 ** attempt) * 2
-                wait = min(wait, 20.0)
-                print(f"[cloud] {response.status_code}, повтор через {wait:.1f}с "
-                      f"(попытка {attempt + 2} из 4)")
-                time.sleep(wait)
-                files = {'file': ('audio.wav', io.BytesIO(wav_data), 'audio/wav')}
-                continue
-
-            print(f"[cloud error] Статус: {response.status_code}")
-            return empty
-
-        except Exception as e:
-            print(f"[cloud exception] {type(e).__name__}")
-            if allow_retry and attempt < 3:
-                time.sleep(2 ** attempt)
-                files = {'file': ('audio.wav', io.BytesIO(wav_data), 'audio/wav')}
-                continue
-            return empty
-
-    return empty
-
-def _transcribe_local(chunk: np.ndarray) -> str:
-    """Локальный fallback — только когда cloud не дал пригодный текст."""
-    max_val = np.max(np.abs(chunk))
-    if max_val > 0.0001:
-        chunk = chunk / max_val * 0.99
-    segments, _ = model.transcribe(
-        chunk, language="ru",
-        beam_size=5, patience=1.0, repetition_penalty=1.2,
-        vad_filter=False, suppress_blank=True, without_timestamps=True,
-        condition_on_previous_text=False,
-        initial_prompt=ASR_CONTEXT_PROMPT or None,
-    )
-    return " ".join(seg.text.strip() for seg in segments).strip()
-
-def _transcribe_one_chunk(chunk: np.ndarray, chunk_idx: int, n_chunks: int) -> tuple[int, str | None, str, list]:
-    """Распознаёт один кусок. Возвращает (индекс, текст|None, метка_качества, слова).
-
-    Метка качества: 'cloud' | 'cloud_retry' | 'local' | 'lost'. Она нужна выше,
-    чтобы пользователь увидел, что часть записи ушла на слабую локальную модель
-    или потерялась — раньше и то и другое проходило молча.
-    Слова с таймкодами нужны для склейки перекрытий по времени.
-    """
-    if n_chunks > 1:
-        print(f"[chunk] Сегмент {chunk_idx + 1}/{n_chunks} ({len(chunk) / SAMPLE_RATE:.1f}s)")
-
-    chunk_text = None
-    chunk_words: list = []
-    quality = 'lost'
-    chunk_dur = len(chunk) / SAMPLE_RATE
-    use_cloud = CLOUD_ENABLED and not cloud_status.get("is_blocked")
-
-    if use_cloud:
-        raw_text, chunk_words = transcribe_cloud_turbo(chunk, return_words=True)
-        degenerate = list(cloud_status.get("last_degenerate") or [])
-        if raw_text:
-            lower = raw_text.lower()
-            if any(t in lower for t in HALLUCINATION_TRIGGERS):
-                cleaned = strip_asr_artifacts(raw_text)
-                if cleaned and (len(cleaned.split()) >= 3 or chunk_dur <= 5.0):
-                    chunk_text, quality = cleaned, 'cloud'
-                else:
-                    print(f"[guard] Сегмент {chunk_idx + 1}: пусто после чистки")
-            else:
-                chunk_text, quality = raw_text, 'cloud'
-
-        # Переспрос без промпта — только если срыв НЕ удалось залечить словами.
-        # Если words[] уже вернули речь для сорванного окна, второй запрос лишний:
-        # он стоит квоты, а на 30-минутной записи именно перерасход запросов
-        # приводил к 429 и потере целых кусков.
-        if degenerate and ASR_CONTEXT_PROMPT and _needs_retry(degenerate, chunk_words):
-            print(f"[gate] Сегмент {chunk_idx + 1}: переспрашиваю без промпта")
-            retry_text, retry_words = transcribe_cloud_turbo(chunk, use_prompt=False, return_words=True)
-            if retry_text and len(retry_text.split()) > len((chunk_text or '').split()):
-                chunk_text, quality, chunk_words = retry_text, 'cloud_retry', retry_words
-
-    if not chunk_text:
-        print(f"[local] Сегмент {chunk_idx + 1}: локальная модель (качество ниже)")
-        try:
-            chunk_text = _transcribe_local(chunk) or None
-            quality = 'local' if chunk_text else 'lost'
-            chunk_words = []
-        except Exception as e:
-            print(f"[local error] Сегмент {chunk_idx + 1}: {type(e).__name__} {e}")
-            chunk_text, quality = None, 'lost'
-
-    return chunk_idx, chunk_text, quality, chunk_words
-
-def _needs_retry(degenerate: list, words: list) -> bool:
-    """Стоит ли переспрашивать окно, которое модель провалила.
-
-    Не стоит, если words[] уже дали для этого интервала осмысленную плотность
-    речи — текст спасён, повторный запрос ничего не добавит, а квоту потратит.
-    """
-    for d in degenerate:
-        span = d['end'] - d['start']
-        if span <= 0:
-            continue
-        recovered = sum(1 for w in words
-                        if d['start'] <= float(w.get('start', -1)) < d['end'])
-        if (recovered / span) < DENSITY_GATE_MIN_WORDS_PER_SEC:
-            return True
-    return False
-
-# ─── Нарезка и склейка ────────────────────────────────────────────────────────
-
-def _split_audio(audio: np.ndarray, dur: float) -> tuple[list, list]:
-    """Режет запись на куски с перекрытием. Возвращает (куски, смещения_в_секундах).
-
-    Короткие записи не режутся вовсе — это главная защита от галлюцинаций:
-    каждый разрез даёт модели ещё один «конец файла», где она склонна дописывать
-    субтитровые водяные знаки.
-    """
-    if dur <= CHUNK_THRESHOLD_SECONDS:
-        return [audio], [0.0]
-
-    size = int(SAMPLE_RATE * CHUNK_SIZE_SECONDS)
-    overlap = int(SAMPLE_RATE * CHUNK_OVERLAP_SECONDS)
-    step = max(size - overlap, size // 2)
-
-    chunks, offsets = [], []
-    pos = 0
-    while pos < len(audio):
-        end = min(pos + size, len(audio))
-        chunks.append(audio[pos:end])
-        offsets.append(pos / SAMPLE_RATE)
-        if end >= len(audio):
-            break
-        pos += step
-
-    print(f"[chunk] Длинная запись {dur:.1f}s → {len(chunks)} кусков "
-          f"по {CHUNK_SIZE_SECONDS:.0f}s с перекрытием {CHUNK_OVERLAP_SECONDS:.0f}s")
-    return chunks, offsets
-
-def _norm_word(w: str) -> str:
-    return re.sub(r'[^\w]', '', w.lower().replace('ё', 'е'))
-
-def _drop_overlap(prev_text: str, next_text: str, max_probe: int = 25) -> str:
-    """Убирает из next_text повтор, попавший в него из зоны перекрытия.
-
-    Ищется ТОЧНОЕ совпадение хвоста предыдущего куска с головой следующего,
-    длиной от трёх слов. Нечёткое сравнение сознательно не используется: на
-    замере оно один раз выбросило 12 слов настоящей речи, оставив бессмыслицу.
-    Не нашли точного совпадения — ничего не трогаем: лишний дубль пережить можно,
-    потерянные слова — нет.
-    """
-    prev_words = prev_text.split()
-    next_words = next_text.split()
-    if len(prev_words) < 3 or len(next_words) < 3:
-        return next_text
-
-    limit = min(max_probe, len(prev_words), len(next_words))
-    for n in range(limit, 2, -1):
-        tail = [_norm_word(w) for w in prev_words[-n:]]
-        head = [_norm_word(w) for w in next_words[:n]]
-        if tail == head and any(tail):
-            return ' '.join(next_words[n:])
-    return next_text
-
-def _fmt_mmss(seconds: float) -> str:
-    m, s = divmod(int(seconds), 60)
-    return f"{m:02d}:{s:02d}"
-
-def _overlap_word_count(words: list, chunk_start: float, cut_before: float) -> int:
-    """Сколько первых слов куска попало в зону перекрытия с предыдущим.
-
-    Считаем по таймкодам, а режем потом от ТЕКСТА — иначе, пересобирая фразу
-    из words[], мы теряем пунктуацию, которая есть только в segments[].
-    Сравнение по времени надёжнее текстового: один и тот же участок в соседних
-    кусках модель распознаёт немного по-разному, и точного совпадения на стыке
-    может не быть вовсе.
-    """
-    n = 0
-    for w in words:
-        try:
-            abs_start = chunk_start + float(w.get('start', 0.0))
-        except (TypeError, ValueError):
-            break
-        if abs_start >= cut_before:
-            break
-        if (w.get('word') or '').strip():
-            n += 1
-    return n
-
-def _join_chunks(parts: list, quality: list, offsets: list,
-                 words_per_chunk: list | None = None) -> tuple[str, list]:
-    """Склеивает куски, помечая потерянные. Возвращает (текст, список_меток_потерь).
-
-    Кусок, который не распознался, раньше просто выпадал: дыра до 23 секунд
-    склеивалась встык, и приходило бодрое «Текст готов». Теперь на его месте
-    остаётся видимая метка — текст честнее, чем гладкий обман.
-
-    Перекрытие снимается по таймкодам слов, если они есть, и точным текстовым
-    совпадением в запасном варианте. Нечёткого сравнения здесь нет намеренно:
-    на замере оно уничтожило 12 слов реальной речи, оставив бессмыслицу.
-    """
-    pieces: list[str] = []
-    lost_marks: list[str] = []
-    prev_end: float | None = None
-
-    for idx, text in enumerate(parts):
-        if not text:
-            if len(parts) > 1:
-                mark = f"[не распознано {_fmt_mmss(offsets[idx])}]"
-                lost_marks.append(mark)
-                pieces.append(mark)
-            continue
-
-        chunk_words = (words_per_chunk[idx] if words_per_chunk and idx < len(words_per_chunk)
-                       else None)
-        if pieces and prev_end is not None and chunk_words:
-            n_dup = _overlap_word_count(chunk_words, offsets[idx], prev_end)
-            words_of_text = text.split()
-            # Режем от текста, а не от words[] — так остаётся пунктуация.
-            # Если перекрытие вдруг накрыло весь кусок, оставляем текст как есть:
-            # лишний дубль пережить можно, потерянные слова нет.
-            if 0 < n_dup < len(words_of_text):
-                text = ' '.join(words_of_text[n_dup:])
-        elif pieces:
-            text = _drop_overlap(pieces[-1], text)
-
-        if chunk_words:
-            try:
-                prev_end = offsets[idx] + max(float(w.get('end', 0.0)) for w in chunk_words)
-            except (TypeError, ValueError):
-                prev_end = None
-
-        if text:
-            pieces.append(text)
-
-    return ' '.join(p for p in pieces if p).strip(), lost_marks
-
-# ─── Транскрибация ────────────────────────────────────────────────────────────
-
-def _recognize_with_whisper(audio: np.ndarray, dur: float) -> tuple[str, str, list, list]:
-    """Вторая и третья ступени каскада: Groq, а при его отказе — локальная модель.
-
-    Здесь живёт всё, что построено вокруг whisper: дробление длинных записей,
-    гейт плотности, восстановление сорванных окон из words[], стилевой проход
-    за знаками препинания и переносы названий и форм с него.
-
-    Deepgram ничего этого не требует — он отдаёт готовый текст со знаками, —
-    поэтому путь вынесен отдельно и при работающей первой ступени не трогается
-    вовсе: ни одного лишнего запроса, ни одной лишней секунды.
-
-    Возвращает (текст, текст до переносов, потерянные куски, качество кусков).
-    """
-    # Дробление длинной записи. Порог поднят с 30 до 90 секунд: на 25 и 60
-    # секундах модель не теряет ничего (69=69 и 140=140 слов), а каждый лишний
-    # разрез создаёт искусственный «конец записи» — место рождения субтитрового
-    # спама. Куски по 60 с с перекрытием 3 с — лучшая из семи замеренных
-    # конфигураций (полнота 84.0% и 85.3% в двух независимых проверках против
-    # 73.0% у прежних 20 секунд без перекрытия).
-    audio_chunks, chunk_offsets = _split_audio(audio, dur)
-    n_chunks = len(audio_chunks)
-
-    # Проход за знаками препинания стартует ОДНОВРЕМЕННО с основным, поэтому
-    # ожидания не добавляет: оба запроса летят к Groq параллельно.
-    style_pool = style_future = None
-    if (PUNCT_TRANSFER_MIN_SECONDS <= dur <= PUNCT_TRANSFER_MAX_SECONDS
-            and CLOUD_ENABLED and not cloud_status.get("is_blocked")):
-        style_pool = ThreadPoolExecutor(max_workers=1)
-        style_future = style_pool.submit(
-            transcribe_cloud_turbo, audio, allow_retry=False,
-            prompt_override=STYLE_PROMPT)
-
-    ordered_parts: list[str | None] = [None] * n_chunks
-    chunk_quality: list[str] = ['lost'] * n_chunks
-    chunk_words: list[list] = [[] for _ in range(n_chunks)]
-
-    parallel_ok = (
-        PARALLEL_CLOUD_CHUNKS
-        and n_chunks > 1
-        and CLOUD_ENABLED
-        and not cloud_status.get("is_blocked")
-    )
-
-    if parallel_ok:
-        print(f"[fast] Параллельно: {n_chunks} сегментов, потоков {MAX_CLOUD_WORKERS}")
-        with ThreadPoolExecutor(max_workers=MAX_CLOUD_WORKERS) as pool:
-            futures = {
-                pool.submit(_transcribe_one_chunk, chunk, idx, n_chunks): idx
-                for idx, chunk in enumerate(audio_chunks)
-            }
-            for fut in as_completed(futures):
-                idx = futures[fut]
-                # Исключение в ОДНОМ куске раньше убивало всю запись целиком:
-                # fut.result() пробрасывал его наружу, общий except печатал строку
-                # в терминал, и пользователь не получал ни текста, ни уведомления.
-                try:
-                    idx, chunk_text, quality, words = fut.result()
-                except Exception as e:
-                    print(f"[error] Сегмент {idx + 1} упал: {type(e).__name__} {e}")
-                    chunk_text, quality, words = None, 'lost', []
-                ordered_parts[idx] = chunk_text
-                chunk_quality[idx] = quality
-                chunk_words[idx] = words
-    else:
-        for idx, chunk in enumerate(audio_chunks):
-            try:
-                _, chunk_text, quality, words = _transcribe_one_chunk(chunk, idx, n_chunks)
-            except Exception as e:
-                print(f"[error] Сегмент {idx + 1} упал: {type(e).__name__} {e}")
-                chunk_text, quality, words = None, 'lost', []
-            ordered_parts[idx] = chunk_text
-            chunk_quality[idx] = quality
-            chunk_words[idx] = words
-
-    # Склейка: перекрытие снимается по таймкодам слов, текстовое сравнение —
-    # только запасной путь. Нечёткого сравнения нет намеренно.
-    text, lost_marks = _join_chunks(
-        ordered_parts, chunk_quality, chunk_offsets, chunk_words)
-
-    if not text:
-        if style_pool is not None:
-            style_pool.shutdown(wait=False)
-        return "", "", lost_marks, chunk_quality
-
-    assembled = text                       # до переносов знаков/названий/форм
-    print(f"[raw whisper] '{text}'")
-
-    # Знаки препинания из второго прохода. Он уже почти наверняка завершён —
-    # шёл параллельно. Ждём не дольше 8 секунд: текст важнее оформления,
-    # и молчаливо задерживать вставку из-за знаков нельзя.
-    if style_future is not None:
-        try:
-            styled = style_future.result(timeout=8.0)
-            if styled:
-                before = text
-                text = transfer_punctuation(text, styled)
-                if text != before:
-                    print(f"[punct] знаки перенесены со второго прохода")
-                # Названия продуктов — из того же прохода, отдельного запроса
-                # он не требует. Слова берутся только из белого списка.
-                text, n_terms = transfer_terms(text, styled)
-                if n_terms:
-                    print(f"[terms] названий поправлено: {n_terms}")
-                # Формы команд — оттуда же. Слово может сменить только окончание.
-                text, n_end = transfer_endings(text, styled)
-                if n_end:
-                    print(f"[forms] окончаний поправлено: {n_end}")
-        except Exception as e:
-            print(f"[punct] второй проход не дошёл ({type(e).__name__}) — "
-                  f"текст остаётся без добавленных знаков")
-        finally:
-            style_pool.shutdown(wait=False)
-
-    return text, assembled, lost_marks, chunk_quality
+# ─── Каскад распознавания ──────────────────────────────────────────────────────
+# _change_tempo, _restore_timeline, create_audio_wav, _find_degenerate_segments,
+# _words_in_range, _text_from_response, _throttle, transcribe_deepgram,
+# transcribe_cloud_turbo, _transcribe_local, _transcribe_one_chunk, _needs_retry,
+# _split_audio, _norm_word, _drop_overlap, _fmt_mmss, _overlap_word_count,
+# _join_chunks, _recognize_with_whisper — весь этот блок (было ~700 строк) переехал
+# в общий пакет speech_engine (профиль dictation), без изменения поведения и
+# констант. Единственный узел, через который process_audio теперь получает текст —
+# _engine.recognize(audio, dur), см. process_audio ниже. Устройство каскада,
+# все замеры и красные зоны — ~/speech-engine/agent.md.
 
 def process_audio(audio_snapshot: list, session_id: int):
-    global processing, last_text_context, cloud_status, session_phase
+    global processing, last_text_context, session_phase
     try:
         if not audio_snapshot: return
         audio = np.concatenate(audio_snapshot, axis=0).flatten().astype(np.float32)
@@ -1996,30 +932,25 @@ def process_audio(audio_snapshot: list, session_id: int):
         print(f"[rec] {dur:.1f}s → распознаю...")
         t_start = time.time()
 
-        # ─── Каскад из трёх ступеней ─────────────────────────────────────────
-        # 1. Deepgram — точнее на 8 пунктов и вдвое быстрее (замер в шапке файла);
-        # 2. Groq whisper со всей нашей обвязкой — когда Deepgram молчит,
-        #    отключён, исчерпан или не отвечает;
-        # 3. локальная модель внутри второй ступени — когда интернета нет вовсе.
-        # Ступени идут ПО ОЧЕРЕДИ, а не одновременно: первая справляется быстрее,
-        # чем вторая успела бы стартовать, и платить за оба движка сразу незачем.
+        # ─── Каскад распознавания (speech_engine, профиль dictation) ───────────
+        # Deepgram → Groq (со всей обвязкой: гейт плотности, стилевой проход,
+        # перенос знаков/терминов/форм) → локальная модель, по очереди. Устройство
+        # каскада — ~/speech-engine/agent.md, не здесь.
         t_asr_start = time.time()
-        full_raw_text = transcribe_deepgram(audio)
-        if full_raw_text:
-            engine = "deepgram"
-            assembled_text = full_raw_text
-            lost_marks: list = []
-            chunk_quality: list[str] = ['deepgram']
-            print(f"[engine] Deepgram {DEEPGRAM_MODEL}, "
-                  f"{deepgram_status['last_seconds']:.1f}с")
-            print(f"[raw deepgram] '{full_raw_text}'")
-        else:
-            engine = "whisper"
-            print("[engine] Groq whisper (запасной путь)")
-            full_raw_text, assembled_text, lost_marks, chunk_quality = \
-                _recognize_with_whisper(audio, dur)
-
+        result = _engine.recognize(audio, dur)
+        engine_name = result.engine
+        full_raw_text = result.text
+        assembled_text = result.assembled_text
+        lost_marks = result.lost_marks
+        chunk_quality = result.chunk_quality
         t_asr_done = time.time()
+
+        if engine_name == "deepgram":
+            print(f"[engine] Deepgram {DEEPGRAM_MODEL}, "
+                  f"{result.meta.get('deepgram_seconds', 0.0):.1f}с")
+            print(f"[raw deepgram] '{full_raw_text}'")
+        elif full_raw_text:
+            print(f"[engine] {engine_name} (запасной путь)")
 
         if not full_raw_text:
             finalize_eval_sample_meta(session_id, dur, "", "")
@@ -2029,9 +960,9 @@ def process_audio(audio_snapshot: list, session_id: int):
 
         # Таблица названий работает ВСЕГДА, даже когда второго прохода не было:
         # короткая диктовка, отказ сети, исчерпанная квота. Сети не требует.
-        full_raw_text, n_fix = fix_known_terms(full_raw_text)
-        if n_fix:
-            print(f"[terms] по таблице поправлено: {n_fix}")
+        # (Применена внутри _engine.recognize — здесь только печать счётчика.)
+        if result.terms_fixed:
+            print(f"[terms] по таблице поправлено: {result.terms_fixed}")
 
         # LLM-полировка удалена. Модель llama-3.1-70b-versatile выведена Groq из
         # обслуживания (HTTP 400 model_decommissioned), и год вызов молча возвращал
@@ -2060,10 +991,10 @@ def process_audio(audio_snapshot: list, session_id: int):
             finalize_eval_sample_meta(
                 session_id, dur, full_raw_text, text,
                 stages={
-                    "engine": engine,
-                    "api_text": cloud_status.get("last_api_text", ""),
+                    "engine": engine_name,
+                    "api_text": result.meta.get("api_text", ""),
                     "assembled": assembled_text,
-                    "degenerate": cloud_status.get("last_degenerate", []),
+                    "degenerate": result.degenerate,
                     "dropouts": len(audio_dropouts),
                 })
 
@@ -2306,11 +1237,15 @@ def main():
         print(f"Распознавание: {CLOUD_WHISPER_MODEL} (Deepgram не подключён — "
               f"он точнее на 8 пунктов и вдвое быстрее)")
         print("   Чтобы включить: допиши в файл .env строку DEEPGRAM_API_KEY=<ключ>")
-    print(f"   промпт: {'выключен' if not ASR_CONTEXT_PROMPT else 'включён'}")
+    print(f"   промпт: {'выключен' if not DICTATION.groq_context_prompt else 'включён'}")
     try:
         print("Загрузка локальной модели (запасной вариант, если облако недоступно)...")
         model = WhisperModel(MODEL_PATH, device="cpu", compute_type="int8", cpu_threads=2, local_files_only=False)
         model.transcribe(np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32), language="ru", beam_size=1)
+        # Модель грузится тут (дорого, после баннера сбора корпуса) — отдаём её
+        # в Engine как третью ступень каскада (используется, только когда и
+        # Deepgram, и Groq недоступны или ничего не вернули).
+        _engine.ctx.local_model = model
 
         if USE_CLOUD or DEEPGRAM_ENABLED:
             def warm_network():
