@@ -702,10 +702,17 @@ def test_term_table_fixes_known_names():
     fx = M["fix_known_terms"]
     cases = [("докрути виспер", "WhisperKey"), ("виспро.кей работает", "WhisperKey"),
              ("как seo to seo", "CEO"), ("джимми 2.5", "Gemini"),
-             ("выложи на гитхаб", "GitHub"), ("клоуда открой", "Claude")]
+             ("выложи на гитхаб", "GitHub"), ("клоуда открой", "Claude"),
+             ("возьми опыт Whisperer-K, прямо", "WhisperKey")]
     for phrase, want in cases:
         out, n = fx(phrase)
         check(f"Т13 исправлено: {phrase!r}", want in out and n > 0, f"{phrase!r} -> {out!r}")
+
+    # Найдено сканом живого корпуса 11.08.26 (несловарная запись WhisperKey) — само
+    # слово "whisperer" без суффикса -k/-key трогать нельзя, мало ли что оно значит.
+    out, n = fx("horse whisperer story")
+    check("Т13 голый whisperer не тронут", out == "horse whisperer story" and n == 0,
+          f"-> {out!r}")
 
     # Пустой вход не роняет.
     for empty in ("", None):
