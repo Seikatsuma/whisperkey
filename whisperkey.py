@@ -59,19 +59,20 @@ from pynput import keyboard
 from pynput.keyboard import Controller as KeyboardController, Key as KeyboardKey
 
 # Каскад распознавания (Deepgram/Groq/локальная модель, гейт плотности, перенос
-# знаков/терминов/форм) вынесен в общий пакет ~/speech-engine/ — тот же движок
-# используют thoughts-bot и transcribe-bot (см. speech-engine/agent.md). Здесь
-# остаётся только платформенная часть: микрофон, клавиша, вставка, уведомления.
+# знаков/терминов/форм) вынесен в общий пакет speech_engine — тот же движок
+# используют thoughts-bot, transcribe-bot, toki-bot, claude-tg-bot (устройство,
+# профили, все замеры — speech_engine/agent.md). Здесь остаётся только
+# платформенная часть: микрофон, клавиша, вставка, уведомления.
 #
-# Доставка на этот Mac: пока НЕ решена окончательно (открытый вопрос Егору —
-# см. отчёт о сдаче унификации, 09.08.26). До решения — sys.path на абсолютный
-# путь; работает на сервере, где разрабатывался перенос, но НЕ на Mac Егора без
-# отдельного клонирования репозитория speech-engine туда же.
-try:
-    import speech_engine
-except ImportError:
-    sys.path.insert(0, os.path.expanduser("~/speech-engine"))
-    import speech_engine
+# Пакет лежит ПРЯМО В ЭТОЙ ПАПКЕ (speech_engine/, рядом с этим файлом), а не
+# отдельным репозиторием — иначе самообновление ловило бы только whisperkey.py,
+# а не движок, от которого он теперь зависит. Ровно это и случилось 11.08.26:
+# первая версия переноса ссылалась на ~/speech-engine на сервере, `git pull`
+# на Mac Егора обновил whisperkey.py, но не принёс пакет — падение при каждом
+# запуске (ModuleNotFoundError, дважды — основной путь и обходной тоже мимо).
+# С пакетом внутри репозитория обычный `import speech_engine` находит его сам:
+# Python всегда ищет модули рядом со своим стартовым файлом.
+import speech_engine
 
 
 def load_env_file(path: str = ".env") -> None:
