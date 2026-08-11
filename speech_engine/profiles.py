@@ -56,7 +56,13 @@ class Profile:
     punct_transfer_max_seconds: float = 0.0
 
     # ── Нарезка длинных записей ──
-    chunk_threshold_seconds: float = 900.0   # dictation: порог, ПОСЛЕ которого режем
+    # 700, не 900: при 16 кГц/16 бит/моно (SAMPLE_RATE=16000 в WhisperKey) один кусок
+    # длиннее ~780с уже весит больше 25 МБ — лимита Groq на бесплатном тарифе — и вместо
+    # нарезки ловит тихий 413, откуда цепочка молча уходит на локальную модель (см.
+    # agent.md WhisperKey, «Открытый дефект этого порога», зафиксировано 08.08.26,
+    # исправлено 11.08.26). 700×32000=22.4 МБ — запас даже без учёта ASR_TEMPO,
+    # который дополнительно уменьшает реальный вес перед отправкой.
+    chunk_threshold_seconds: float = 700.0   # dictation: порог, ПОСЛЕ которого режем
     chunk_size_seconds: float = 60.0
     chunk_overlap_seconds: float = 3.0
     parallel_cloud_chunks: bool = True
@@ -107,7 +113,7 @@ DICTATION = Profile(
     ),
     punct_transfer_min_seconds=12.0,
     punct_transfer_max_seconds=600.0,
-    chunk_threshold_seconds=900.0,
+    chunk_threshold_seconds=700.0,
     chunk_size_seconds=60.0,
     chunk_overlap_seconds=3.0,
     parallel_cloud_chunks=True,
