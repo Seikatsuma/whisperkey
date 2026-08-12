@@ -20,7 +20,7 @@ from . import chunking
 from .context import Context
 from .deepgram_engine import transcribe_deepgram
 from .density_gate import needs_retry
-from .groq_engine import transcribe_groq
+from .groq_engine import maybe_probe_if_blocked, transcribe_groq
 from .local_engine import transcribe_local
 from .terms import fix_known_terms
 from .transfer import transfer_endings, transfer_punctuation
@@ -102,6 +102,7 @@ def _recognize_with_groq_cascade(audio: np.ndarray, dur: float, ctx: Context):
     Возвращает (текст, текст_до_переносов, потерянные_куски, качество_кусков).
     """
     p = ctx.profile
+    maybe_probe_if_blocked(api_key=ctx.groq_api_key, state=ctx.cloud_state, session=ctx.session)
     audio_chunks, chunk_offsets = chunking.split_audio(
         audio, dur, ctx.sample_rate, p.chunk_threshold_seconds, p.chunk_size_seconds,
         p.chunk_overlap_seconds)

@@ -92,6 +92,25 @@ def background_cloud_probe(*, api_key: str, state: CloudState, session: requests
     threading.Thread(target=probe, daemon=True).start()
 
 
+def maybe_probe_if_blocked(*, api_key: str, state: CloudState, session: requests.Session) -> None:
+    """Даёт заблокированному Groq шанс раскрыться сам, независимо от того, решил ли
+    вызывающий код вообще звать transcribe_groq в этом цикле.
+
+    Без этой функции периодическая проверка (`since > 60` внутри transcribe_groq)
+    была мёртвым кодом для каскада dictation.py: там сам вызов transcribe_groq
+    защищён условием `not state.is_blocked` (см. dictation.py `use_cloud` /
+    `parallel_ok` / `style_future`) — то есть ровно пока is_blocked=True, функция
+    не вызывается вовсе, и написанная внутри неё проверка никогда не выполняется.
+    Живой инцидент 12.08.26: Groq поймал 403 один раз в начале сессии и молча
+    простоял заблокированным до самого перезапуска WhisperKey — фоновая проверка
+    ни разу не запустилась за час диктовок.
+    """
+    if not state.is_blocked or not api_key:
+        return
+    if time.time() - state.last_check_time > 60:
+        background_cloud_probe(api_key=api_key, state=state, session=session)
+
+
 def transcribe_groq(audio_data, *, api_key: str, profile: Profile, sample_rate: int,
                     state: CloudState, throttle: Throttle, session: requests.Session,
                     allow_retry: bool = True, use_prompt: bool = True,
