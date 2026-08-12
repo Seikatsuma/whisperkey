@@ -43,6 +43,12 @@ def transcribe_deepgram(audio_data, *, api_key: str, profile: Profile, sample_ra
     if not api_key:
         return None
     if time.time() < state.blocked_until:
+        # Видимость: без этой строки блокировка молчит до самого истечения —
+        # с терминала не отличить "ждёт таймер" от "забыл про Deepgram вовсе"
+        # (тот же пробел, что был у groq_engine.py, найден на одном и том же
+        # живом инциденте 11.08.26).
+        logger.info("deepgram: заблокирован (%s), ещё %.0fс — ухожу на groq/local",
+                   state.last_reason or "?", state.blocked_until - time.time())
         return None
 
     wav_data = create_audio_wav(audio_data, sample_rate, tempo=profile.asr_tempo)

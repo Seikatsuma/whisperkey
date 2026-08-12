@@ -71,9 +71,18 @@ def background_cloud_probe(*, api_key: str, state: CloudState, session: requests
                         logger.info("groq: связь стабильна, возвращаю облако")
                     state.is_blocked = False
             else:
+                # ВИДИМОСТЬ ПОПЫТКИ — до этой строки провал проверки не оставлял
+                # ни следа в логе: пользователь видел только "local" раз за разом
+                # и не мог отличить "код не пытается" от "пытается и падает"
+                # (живой случай Егора 11.08.26, лог передан текстом, диагностировать
+                # без этой строки было нечем). Раньше здесь просто молча
+                # ставился is_blocked=True.
+                logger.info("groq: проверка связи — статус %s, ещё заблокирован",
+                           response.status_code)
                 state.is_blocked = True
                 state.consecutive_success = 0
-        except Exception:
+        except Exception as e:
+            logger.info("groq: проверка связи — %s, ещё заблокирован", type(e).__name__)
             state.is_blocked = True
             state.consecutive_success = 0
         finally:
@@ -92,8 +101,13 @@ def transcribe_groq(audio_data, *, api_key: str, profile: Profile, sample_rate: 
     empty = (None, []) if return_words else None
 
     if state.is_blocked:
-        if time.time() - state.last_check_time > 60:
+        since = time.time() - state.last_check_time
+        if since > 60:
+            logger.info("groq: заблокирован, запускаю фоновую проверку связи")
             background_cloud_probe(api_key=api_key, state=state, session=session)
+        else:
+            logger.info("groq: заблокирован, до следующей проверки %.0fс — ухожу на local",
+                       60 - since)
         return empty
 
     if not api_key:
