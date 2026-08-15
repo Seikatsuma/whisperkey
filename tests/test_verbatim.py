@@ -703,7 +703,12 @@ def test_term_table_fixes_known_names():
     cases = [("докрути виспер", "WhisperKey"), ("виспро.кей работает", "WhisperKey"),
              ("как seo to seo", "CEO"), ("джимми 2.5", "Gemini"),
              ("выложи на гитхаб", "GitHub"), ("клоуда открой", "Claude"),
-             ("возьми опыт Whisperer-K, прямо", "WhisperKey")]
+             ("возьми опыт Whisperer-K, прямо", "WhisperKey"),
+             # Живой инцидент 15.08.26: Deepgram nova-2 без словарной подсказки
+             # исказил редкий для него AI-жаргон — см. agent.md.
+             ("используем систему с окистратором", "оркестратором"),
+             ("нужна многогенную систему", "многоагентную"),
+             ("это многогенная система", "многоагентная")]
     for phrase, want in cases:
         out, n = fx(phrase)
         check(f"Т13 исправлено: {phrase!r}", want in out and n > 0, f"{phrase!r} -> {out!r}")
