@@ -26,13 +26,15 @@ TERM_CANON = {
 }
 
 TERM_FIX = [
-    (r"\b(?:виспер\s?кей|висперкей|виспро[\s.]?кей|wispro[\s.]?ke[yй]|wisperk|whisper\s?key)\b", "WhisperKey"),
+    (r"\b(?:виспер\s?кей|висперкей|виспро[\s.]?кей|wispro[\s.]?ke[yй]|wisperk|whisper\s?key|wisper\s?key|visperkey)\b", "WhisperKey"),
     (r"\bвиспр[оа]\b", "WhisperKey"),
     (r"\bвиспер\b", "WhisperKey"),
     (r"\bwhisperer[-\s]?k(?:ey)?\b", "WhisperKey"),
     (r"\b(?:jiminy|джимм?и|джемини|гемини)\b", "Gemini"),
     (r"\bкл[оа]уд\w*\b", "Claude"),
     (r"\bклод\b", "Claude"),
+    (r"\bklot\b", "Claude"),
+    (r"\bигрок\s*[qQ]\b", "Groq"),
     (r"\badaxmarket\b", "Яндекс Маркет"),
     (r"\b(?:valberis|валберис|вайлдберриз|вайлдберис)\b", "Wildberries"),
     (r"\b(?:озон|ozon)\b", "Ozon"),
