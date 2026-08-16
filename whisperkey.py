@@ -352,21 +352,13 @@ def _eval_check_deadline() -> tuple[bool, int, int]:
     return True, days_passed, collected
 
 def _eval_print_banner(active: bool, days_passed: int, collected: int) -> None:
-    """Крупная плашка в терминале — её видно при каждом запуске."""
+    """Крупная плашка в терминале — её видно при каждом запуске, пока сбор идёт.
+
+    Плашка "СБОР ЗАВЕРШЁН... разбери корпус диктовок" убрана 16.08.26: корпус
+    (256 записей) уже выгружен и разобран, повторять призыв к действию, которое
+    уже сделано, при каждом запуске незачем.
+    """
     if eval_collection_finished or not active:
-        if collected <= 0:
-            return
-        print()
-        print("=" * 70)
-        print("   ███  С Б О Р   З А В Е Р Ш Ё Н  ███")
-        print()
-        print(f"   Собрано записей: {collected}")
-        print(f"   Папка: {EVAL_SAMPLES_ROOT}")
-        print()
-        print("   МОЖНО ИДТИ ДАЛЬШЕ — материал готов к разбору.")
-        print("   Скажи Клоду: «разбери корпус диктовок».")
-        print("=" * 70)
-        print()
         return
 
     left = max(0, EVAL_COLLECT_DAYS - days_passed)

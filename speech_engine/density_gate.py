@@ -13,6 +13,10 @@ transcribe_core.py, уже подобран отдельным замером и
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger("speech_engine.density_gate")
+
 
 def find_degenerate_segments(segments: list, min_duration: float, min_words_per_sec: float) -> list:
     """Сегменты, где модель сорвалась: длинные и почти без слов."""
@@ -81,6 +85,14 @@ def text_from_response(result: dict, min_duration: float, min_words_per_sec: flo
                 pieces.append(recovered)
             elif seg_text:
                 pieces.append(seg_text)
+            else:
+                # ВИДИМОСТЬ — расследование живого случая 16.08.26: сегмент признан
+                # сорванным (или пуст изначально), а words[] для этого интервала тоже
+                # пуст — кусок речи молча теряется совсем, без единого следа в логе.
+                # До этой строки такой случай выглядел неотличимо от "тут и правда
+                # была тишина".
+                logger.warning("density_gate: сегмент %.1f-%.1fс потерян целиком — "
+                               "ни text, ни words[] для этого интервала", s_start, s_end)
         elif seg_text:
             pieces.append(seg_text)
 

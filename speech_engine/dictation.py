@@ -189,6 +189,18 @@ def recognize(audio: np.ndarray, dur: float, ctx: Context) -> RecognitionResult:
         full_raw_text = transcribe_deepgram(
             audio, api_key=ctx.deepgram_api_key, profile=p, sample_rate=ctx.sample_rate,
             state=ctx.deepgram_state, session=ctx.session)
+        if full_raw_text and dur > 8.0:
+            # ВИДИМОСТЬ — расследование живого случая 16.08.26 (независимо подтверждено
+            # SaluteSpeech+Nexara на 4 записях: Deepgram/каскад молча теряет куски речи,
+            # не искажает слова, а целиком их не возвращает). У Deepgram, в отличие от
+            # groq_engine/density_gate.py, нет своего recovery-механизма — берём ответ
+            # как есть. Порог подобран грубо (не эталон, только для диагностики в логе):
+            # заметно ниже типичного темпа речи Егора (~1.5-2 слова/с на этом корпусе).
+            wps = len(full_raw_text.split()) / dur
+            if wps < 1.0:
+                logger.warning("deepgram: подозрительно мало текста на длину записи "
+                               "(%.2f слов/с за %.1fс, %d слов) — возможна потеря куска речи",
+                               wps, dur, len(full_raw_text.split()))
 
     if full_raw_text:
         engine = "deepgram"
