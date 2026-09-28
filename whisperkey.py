@@ -74,6 +74,13 @@ from pynput.keyboard import Controller as KeyboardController, Key as KeyboardKey
 # Python всегда ищет модули рядом со своим стартовым файлом.
 import speech_engine
 
+# Плашка внизу экрана, как у Wispr Flow (pill.py): полоска — ждёт, капсула с
+# волной — пишет, капсула со спиннером — распознаёт. Пока она работает, баннеры
+# «Запись / Распознаю / Текст готов» не нужны — их видно по плашке; баннеры о
+# проблемах остаются, в них текст. Не Mac или WHISPERKEY_PILL=0 — всё как раньше.
+import pill as _pill_mod
+pill = _pill_mod.create()
+
 
 def load_env_file(path: str = ".env") -> None:
     """Минимальная загрузка .env без внешних зависимостей.
@@ -542,6 +549,8 @@ def audio_callback(indata, frames, time_info, status):
     block = indata.copy()
     if is_recording:
         recording_data.append(block)
+        if pill.active:
+            pill.set_level_rms(float(np.sqrt(np.mean(block * block))))
     elif PREROLL_ENABLED:
         preroll_buffer.append(block)
 
@@ -930,6 +939,7 @@ def compress_silence(audio_data, threshold=0.01, min_pause=1.5, keep_pause=0.5):
 
 def process_audio(audio_snapshot: list, session_id: int):
     global processing, last_text_context, session_phase
+    pill_error = False
     try:
         if not audio_snapshot: return
         audio = np.concatenate(audio_snapshot, axis=0).flatten().astype(np.float32)
@@ -965,6 +975,7 @@ def process_audio(audio_snapshot: list, session_id: int):
             finalize_eval_sample_meta(session_id, dur, "", "")
             print("[skip] Пустой результат")
             notify("WhisperKey", "Речь не распознана")
+            pill_error = True
             return
 
         # Таблица названий работает ВСЕГДА, даже когда второго прохода не было:
@@ -1025,13 +1036,14 @@ def process_audio(audio_snapshot: list, session_id: int):
             if problems:
                 notify("WhisperKey — распознано частично", "; ".join(problems))
                 print(f"[warn] {'; '.join(problems)}")
-            else:
+            elif not pill.active:
                 suffix = f" (переспрошено окон: {n_retry})" if n_retry else ""
                 notify("WhisperKey ✓", "Текст готов" + suffix)
         else:
             finalize_eval_sample_meta(session_id, dur, full_raw_text, "")
             print("[skip] Пустой результат")
             notify("WhisperKey", "Речь не распознана")
+            pill_error = True
     except Exception as e:
         # Этот except стоит после всех notify, поэтому раньше пользователь при
         # падении не получал НИЧЕГО — ни текста, ни уведомления, только строку
@@ -1040,11 +1052,15 @@ def process_audio(audio_snapshot: list, session_id: int):
         print(f"[error] {type(e).__name__}: {e}")
         traceback.print_exc()
         notify("WhisperKey — сбой", f"{type(e).__name__}. Текст не вставлен.")
+        pill_error = True
     finally:
         processing = False
         with state_lock:
             if active_session_id == session_id:
                 session_phase = "idle"
+                # Под тем же замком, что и фаза: иначе новое нажатие между
+                # двумя строками получило бы «запись», а мы бы тут же её затёрли.
+                pill.set_state("error" if pill_error else "idle")
         # Диктовка закончена — заводим отсчёт до освобождения микрофона.
         # Новое нажатие таймер сбросит, так что при серии диктовок поток живёт.
         schedule_idle_close()
@@ -1078,6 +1094,7 @@ def on_press(key):
                     # Поток мог закрыться по простою или умереть от смены устройства.
                     if not ensure_audio_stream():
                         session_phase = "idle"
+                        pill.set_state("error")
                         return
                     # Порядок важен: буфер заполняется ДО поднятия is_recording,
                     # иначе колбэк успевает дописать в старый список.
@@ -1086,6 +1103,7 @@ def on_press(key):
                 else:
                     if not start_audio_stream():
                         session_phase = "idle"
+                        pill.set_state("error")
                         return
                     recording_data = []
 
@@ -1093,7 +1111,9 @@ def on_press(key):
                 is_recording = True
                 # Уведомление ПОСЛЕ фактического начала захвата: раньше «говори»
                 # выдавалось до того, как микрофон отдавал первый сэмпл.
-                notify("WhisperKey", "🎙 Запись...")
+                pill.set_state("recording")
+                if not pill.active:
+                    notify("WhisperKey", "🎙 Запись...")
                 if PREROLL_ENABLED:
                     pre = len(recording_data) * 512 / SAMPLE_RATE
                     # Нулевая предзапись при включённом режиме — признак того, что
@@ -1117,6 +1137,7 @@ def on_press(key):
                 notify("WhisperKey — микрофон недоступен", str(e)[:120])
                 is_recording = False
                 session_phase = "idle"
+                pill.set_state("error")
 
 def on_release(key):
     global is_recording, processing, trigger_held, session_counter, session_phase
@@ -1128,6 +1149,9 @@ def on_release(key):
                 return
             current_session_id = active_session_id
             session_phase = "processing"
+            # Хвост ещё секунду пишется, но человек клавишу уже отпустил —
+            # плашка сразу переходит в «распознаю», как у Wispr.
+            pill.set_state("processing")
         # CEO Fix: Задержка для захвата хвоста
         def delayed_stop():
             # global обязателен для ВСЕХ трёх имён. У session_phase его не было:
@@ -1152,10 +1176,12 @@ def on_release(key):
                 with state_lock:
                     if active_session_id == current_session_id:
                         session_phase = "idle"
+                        pill.set_state("idle")
                 schedule_idle_close()
                 return
-            
-            notify("WhisperKey", "⏹ Распознаю...")
+
+            if not pill.active:
+                notify("WhisperKey", "⏹ Распознаю...")
             print(f"[rec] Остановлена (хвост захвачен)")
             threading.Thread(target=process_audio, args=(audio_snapshot, current_session_id), daemon=True).start()
 
@@ -1282,8 +1308,17 @@ def main():
     print("Готов! Зажми ПРАВЫЙ OPTION для записи.")
     notify("WhisperKey", "Готов к работе!")
 
-    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-        listener.join()
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+    listener.start()
+    # Окна macOS живут только в главном потоке, поэтому он теперь крутит цикл
+    # событий плашки, а клавиатура слушается в своём потоке, как и раньше.
+    # Плашка не поднялась (или её нет) — главный поток просто ждёт клавиатуру.
+    try:
+        pill.run_forever(on_fail=listener.join)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        listener.stop()
 
 if __name__ == "__main__":
     main()

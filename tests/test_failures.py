@@ -38,6 +38,9 @@ SRC = os.path.join(HERE, "..", "whisperkey.py")
 SPEECH_ENGINE_HOME = os.path.expanduser("~/speech-engine")
 if SPEECH_ENGINE_HOME not in sys.path:
     sys.path.insert(0, SPEECH_ENGINE_HOME)
+# Соседние модули (pill.py) — как при настоящем запуске: Python ищет рядом со
+# стартовым файлом. В конец, чтобы speech_engine по-прежнему брался с сервера.
+sys.path.append(os.path.abspath(os.path.join(HERE, "..")))
 import speech_engine
 from speech_engine.types import RecognitionResult
 
@@ -371,6 +374,74 @@ def test_clipboard_restore_skipped_if_user_copied_own():
     finally:
         M["subprocess"].run, M["_clipboard_now"] = orig_run, orig_now
     check("Чужую копию не затираем", not restored, f"записано: {restored}")
+
+
+# ─── Плашка (pill.py): что она показывает и какие баннеры при ней молчат ───────
+
+class FakePill:
+    active = True
+
+    def __init__(self):
+        self.states = []
+
+    def set_state(self, state):
+        self.states.append(state)
+
+    def set_level_rms(self, rms):
+        pass
+
+
+def run_with_pill(fake_result):
+    real_pill = M["pill"]
+    fake = FakePill()
+    M["pill"] = fake
+    M["active_session_id"] = 1          # как при настоящей диктовке: сессия своя
+    try:
+        text, notes = run_with_result(fake_result)
+    finally:
+        M["pill"] = real_pill
+    return text, notes, fake.states
+
+
+def test_pill_success_returns_to_idle_without_banner():
+    text, notes, states = run_with_pill(RecognitionResult(
+        text="текст готов", engine="deepgram", chunk_quality=["deepgram"]))
+    check("Плашка: после успеха — снова полоска", states[-1:] == ["idle"], f"состояния: {states}")
+    check("Плашка: баннер «Текст готов» не всплывает — видно по плашке",
+          not any("готов" in m.lower() for _, m in notes), f"уведомления: {notes}")
+
+
+def test_pill_problems_keep_banner():
+    text, notes, states = run_with_pill(RecognitionResult(
+        text="первый [не распознано 00:57] третий", engine="groq",
+        chunk_quality=["cloud", "lost", "cloud"], lost_marks=["[не распознано 00:57]"]))
+    said = " ".join(f"{n} {m}" for n, m in notes).lower()
+    check("Плашка: баннер о потере куска остаётся", "потеряно" in said, f"уведомления: {notes}")
+
+
+def test_pill_empty_and_crash_show_error():
+    _, notes, states = run_with_pill(RecognitionResult(text="", engine=""))
+    check("Плашка: пустой результат — красная обводка", states[-1:] == ["error"], f"состояния: {states}")
+    check("Плашка: пустой результат — баннер остаётся",
+          any("не распознан" in m.lower() for _, m in notes), f"уведомления: {notes}")
+    _, notes, states = run_with_pill(RuntimeError("Groq и Deepgram оба недоступны"))
+    check("Плашка: сбой — красная обводка", states[-1:] == ["error"], f"состояния: {states}")
+    check("Плашка: сбой — баннер остаётся", any("сбой" in n.lower() for n, _ in notes),
+          f"уведомления: {notes}")
+
+
+def test_pill_not_touched_by_foreign_session():
+    """Распознавание старой диктовки не должно гасить плашку новой."""
+    real_pill = M["pill"]
+    fake = FakePill()
+    M["pill"] = fake
+    M["active_session_id"] = 2
+    try:
+        run_with_result(RecognitionResult(text="старая", engine="deepgram", chunk_quality=["deepgram"]))
+    finally:
+        M["pill"] = real_pill
+        M["active_session_id"] = 1
+    check("Плашка: чужая сессия её не трогает", fake.states == [], f"состояния: {fake.states}")
 
 
 def main():
