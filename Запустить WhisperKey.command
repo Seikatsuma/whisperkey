@@ -131,4 +131,37 @@ if [ -z "$PY" ]; then
 fi
 
 echo "Python: $($PY --version)"
+
+# ─── Серверный мост распознавания (SSH-туннель) ──────────────────────────────
+# Запасная ступень каскада (Groq) с домашнего IP недоступна — гео-блок 403, и
+# любой сбой Deepgram ронял диктовку в локальную модель: медленно и заметно
+# хуже по качеству. На сервере стоит тот же движок с живыми Deepgram и Groq
+# (voice-bridge.service, 127.0.0.1:8092); туннель пробрасывает его сюда, и
+# каскад зовёт сервер ДО локальной модели. Если ключ SSH недоступен или сервер
+# не отвечает — проверка /health не пройдёт, переменная не ставится и всё
+# работает ровно как раньше, без единой лишней секунды ожидания.
+TUNNEL_PID_FILE=/tmp/whisperkey_tunnel.pid
+if [ -z "${WHISPERKEY_NO_TUNNEL:-}" ]; then
+  # Старый туннель от прошлого запуска — убиваем строго по сохранённому PID.
+  if [ -f "$TUNNEL_PID_FILE" ]; then
+    kill "$(cat "$TUNNEL_PID_FILE")" 2>/dev/null
+    rm -f "$TUNNEL_PID_FILE"
+  fi
+  ssh -N -L 8092:127.0.0.1:8092 \
+      -o BatchMode=yes -o ConnectTimeout=5 -o ExitOnForwardFailure=yes \
+      -o ServerAliveInterval=15 -o ServerAliveCountMax=2 \
+      claude@45.39.60.20 >/tmp/whisperkey_tunnel.log 2>&1 &
+  TUNNEL_PID=$!
+  echo "$TUNNEL_PID" > "$TUNNEL_PID_FILE"
+  sleep 2
+  if curl -sm 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:8092/health 2>/dev/null | grep -q 200; then
+    export REMOTE_ASR_URL="http://127.0.0.1:8092/audio/transcriptions"
+    echo "Серверный мост: подключён — резерв распознавания через сервер"
+  else
+    kill "$TUNNEL_PID" 2>/dev/null
+    rm -f "$TUNNEL_PID_FILE"
+    echo "Серверный мост: не поднялся — работаю как раньше"
+  fi
+fi
+
 exec "$PY" whisperkey.py

@@ -22,6 +22,7 @@ from .deepgram_engine import transcribe_deepgram
 from .density_gate import needs_retry
 from .groq_engine import maybe_probe_if_blocked, transcribe_groq
 from .local_engine import transcribe_local
+from .remote_engine import transcribe_remote
 from .terms import fix_known_terms
 from .transfer import transfer_endings, transfer_punctuation
 from .terms import transfer_terms
@@ -210,11 +211,30 @@ def recognize(audio: np.ndarray, dur: float, ctx: Context) -> RecognitionResult:
         degenerate: list = []
     else:
         engine = "groq" if ctx.groq_api_key else "local"
-        full_raw_text, assembled_text, lost_marks, chunk_quality = _recognize_with_groq_cascade(
-            audio, dur, ctx)
-        degenerate = list(ctx.cloud_state.last_degenerate or [])
-        if 'local' in chunk_quality and 'cloud' not in chunk_quality and 'cloud_retry' not in chunk_quality:
-            engine = "local"
+        degenerate = []
+        remote_tried = False
+        # Удалённая ступень — быстрый путь: Groq заведомо недоступен (ключа нет
+        # или свежий блок — на Mac'е у Егора это гео-блок 403 навсегда) →
+        # не жечь минуты на локальной модели, спросить каскад на сервере.
+        if ctx.remote_asr_url and (not ctx.groq_api_key or ctx.cloud_state.is_blocked):
+            remote_tried = True
+            remote_text = transcribe_remote(audio, dur, ctx)
+            if remote_text:
+                full_raw_text = assembled_text = remote_text
+                engine, lost_marks, chunk_quality = "remote", [], ['remote']
+        if not full_raw_text:
+            full_raw_text, assembled_text, lost_marks, chunk_quality = _recognize_with_groq_cascade(
+                audio, dur, ctx)
+            degenerate = list(ctx.cloud_state.last_degenerate or [])
+            if 'local' in chunk_quality and 'cloud' not in chunk_quality and 'cloud_retry' not in chunk_quality:
+                engine = "local"
+            # Спасательный путь: каскад кончился пустотой или целиком локальной
+            # моделью → последний облачный шанс — мост (там Deepgram и Groq живы).
+            if ctx.remote_asr_url and not remote_tried and (not full_raw_text or engine == "local"):
+                remote_text = transcribe_remote(audio, dur, ctx)
+                if remote_text:
+                    full_raw_text = assembled_text = remote_text
+                    engine, lost_marks, chunk_quality, degenerate = "remote", [], ['remote'], []
 
     if not full_raw_text:
         return RecognitionResult(text="", engine="", assembled_text="", lost_marks=lost_marks,

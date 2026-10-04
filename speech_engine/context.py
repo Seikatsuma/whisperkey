@@ -29,6 +29,8 @@ class Context:
     sample_rate: int = 16000
     groq_api_key: str = ""
     deepgram_api_key: str = ""
+    remote_asr_url: str = ""     # мост на серверный каскад (http_bridge), пусто = ступени нет
+    remote_asr_token: str = ""   # X-Bridge-Token, если мост выставлен наружу
     local_model: object = None   # faster_whisper.WhisperModel-подобный объект или None
     session: requests.Session = field(default_factory=requests.Session)
     cloud_state: CloudState = field(default_factory=CloudState)
