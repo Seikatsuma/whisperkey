@@ -273,6 +273,16 @@ PREROLL_IDLE_TIMEOUT = 90.0
 _PREROLL_BLOCKS = max(1, int(PREROLL_SECONDS * SAMPLE_RATE / 512))
 preroll_buffer: deque = deque(maxlen=_PREROLL_BLOCKS)
 TRIGGER_DEBOUNCE_SEC = 0.35
+# «Залипание» двойным касанием — как у Wispr Flow: тап-тап Option включает
+# запись без удержания (диктовка идёт, руки свободны), следующее нажатие её
+# завершает. Обычный «нажал-держи-говори» не меняется.
+LATCH_WINDOW_SEC = 0.30    # окно второго касания после отпускания (~300 мс у Wispr)
+LATCH_MIN_GAP_SEC = 0.06   # быстрее — дребезг клавиши, не намеренное касание
+LATCH_MAX_SEC = 900        # потолок залипшей записи — страховка от «забыл включённым»
+latch_active = False       # запись «залипла»: следующее нажатие завершит её
+_latch_deadline = 0.0      # до этого момента отпускание ещё ждёт второго касания
+_last_release_ts = 0.0     # время отпускания — от него считается окно касания
+_release_seq = 0           # поколение отпускания; отменяет просроченный финализ
 session_counter = 0
 state_lock = threading.Lock()
 session_phase = "idle"   # idle -> recording -> processing
@@ -1074,10 +1084,113 @@ def is_trigger(key):
     except: pass
     return False
 
+def _begin_stop():
+    """Финализ записи — общий для двух путей: истекло окно двойного касания
+    (обычный «нажал-отпустил») либо при залипании пришло завершающее нажатие."""
+    global is_recording, processing, session_phase
+    with state_lock:
+        if session_phase != "recording":
+            return
+        current_session_id = active_session_id
+        session_phase = "processing"
+        # Хвост ещё секунду пишется, но человек клавишу уже отпустил —
+        # плашка сразу переходит в «распознаю», как у Wispr.
+        pill.set_state("processing")
+    # CEO Fix: Задержка для захвата хвоста
+    def delayed_stop():
+        # global обязателен для ВСЕХ трёх имён. У session_phase его не было:
+        # объявление в on_release на вложенную функцию не распространяется,
+        # поэтому "idle" ниже писалось в ЛОКАЛЬНУЮ переменную, а модульная
+        # фаза навсегда оставалась "processing" — и on_press с этого момента
+        # выходил по первой же проверке. Итог: одно случайное короткое
+        # касание правого Option намертво выключало диктовку до перезапуска.
+        global is_recording, processing, session_phase
+        time.sleep(TAIL_CAPTURE_SECONDS)
+        is_recording = False
+        # При включённой предзаписи поток остаётся открытым — иначе следующее
+        # нажатие снова начнётся с холодного старта и срежет первое слово.
+        if not PREROLL_ENABLED:
+            stop_audio_stream()
+
+        audio_snapshot = list(recording_data)
+        if len(audio_snapshot) < 10:
+            print("[skip] Слишком коротко")
+            notify("WhisperKey", "⚠️ Слишком короткая запись")
+            processing = False
+            with state_lock:
+                if active_session_id == current_session_id:
+                    session_phase = "idle"
+                    pill.set_state("idle")
+            schedule_idle_close()
+            return
+
+        if not pill.active:
+            notify("WhisperKey", "⏹ Распознаю...")
+        print(f"[rec] Остановлена (хвост захвачен)")
+        threading.Thread(target=process_audio, args=(audio_snapshot, current_session_id), daemon=True).start()
+
+    processing = True
+    threading.Thread(target=delayed_stop, daemon=True).start()
+
+
+def _latch_window_then_stop(seq: int) -> None:
+    """Отпускание ждёт окно двойного касания. Второе касание в этом окне обнуляет
+    дедлайн — поток просто выходит, а запись продолжается без удержания."""
+    global _latch_deadline
+    deadline = _latch_deadline
+    time.sleep(max(0.0, deadline - time.time()))
+    with state_lock:
+        if seq != _release_seq or _latch_deadline == 0.0:
+            return
+        _latch_deadline = 0.0
+    _begin_stop()
+
+
+def _latch_watchdog(sid: int) -> None:
+    """Страховка от «забыл залипшую запись включённой»: по потолку — обычный стоп."""
+    time.sleep(LATCH_MAX_SEC)
+    with state_lock:
+        armed = latch_active and session_phase == "recording" and active_session_id == sid
+    if armed:
+        print(f"[rec] Залипание: потолок {LATCH_MAX_SEC // 60} мин — останавливаю")
+        _begin_stop()
+
+
 def on_press(key):
     global is_recording, recording_data, processing, trigger_held, last_trigger_ts, session_counter, active_session_id, session_phase
+    global latch_active, _latch_deadline
     now = time.time()
     if is_trigger(key) and not trigger_held:
+        # Сначала — режимы, которые не стартуют новую запись и потому идут до
+        # дебаунса: быстрый тап-тап (в пределах 350 мс) иначе съедается им целиком.
+        with state_lock:
+            if latch_active:
+                # «Залипшая» диктовка заканчивается нажатием — как одиночное
+                # касание у Wispr, а не отпусканием.
+                latch_active = False
+                trigger_held = True
+                end_by_press = True
+            else:
+                end_by_press = False
+            if (not end_by_press and session_phase == "recording"
+                    and now < _latch_deadline
+                    and now - _last_release_ts >= LATCH_MIN_GAP_SEC):
+                # Второе касание в окне после отпускания — запись «залипает».
+                latch_active = True
+                _latch_deadline = 0.0
+                trigger_held = True
+                last_trigger_ts = now
+                armed_sid = active_session_id
+                armed = True
+            else:
+                armed = False
+        if end_by_press:
+            _begin_stop()
+            return
+        if armed:
+            print("[rec] Залипание: запись без удержания — Option завершит")
+            threading.Thread(target=_latch_watchdog, args=(armed_sid,), daemon=True).start()
+            return
         if now - last_trigger_ts < TRIGGER_DEBOUNCE_SEC:
             return
         with state_lock:
@@ -1140,53 +1253,25 @@ def on_press(key):
                 pill.set_state("error")
 
 def on_release(key):
-    global is_recording, processing, trigger_held, session_counter, session_phase
+    global is_recording, processing, trigger_held, session_counter, session_phase, _latch_deadline, _last_release_ts, _release_seq
     if is_trigger(key):
         trigger_held = False
-    if is_trigger(key) and is_recording:
+        if latch_active or not is_recording:
+            # Залипшая запись заканчивается нажатием (в on_press), отпускание
+            # здесь просто игнорируется — как у Wispr.
+            return
         with state_lock:
             if session_phase != "recording":
                 return
-            current_session_id = active_session_id
-            session_phase = "processing"
-            # Хвост ещё секунду пишется, но человек клавишу уже отпустил —
-            # плашка сразу переходит в «распознаю», как у Wispr.
-            pill.set_state("processing")
-        # CEO Fix: Задержка для захвата хвоста
-        def delayed_stop():
-            # global обязателен для ВСЕХ трёх имён. У session_phase его не было:
-            # объявление в on_release на вложенную функцию не распространяется,
-            # поэтому "idle" ниже писалось в ЛОКАЛЬНУЮ переменную, а модульная
-            # фаза навсегда оставалась "processing" — и on_press с этого момента
-            # выходил по первой же проверке. Итог: одно случайное короткое
-            # касание правого Option намертво выключало диктовку до перезапуска.
-            global is_recording, processing, session_phase
-            time.sleep(TAIL_CAPTURE_SECONDS)
-            is_recording = False
-            # При включённой предзаписи поток остаётся открытым — иначе следующее
-            # нажатие снова начнётся с холодного старта и срежет первое слово.
-            if not PREROLL_ENABLED:
-                stop_audio_stream()
-
-            audio_snapshot = list(recording_data)
-            if len(audio_snapshot) < 10:
-                print("[skip] Слишком коротко")
-                notify("WhisperKey", "⚠️ Слишком короткая запись")
-                processing = False
-                with state_lock:
-                    if active_session_id == current_session_id:
-                        session_phase = "idle"
-                        pill.set_state("idle")
-                schedule_idle_close()
-                return
-
-            if not pill.active:
-                notify("WhisperKey", "⏹ Распознаю...")
-            print(f"[rec] Остановлена (хвост захвачен)")
-            threading.Thread(target=process_audio, args=(audio_snapshot, current_session_id), daemon=True).start()
-
-        processing = True
-        threading.Thread(target=delayed_stop, daemon=True).start()
+            # Отпускание не финализирует мгновенно: открывается окно второго
+            # касания. Захват при этом не прерывается — пришедшее в окне касание
+            # «залипнет» без разрыва звука и без мигания плашки, а не пришедшее —
+            # отпустит запись в обычный финализ через _begin_stop.
+            _last_release_ts = time.time()
+            _latch_deadline = _last_release_ts + LATCH_WINDOW_SEC
+            _release_seq += 1
+            seq = _release_seq
+        threading.Thread(target=_latch_window_then_stop, args=(seq,), daemon=True).start()
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
