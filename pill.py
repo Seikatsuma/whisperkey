@@ -61,8 +61,8 @@ BAR_LIVE = (1.0, 1.0, 1.0, 1.0)      # микрофон слушает
 BAR_DIM = (1.0, 1.0, 1.0, 0.4)       # волна «уснула» (обработка, ошибка)
 WAVE_KEYFRAMES = ((0.0, 1.0), (0.2, 1.2), (0.4, 1.5), (0.8, 1.1), (0.9, 1.3), (1.0, 1.0))
 WAVE_PERIOD = 1.0
-LEVEL_GAIN = 5.0                     # --audio-scale = max(1, 5 × уровень)
-LEVEL_SMOOTH = 0.85                  # сглаживание уровня на кадр (60 кадров/с)
+LEVEL_GAIN = 7.0                     # --audio-scale = max(1, 7 × уровень)
+LEVEL_SMOOTH = 0.78                  # сглаживание уровня на кадр (60 кадров/с)
 
 SPIN_TICKS = 8
 SPIN_R = 6.0
@@ -76,10 +76,14 @@ SPIN_BOX = 16.0
 PROCESSING_GAP = 6.0                 # между волной и спиннером
 WAVE_PAD_X = 4.0                     # внутренние поля блока волны
 
-# Громкость микрофона → 0..1. Тишина комнаты (−50 дБ и тише) — точки,
-# обычная речь (−30…−20 дБ) — половина-три четверти размаха, крик (−10 дБ) — предел.
+# Громкость микрофона → 0..1. Тишина комнаты (≈−44 дБ и тише) — точки,
+# обычная речь (−30…−20 дБ) — почти весь размах, крик (−10 дБ) — предел.
+# Замер на корпусе диктовок Егора (04.10.26, 40 файлов): медиана −22 дБ,
+# тихие фразы −38 дБ, паузы до −45 дБ — окно и порог подобраны под это.
 LEVEL_FLOOR_DB = -50.0
 LEVEL_CEIL_DB = -10.0
+LEVEL_GATE = 0.15                    # raw ниже ≈−44 дБ — тишина: точки, без дрожания
+LEVEL_GAMMA = 0.55                   # усиление середины: тихая речь тоже заметна
 
 
 def _bezier(p1x: float, p1y: float, p2x: float, p2y: float, x: float) -> float:
@@ -126,7 +130,9 @@ def level_from_rms(rms: float) -> float:
     if rms <= 0.0:
         return 0.0
     db = 20.0 * math.log10(rms)
-    return min(1.0, max(0.0, (db - LEVEL_FLOOR_DB) / (LEVEL_CEIL_DB - LEVEL_FLOOR_DB)))
+    raw = min(1.0, max(0.0, (db - LEVEL_FLOOR_DB) / (LEVEL_CEIL_DB - LEVEL_FLOOR_DB)))
+    gated = max(0.0, (raw - LEVEL_GATE) / (1.0 - LEVEL_GATE))
+    return gated ** LEVEL_GAMMA
 
 
 class PillModel:
