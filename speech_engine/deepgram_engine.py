@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 
 import requests
 
-from .audio import create_audio_wav
+from .audio import create_upload_audio
 from .profiles import Profile
 
 logger = logging.getLogger("speech_engine.deepgram")
@@ -51,22 +51,26 @@ def transcribe_deepgram(audio_data, *, api_key: str, profile: Profile, sample_ra
                    state.last_reason or "?", state.blocked_until - time.time())
         return None
 
-    wav_data = create_audio_wav(audio_data, sample_rate, tempo=profile.asr_tempo)
-    if not wav_data:
+    upload = create_upload_audio(audio_data, sample_rate, tempo=profile.asr_tempo)
+    if not upload:
         return None
+    payload, _filename, mime = upload
 
     headers = {
         "Authorization": f"Token {api_key}",
-        "Content-Type": "audio/wav",
+        "Content-Type": mime,
     }
     http = session or requests
 
     t0 = time.time()
     for attempt in range(profile.deepgram_retries):
         try:
+            # timeout=(подключение, чтение): недоступный хост раньше держал
+            # целиком deepgram_timeout до каждого ухода на следующую ступень —
+            # на медленной сети это был основной источник «долго думает».
             response = http.post(
                 DEEPGRAM_URL, params=profile.deepgram_params, headers=headers,
-                data=wav_data, timeout=profile.deepgram_timeout,
+                data=payload, timeout=(5.0, profile.deepgram_timeout),
             )
 
             if response.status_code == 200:

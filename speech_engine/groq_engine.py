@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 
 import requests
 
-from .audio import create_audio_wav, restore_timeline
+from .audio import create_upload_audio, restore_timeline
 from .density_gate import text_from_response
 from .profiles import Profile
 
@@ -132,16 +132,17 @@ def transcribe_groq(audio_data, *, api_key: str, profile: Profile, sample_rate: 
     if not api_key:
         return empty
 
-    wav_data = create_audio_wav(audio_data, sample_rate, tempo=profile.asr_tempo)
-    if not wav_data:
+    upload = create_upload_audio(audio_data, sample_rate, tempo=profile.asr_tempo)
+    if not upload:
         return empty
+    payload, up_name, up_mime = upload
 
     headers = {
         'Authorization': f'Bearer {api_key}',
         'User-Agent': _USER_AGENT,
         'Accept': 'application/json',
     }
-    files = {'file': ('audio.wav', io.BytesIO(wav_data), 'audio/wav')}
+    files = {'file': (up_name, io.BytesIO(payload), up_mime)}
     data = [
         ('model', profile.groq_model),
         ('language', profile.groq_language),
@@ -157,8 +158,10 @@ def transcribe_groq(audio_data, *, api_key: str, profile: Profile, sample_rate: 
     for attempt in range(4):
         try:
             throttle.wait()
+            # timeout=(подключение, чтение): connect-ветка раньше могла держать
+            # целиком 60с до каждой попытки — на мёртвом хосте это был ступор.
             response = session.post(GROQ_TRANSCRIBE_URL, headers=headers, files=files,
-                                    data=data, timeout=60)
+                                    data=data, timeout=(5.0, 60.0))
 
             if response.status_code == 200:
                 result = response.json()
@@ -188,7 +191,7 @@ def transcribe_groq(audio_data, *, api_key: str, profile: Profile, sample_rate: 
                 logger.info("groq: %s, повтор через %.1fс (попытка %d из 4)",
                            response.status_code, wait, attempt + 2)
                 time.sleep(wait)
-                files = {'file': ('audio.wav', io.BytesIO(wav_data), 'audio/wav')}
+                files = {'file': (up_name, io.BytesIO(payload), up_mime)}
                 continue
 
             logger.warning("groq: статус %s, отказ", response.status_code)
@@ -198,7 +201,7 @@ def transcribe_groq(audio_data, *, api_key: str, profile: Profile, sample_rate: 
             logger.warning("groq: исключение %s", type(e).__name__)
             if allow_retry and attempt < 3:
                 time.sleep(2 ** attempt)
-                files = {'file': ('audio.wav', io.BytesIO(wav_data), 'audio/wav')}
+                files = {'file': (up_name, io.BytesIO(payload), up_mime)}
                 continue
             return empty
 

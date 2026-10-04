@@ -61,3 +61,64 @@ def create_audio_wav(audio_data: np.ndarray, sample_rate: int, tempo: float = 1.
         return wav_io.getvalue()
     except Exception:
         return None
+
+
+def _encode_flac(pcm_int16: np.ndarray, sample_rate: int) -> bytes | None:
+    """FLAC-кодирование через PyAV (пакет `av`). Он уже стоит у пользователя
+    как зависимость faster-whisper — отдельной установки не требует, что
+    важно: обновление WhisperKey приезжает git pull'ом без pip install.
+    Любая ошибка или отсутствие пакета → None (вызывающий код уходит на WAV)."""
+    try:
+        import av
+    except ImportError:
+        return None
+    try:
+        buf = io.BytesIO()
+        with av.open(buf, mode="w", format="flac") as out:
+            stream = out.add_stream("flac", rate=sample_rate)
+            stream.layout = "mono"
+            frame = av.AudioFrame.from_ndarray(
+                pcm_int16.reshape(1, -1), format="s16", layout="mono")
+            frame.sample_rate = sample_rate
+            for packet in stream.encode(frame):
+                out.mux(packet)
+            for packet in stream.encode(None):
+                out.mux(packet)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def create_upload_audio(audio_data, sample_rate: int, tempo: float = 1.0):
+    """Звук для отправки в облако. Возвращает (payload, filename, mime) или None.
+
+    Предпочитает FLAC: сжатие БЕЗ потерь, распаковывается в тот же PCM бит-в-бит
+    (проверено 04.10.26 на диктовке 159.8с из корпуса: контрольная сумма
+    расжатого совпала с исходным WAV, 5.11 МБ → 3.13 МБ). Качество не может
+    просесть по построению — в отличие от Opus/MP3, где потеря возможна на
+    низком битрейте. Меньше файл → короче отправка на домашнем канале
+    (сервер шлёт за доли секунды, домашний аплинк — секунды) и короче окно,
+    когда аплоад забивает канал под завязку и «падает интернет».
+
+    PyAV отсутствует или кодирование упало — прежний WAV, поведение как раньше.
+    """
+    try:
+        audio_data = np.asarray(audio_data, dtype=np.float32)
+        if tempo != 1.0:
+            audio_data = change_tempo(audio_data, tempo)
+        audio_data = np.clip(audio_data, -1.0, 1.0)
+        pcm = (audio_data * 32767).astype(np.int16)
+
+        flac = _encode_flac(pcm, sample_rate)
+        if flac:
+            return flac, "audio.flac", "audio/flac"
+
+        wav_io = io.BytesIO()
+        with wave.open(wav_io, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm.tobytes())
+        return wav_io.getvalue(), "audio.wav", "audio/wav"
+    except Exception:
+        return None
