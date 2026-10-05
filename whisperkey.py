@@ -1273,6 +1273,7 @@ def on_press(key):
             session_counter += 1
             active_session_id = session_counter
             session_phase = "recording"
+            _tlog("  → старт записи")
             try:
                 if PREROLL_ENABLED:
                     cancel_idle_close()
@@ -1326,6 +1327,9 @@ def on_press(key):
 
 def on_release(key):
     global is_recording, processing, trigger_held, session_counter, session_phase, _latch_deadline, _last_release_ts, _release_seq
+    if _fam(key):
+        _tlog(f"R {key} trig={is_trigger(key)} latch={int(latch_active)} "
+              f"rec={int(is_recording)} ph={session_phase}")
     if is_trigger(key):
         trigger_held = False
         if latch_active or not is_recording:
@@ -1344,8 +1348,10 @@ def on_release(key):
             seq = _release_seq
             hold = _last_release_ts - last_trigger_ts
             if hold >= LATCH_TAP_MAX_SEC:
+                _tlog(f"  → стоп сразу (держали {hold:.3f} с)")
                 finalize_now = True
             else:
+                _tlog(f"  → окно залипания {LATCH_WINDOW_SEC} с (тап {hold:.3f} с)")
                 _latch_deadline = _last_release_ts + LATCH_WINDOW_SEC
                 finalize_now = False
                 print(f"[rec] тап {int(hold * 1000)} мс — жду второе касание "
@@ -1474,6 +1480,15 @@ def main():
 
     print("Готов! Зажми ПРАВЫЙ OPTION для записи.")
     notify("WhisperKey", "Готов к работе!")
+
+    try:
+        ver = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        ver = "nogit"
+    _tlog(f"=== запуск, сборка {ver} ===")
 
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.start()

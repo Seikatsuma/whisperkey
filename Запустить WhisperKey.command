@@ -157,7 +157,8 @@ if [ -z "${WHISPERKEY_NO_TUNNEL:-}" ]; then
   TUNNEL_PID=$!
   echo "$TUNNEL_PID" > "$TUNNEL_PID_FILE"
   sleep 2
-  if curl -sm 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:8092/health 2>/dev/null | grep -q 200; then
+  # ?v=<commit> — в журнале моста видно, какая сборка у тебя запустилась.
+  if curl -sm 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8092/health?v=${AFTER:-nogit}" 2>/dev/null | grep -q 200; then
     export REMOTE_ASR_URL="http://127.0.0.1:8092/audio/transcriptions"
     echo "Серверный мост: подключён — резерв распознавания через сервер"
   else
