@@ -168,4 +168,16 @@ if [ -z "${WHISPERKEY_NO_TUNNEL:-}" ]; then
   fi
 fi
 
+# Старая копия whisperkey.py могла остаться висеть от прошлого запуска (окно
+# Терминала открыто, процесс жив): два процесса слушают Option параллельно, и
+# старая логика реагирует на события рядом с новой — отсюда «записал и сразу
+# распознал» при живом тап-тап. Гасим её до старта — строго процессы
+# «python… whisperkey.py», лаунчер и соседние программы не задеваем.
+PIDS="$(pgrep -f 'python.*whisperkey\.py' 2>/dev/null)"
+if [ -n "$PIDS" ]; then
+  echo "Найдена старая копия WhisperKey (PID $(echo $PIDS | tr '\n' ' ')) — гашу, чтобы не было двух слушателей"
+  kill $PIDS 2>/dev/null
+  sleep 1
+fi
+
 exec "$PY" whisperkey.py
