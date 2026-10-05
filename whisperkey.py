@@ -1192,6 +1192,7 @@ def _latch_window_then_stop(seq: int) -> None:
         if seq != _release_seq or _latch_deadline == 0.0:
             return
         _latch_deadline = 0.0
+    _tlog("  → окно истекло, стоп")
     _begin_stop()
 
 
@@ -1202,17 +1203,33 @@ def _latch_watchdog(sid: int) -> None:
         armed = latch_active and session_phase == "recording" and active_session_id == sid
     if armed:
         print(f"[rec] Залипание: потолок {LATCH_MAX_SEC // 60} мин — останавливаю")
+        _tlog("  → сторож 15 мин, стоп")
         _begin_stop()
 
 
 def on_press(key):
     global is_recording, recording_data, processing, trigger_held, last_trigger_ts, session_counter, active_session_id, session_phase
-    global latch_active, _latch_deadline, _latch_started_ts
+    global latch_active, _latch_deadline, _latch_started_ts, _last_release_ts, _release_seq
     now = time.time()
     if _fam(key):
         _tlog(f"P {key} trig={is_trigger(key)} held={trigger_held} ph={session_phase} "
               f"latch={int(latch_active)} win={_latch_deadline - now:+.3f} "
               f"postRel={now - _last_release_ts:.3f}")
+    if is_trigger(key) and trigger_held and session_phase == "recording":
+        # Нажатие при «ещё нажатой» клавише: физически её успели отпустить,
+        # иначе press не пришёл бы — значит, событие отпускания потерялось по
+        # дороге (macOS может сливать быстрые переключения модификатора).
+        # Считаем отпускание случившимся прямо перед нажатием — дальше общий
+        # путь второго касания: окно залипания уже открыто.
+        _tlog("  → press при held: отпускание потерялось, считаю случившимся")
+        trigger_held = False
+        with state_lock:
+            if _last_release_ts < now - 2 * LATCH_MIN_GAP_SEC:
+                # Отступ 2× с запасом: вычитание в плавающей точке на рубеже
+                # ровно LATCH_MIN_GAP_SEC даёт значение чуть меньше порога.
+                _last_release_ts = now - 2 * LATCH_MIN_GAP_SEC
+            _release_seq += 1
+            _latch_deadline = now + LATCH_WINDOW_SEC
     if is_trigger(key) and not trigger_held:
         # Сначала — режимы, которые не стартуют новую запись и потому идут до
         # дебаунса: второй тап приходит раньше дебаунс-порога и съедается им.
