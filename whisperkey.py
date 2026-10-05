@@ -1101,6 +1101,8 @@ def _tlog(msg):
 def _fam(key):
     """Option-семейство для журнала: правый/левый/alt_gr и vk 58/61/62 — если
     второе касание приходит другим кодом, в журнале это будет видно."""
+    if key is None:
+        return False
     try:
         if getattr(key, "vk", None) in (58, 61, 62):
             return True
@@ -1224,12 +1226,14 @@ def on_press(key):
         _tlog("  → press при held: отпускание потерялось, считаю случившимся")
         trigger_held = False
         with state_lock:
-            if _last_release_ts < now - 2 * LATCH_MIN_GAP_SEC:
-                # Отступ 2× с запасом: вычитание в плавающей точке на рубеже
-                # ровно LATCH_MIN_GAP_SEC даёт значение чуть меньше порога.
-                _last_release_ts = now - 2 * LATCH_MIN_GAP_SEC
+            # Отступ 2× с запасом: вычитание в плавающей точке на рубеже
+            # ровно LATCH_MIN_GAP_SEC даёт значение чуть меньше порога.
+            _last_release_ts = now - 2 * LATCH_MIN_GAP_SEC
             _release_seq += 1
-            _latch_deadline = now + LATCH_WINDOW_SEC
+            if not latch_active:
+                # Дедлайн только когда залипание ещё не включено — иначе
+                # протухшее окно переживёт эту запись и ложно поймает следующий тап.
+                _latch_deadline = now + LATCH_WINDOW_SEC
     if is_trigger(key) and not trigger_held:
         # Сначала — режимы, которые не стартуют новую запись и потому идут до
         # дебаунса: второй тап приходит раньше дебаунс-порога и съедается им.
