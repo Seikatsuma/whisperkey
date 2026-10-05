@@ -42,6 +42,7 @@ from speech_engine import density_gate as se_density_gate
 from speech_engine import audio as se_audio
 from speech_engine import terms as se_terms
 from speech_engine import transfer as se_transfer
+from speech_engine import watermarks as se_watermarks
 
 DICTATION = speech_engine.DICTATION
 
@@ -741,6 +742,34 @@ def test_markers_have_no_plain_words():
     forbidden = {"корректор", "продолжение следует", "конец"}
     found = [m for m in M["BOH_TAIL_MARKERS"] if m.lower() in forbidden]
     check("Т2 нет обычных слов в маркерах", not found, f"найдено: {found}")
+
+
+def test_boilerplate_only():
+    """boilerplate_only: пустая диктовка глушится, живая фраза с заглушкой остаётся."""
+    only = se_watermarks.boilerplate_only
+
+    # Тишина/шум → субтитровые заглушки — подавляются.
+    for t in ("Продолжение следует...",
+              "Продолжение следует... Продолжение следует...",
+              "продолжение следует",
+              "Спасибо за просмотр!",
+              "Подписывайтесь на канал.",
+              "The End.",
+              "(музыка)",
+              "[аплодисменты]",
+              "(смех) (аплодисменты)"):
+        check(f"Т14 заглушка глушится: {t!r}", only(t) is True, "")
+
+    # Пустое и почти пустое — тоже «вставлять нечего».
+    for t in ("", None, "   ", "..."):
+        check(f"Т14 пустое глушится: {t!r}", only(t) is True, "")
+
+    # Живая речь остаётся — даже содержащая заглушечную фразу.
+    for t in ("задача сложная, но продолжение следует",
+              "поговорим об этом позже, продолжение следует",
+              "да", "нет", "спасибо за внимание к деталям проекта",
+              "музыка", "конец"):
+        check(f"Т14 живая фраза остаётся: {t!r}", only(t) is False, "")
 
 
 def main():

@@ -129,6 +129,11 @@ TAIL_CAPTURE_SECONDS = 1.0  # Захват хвоста после отпуск�
 # звук, и то, что не попало в файл, в нём отсутствует у всех одинаково.
 # Проверка — на калибровочном тексте, где известно, что было сказано.
 RESTORE_CLIPBOARD = True
+
+# Гейт тишины: пик RMS записи ниже этого уровня — речи не было (случайное
+# касание, шум вентилятора). Стоит между полом комнаты (~-50 дБ) и самой
+# тихой речью в корпусе (-38 дБ), поэтому настоящие тихие слова не режет.
+SILENCE_GATE_DB = -45.0
 SAVE_DEBUG_AUDIO = False  # Speed: без записи WAV на диск (качество 5/5)
 
 # Промпт задаёт модели ТОЛЬКО образец пунктуации — ни темы, ни терминов, ни имён
@@ -968,6 +973,19 @@ def process_audio(audio_snapshot: list, session_id: int):
         dur = len(audio) / SAMPLE_RATE
         if dur < 0.5: return
 
+        # Тишина/чистый шум до ASR: случайное нажатие не едет на распознавание
+        # и не оставляет ни текста, ни уведомления. Пик по фреймам, не среднее:
+        # речь всплесками, а щелчок клавиши — один сэмпл — гейт не открывает.
+        n_frames = len(audio) // 512
+        if n_frames:
+            peak_rms = float(np.sqrt(
+                (audio[: n_frames * 512].reshape(n_frames, 512) ** 2).mean(axis=1)
+            ).max())
+            if peak_rms < 10.0 ** (SILENCE_GATE_DB / 20.0):
+                peak_db = 20.0 * np.log10(peak_rms + 1e-9)
+                print(f"[skip] тишина {dur:.1f}s, пик {peak_db:.0f} дБ — молча")
+                return
+
         schedule_eval_sample_collect(audio, dur, session_id)
 
         print(f"[rec] {dur:.1f}s → распознаю...")
@@ -1022,6 +1040,15 @@ def process_audio(audio_snapshot: list, session_id: int):
         artifacts_removed.clear()
         text = clean_noise(text)
         text = smart_grammar_fix(text)
+
+        # Весь результат — субтитровая заглушка Whisper («Продолжение следует…»)
+        # или пуст после чистки: на тишине/шуме модель так рисует «речь».
+        # Молча гасим — ни вставки, ни баннера. Внутри живой фразы эти слова
+        # не трогаем (boilerplate_only проверяет только текст целиком).
+        if speech_engine.watermarks.boilerplate_only(text):
+            finalize_eval_sample_meta(session_id, dur, full_raw_text, "")
+            print(f"[skip] только заглушка ASR: '{text[:60]}' — молча")
+            return
 
         if text and len(text) > 1:
             text = apply_smart_sentence_ending(text)
@@ -1168,8 +1195,12 @@ def _begin_stop():
 
         audio_snapshot = list(recording_data)
         if len(audio_snapshot) < 10:
-            print("[skip] Слишком коротко")
-            notify("WhisperKey", "⚠️ Слишком короткая запись")
+            # 0 фреймов — поток микрофона мёртв: поломка, её надо видеть.
+            # 1-9 фреймов — случайное касание: глушим молча, как у Wispr —
+            # пустая диктовка не оставляет ни текста, ни уведомления.
+            print(f"[skip] Слишком коротко ({len(audio_snapshot)} фреймов)")
+            if not audio_snapshot:
+                notify("WhisperKey", "⚠️ Слишком короткая запись")
             processing = False
             with state_lock:
                 if active_session_id == current_session_id:
