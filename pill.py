@@ -62,7 +62,8 @@ BAR_DIM = (1.0, 1.0, 1.0, 0.4)       # волна «уснула» (обрабо
 WAVE_KEYFRAMES = ((0.0, 1.0), (0.2, 1.2), (0.4, 1.5), (0.8, 1.1), (0.9, 1.3), (1.0, 1.0))
 WAVE_PERIOD = 1.0
 LEVEL_GAIN = 8.4                     # --audio-scale = max(1, 8.4 × уровень); +20% по просьбе 05.10.26
-LEVEL_SMOOTH = 0.86                  # сглаживание уровня на кадр (60 кадров/с); ↑ 05.10 — волна спокойнее
+LEVEL_SMOOTH = 0.86                  # спад уровня — вниз плавно (60 кадров/с)
+LEVEL_ATTACK = 0.45                  # подъём уровня — вверх быстро: голос сразу виден
 
 SPIN_TICKS = 8
 SPIN_R = 6.0
@@ -82,8 +83,8 @@ WAVE_PAD_X = 4.0                     # внутренние поля блока 
 # тихие фразы −38 дБ, паузы до −45 дБ — окно и порог подобраны под это.
 LEVEL_FLOOR_DB = -50.0
 LEVEL_CEIL_DB = -10.0
-LEVEL_GATE = 0.15                    # raw ниже ≈−44 дБ — тишина: точки, без дрожания
-LEVEL_GAMMA = 0.55                   # усиление середины: тихая речь тоже заметна
+LEVEL_GATE = 0.10                    # raw ниже ≈−46 дБ — тишина: точки, без дрожания
+LEVEL_GAMMA = 0.50                   # усиление середины: тихая речь тоже заметна
 
 
 def _bezier(p1x: float, p1y: float, p2x: float, p2y: float, x: float) -> float:
@@ -200,11 +201,12 @@ class PillModel:
                 self.state = "idle"
                 self._since = now
 
-            # Сглаживание уровня привязано ко времени, а не к числу кадров:
-            # 0.85 на кадр при 60 кадрах/с, как в Wispr.
+            # Сглаживание привязано ко времени и асимметрично, как у VU-метра:
+            # голос появился — вверх быстро (LEVEL_ATTACK), пропал — вниз плавно
+            # (LEVEL_SMOOTH). Отсюда и чувствительность, и спокойствие картинки.
             dt = max(0.0, min(0.2, now - self._last_frame))
             self._last_frame = now
-            keep = LEVEL_SMOOTH ** (dt * 60.0)
+            keep = (LEVEL_ATTACK if self._raw_level > self._level else LEVEL_SMOOTH) ** (dt * 60.0)
             self._level = self._level * keep + self._raw_level * (1.0 - keep)
 
             shape = self._current_shape(now)

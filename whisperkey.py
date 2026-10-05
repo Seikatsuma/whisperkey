@@ -1086,6 +1086,29 @@ def process_audio(audio_snapshot: list, session_id: int):
 
 # ─── Обработка клавиш ─────────────────────────────────────────────────────────
 
+# Журнал событий Option — разбор «почему тап-тап не залип» на живом маке:
+# каждое нажатие/отпускание с миллисекундами и решением программы. Читается
+# командой: cat ~/.whisperkey_taps.log | tail -40
+LATCH_DEBUG_LOG = os.path.expanduser("~/.whisperkey_taps.log")
+
+def _tlog(msg):
+    try:
+        with open(LATCH_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%H:%M:%S')}.{int((time.time() % 1) * 1000):03d} {msg}\n")
+    except Exception:
+        pass
+
+def _fam(key):
+    """Option-семейство для журнала: правый/левый/alt_gr и vk 58/61/62 — если
+    второе касание приходит другим кодом, в журнале это будет видно."""
+    try:
+        if getattr(key, "vk", None) in (58, 61, 62):
+            return True
+        return key in (keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r,
+                       getattr(keyboard.Key, "alt_gr", None))
+    except Exception:
+        return False
+
 def is_trigger(key):
     if key == keyboard.Key.alt_r: return True
     try:
@@ -1186,6 +1209,10 @@ def on_press(key):
     global is_recording, recording_data, processing, trigger_held, last_trigger_ts, session_counter, active_session_id, session_phase
     global latch_active, _latch_deadline, _latch_started_ts
     now = time.time()
+    if _fam(key):
+        _tlog(f"P {key} trig={is_trigger(key)} held={trigger_held} ph={session_phase} "
+              f"latch={int(latch_active)} win={_latch_deadline - now:+.3f} "
+              f"postRel={now - _last_release_ts:.3f}")
     if is_trigger(key) and not trigger_held:
         # Сначала — режимы, которые не стартуют новую запись и потому идут до
         # дебаунса: второй тап приходит раньше дебаунс-порога и съедается им.
@@ -1221,20 +1248,25 @@ def on_press(key):
                     print(f"[rec] касание мимо окна залипания "
                           f"(после отпускания {int((now - _last_release_ts) * 1000)} мс, "
                           f"до конца окна {int((_latch_deadline - now) * 1000)} мс)")
+                    _tlog("  → касание мимо окна")
         if end_by_press:
+            _tlog("  → стоп залипания нажатием" + (" (отмена)" if cancel_by_press else ""))
             if cancel_by_press:
                 _cancel_recording()
             else:
                 _begin_stop()
             return
         if armed:
+            _tlog("  → LATCH")
             print("[rec] Залипание: запись без удержания — Option завершит")
             threading.Thread(target=_latch_watchdog, args=(armed_sid,), daemon=True).start()
             return
         if now - last_trigger_ts < TRIGGER_DEBOUNCE_SEC:
+            _tlog("  → дебаунс, пропуск")
             return
         with state_lock:
             if session_phase != "idle":
+                _tlog(f"  → пропуск, фаза {session_phase}")
                 return
             last_trigger_ts = now
             trigger_held = True
