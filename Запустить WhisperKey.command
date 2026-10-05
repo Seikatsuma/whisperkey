@@ -91,9 +91,23 @@ if [ -z "${WHISPERKEY_NO_UPDATE:-}" ] && [ ! -f ".no-update" ] && [ -d ".git" ];
         echo "Уже последняя версия."
       fi
     else
-      # Частые причины: нет сети, свои правки в папке, ключ SSH недоступен.
-      echo "Обновиться не вышло — работаю на текущей версии."
-      sed 's/^/   /' /tmp/whisperkey_update.log 2>/dev/null | head -3
+      # Мягкий pull не прошёл — чаще всего папка отвязалась (локальная правка
+      # отслеживаемого файла, разъехавшаяся история). Синхронизируем жёстко:
+      # reset --hard трогает ТОЛЬКО отслеживаемые файлы — .env и прочие
+      # неотслеживаемые (ключи, логи) переживают сброс. Если и это не помогло —
+      # причина видна в /tmp/whisperkey_update.log (нет сети, ключ SSH и т.п.).
+      echo "Мягкое обновление не прошло — синхронизирую с репозиторием принудительно."
+      if GIT_TERMINAL_PROMPT=0 \
+         GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new" \
+         git fetch origin --quiet 2>>/tmp/whisperkey_update.log && \
+         git reset --hard origin/main --quiet 2>>/tmp/whisperkey_update.log; then
+        AFTER="$(git rev-parse --short HEAD 2>/dev/null)"
+        echo "Обновлено: $BEFORE → $AFTER (принудительная синхронизация)"
+      else
+        echo "ОБНОВИТЬ НЕ УДАЛОСЬ — работаю на СТАРОЙ версии."
+        sed 's/^/   /' /tmp/whisperkey_update.log 2>/dev/null | head -3
+        osascript -e 'display notification "WhisperKey запустился на старой версии — обновление не прошло" with title "WhisperKey"' 2>/dev/null
+      fi
     fi
   fi
 elif [ ! -d ".git" ]; then
@@ -101,6 +115,7 @@ elif [ ! -d ".git" ]; then
   echo "Один раз выполни в Терминале, и дальше всё будет само:"
   echo "   git clone https://github.com/Seikatsuma/whisperkey.git ~/Desktop/WhisperKey"
   echo "   и перенеси в новую папку файл .env со своим ключом."
+  osascript -e 'display notification "WhisperKey запущен из папки без обновлений — нужна одна команда в Терминале" with title "WhisperKey"' 2>/dev/null
 fi
 
 export KMP_DUPLICATE_LIB_OK=TRUE
