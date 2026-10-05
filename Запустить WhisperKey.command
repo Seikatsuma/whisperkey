@@ -108,6 +108,9 @@ export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
 echo "WhisperKey — запуск из: $(pwd)"
+if [ -d ".git" ]; then
+  echo "Версия: $(git rev-parse --short HEAD 2>/dev/null) от $(git log -1 --format=%cd --date=format:'%d.%m %H:%M' 2>/dev/null)"
+fi
 
 # venv проекта, если он есть: без него не найдутся установленные зависимости.
 if [ -f "venv/bin/activate" ]; then
