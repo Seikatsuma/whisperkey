@@ -173,13 +173,16 @@ if [ -z "${WHISPERKEY_NO_TUNNEL:-}" ]; then
   echo "$TUNNEL_PID" > "$TUNNEL_PID_FILE"
   sleep 2
   # ?v=<commit> — в журнале моста видно, какая сборка у тебя запустилась.
-  if curl -sm 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8092/health?v=${AFTER:-nogit}" 2>/dev/null | grep -q 200; then
+  # Одна повторная проверка через 2 с: SSH-туннель иногда поднимается
+  # чуть дольше первого sleep, иначе мост глушится по вспышке.
+  if curl -sm 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8092/health?v=${AFTER:-nogit}" 2>/dev/null | grep -q 200 \
+     || { sleep 2; curl -sm 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8092/health?v=${AFTER:-nogit}" 2>/dev/null | grep -q 200; }; then
     export REMOTE_ASR_URL="http://127.0.0.1:8092/audio/transcriptions"
     echo "Серверный мост: подключён — резерв распознавания через сервер"
   else
     kill "$TUNNEL_PID" 2>/dev/null
     rm -f "$TUNNEL_PID_FILE"
-    echo "Серверный мост: не поднялся — работаю как раньше"
+    echo "Серверный мост: не поднялся — работаю как раньше (причина в /tmp/whisperkey_tunnel.log)"
   fi
 fi
 
