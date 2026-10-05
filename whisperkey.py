@@ -276,12 +276,18 @@ TRIGGER_DEBOUNCE_SEC = 0.35
 # «Залипание» двойным касанием — как у Wispr Flow: тап-тап Option включает
 # запись без удержания (диктовка идёт, руки свободны), следующее нажатие её
 # завершает. Обычный «нажал-держи-говори» не меняется.
-LATCH_WINDOW_SEC = 0.30    # окно второго касания после отпускания (~300 мс у Wispr)
+# Тайминги взяты дословно из документации Wispr (docs.wisprflow.ai):
+# второе нажатие засчитывается «within half a second of starting» — в течение
+# 0.5 с от НАЧАЛА записи (от первого нажатия, не от отпускания); третье быстрое
+# касание в те же 0.5 с после залипания отменяет диктовку вместо вставки.
+LATCH_DOUBLE_TAP_SEC = 0.5  # окно «тап-тап» — от начала записи, как у Wispr
 LATCH_MIN_GAP_SEC = 0.06   # быстрее — дребезг клавиши, не намеренное касание
+LATCH_CANCEL_SEC = 0.5     # нажатие в первые 0.5 с залипания — отмена без текста
 LATCH_MAX_SEC = 900        # потолок залипшей записи — страховка от «забыл включённым»
 latch_active = False       # запись «залипла»: следующее нажатие завершит её
-_latch_deadline = 0.0      # до этого момента отпускание ещё ждёт второго касания
-_last_release_ts = 0.0     # время отпускания — от него считается окно касания
+_latch_deadline = 0.0      # конец окна второго касания (= начало записи + 0.5 с)
+_latch_started_ts = 0.0    # когда залипание вступило — для окна отмены
+_last_release_ts = 0.0     # время отпускания — отсев дребезга клавиши
 _release_seq = 0           # поколение отпускания; отменяет просроченный финализ
 session_counter = 0
 state_lock = threading.Lock()
@@ -1084,6 +1090,23 @@ def is_trigger(key):
     except: pass
     return False
 
+def _cancel_recording():
+    """Отмена диктовки без распознавания — у Wispr третье быстрое касание в первые
+    полсекунды залипания «cancels instead of pasting». Запись просто глушится."""
+    global is_recording, session_phase
+    with state_lock:
+        if session_phase != "recording":
+            return
+        session_phase = "idle"
+    is_recording = False
+    recording_data.clear()
+    pill.set_state("idle")
+    print("[rec] Отменено быстрым третьим касанием")
+    if not pill.active:
+        notify("WhisperKey", "✖️ Диктовка отменена")
+    schedule_idle_close()
+
+
 def _begin_stop():
     """Финализ записи — общий для двух путей: истекло окно двойного касания
     (обычный «нажал-отпустил») либо при залипании пришло завершающее нажатие."""
@@ -1158,7 +1181,7 @@ def _latch_watchdog(sid: int) -> None:
 
 def on_press(key):
     global is_recording, recording_data, processing, trigger_held, last_trigger_ts, session_counter, active_session_id, session_phase
-    global latch_active, _latch_deadline
+    global latch_active, _latch_deadline, _latch_started_ts
     now = time.time()
     if is_trigger(key) and not trigger_held:
         # Сначала — режимы, которые не стартуют новую запись и потому идут до
@@ -1166,17 +1189,21 @@ def on_press(key):
         with state_lock:
             if latch_active:
                 # «Залипшая» диктовка заканчивается нажатием — как одиночное
-                # касание у Wispr, а не отпусканием.
+                # касание у Wispr, а не отпусканием. Но если нажатие пришло в
+                # первые 0.5 с залипания — это у Wispr отмена без вставки текста.
                 latch_active = False
                 trigger_held = True
                 end_by_press = True
+                cancel_by_press = (now - _latch_started_ts) < LATCH_CANCEL_SEC
             else:
                 end_by_press = False
+                cancel_by_press = False
             if (not end_by_press and session_phase == "recording"
                     and now < _latch_deadline
                     and now - _last_release_ts >= LATCH_MIN_GAP_SEC):
                 # Второе касание в окне после отпускания — запись «залипает».
                 latch_active = True
+                _latch_started_ts = now
                 _latch_deadline = 0.0
                 trigger_held = True
                 last_trigger_ts = now
@@ -1185,7 +1212,10 @@ def on_press(key):
             else:
                 armed = False
         if end_by_press:
-            _begin_stop()
+            if cancel_by_press:
+                _cancel_recording()
+            else:
+                _begin_stop()
             return
         if armed:
             print("[rec] Залипание: запись без удержания — Option завершит")
@@ -1263,15 +1293,24 @@ def on_release(key):
         with state_lock:
             if session_phase != "recording":
                 return
-            # Отпускание не финализирует мгновенно: открывается окно второго
-            # касания. Захват при этом не прерывается — пришедшее в окне касание
-            # «залипнет» без разрыва звука и без мигания плашки, а не пришедшее —
-            # отпустит запись в обычный финализ через _begin_stop.
+            # Окно двойного касания считается от НАЧАЛА записи (0.5 с, как у
+            # Wispr). Клавишу держали дольше — пара касаний уже не образуется и
+            # запись закрывается мгновенно, без всякой задержки; тап был короткий
+            # — ждём конца окна: пришедшее в нём касание «залипнет» без разрыва
+            # звука, а не пришедшее — отпустит запись в обычный финализ.
             _last_release_ts = time.time()
-            _latch_deadline = _last_release_ts + LATCH_WINDOW_SEC
+            deadline = last_trigger_ts + LATCH_DOUBLE_TAP_SEC
             _release_seq += 1
             seq = _release_seq
-        threading.Thread(target=_latch_window_then_stop, args=(seq,), daemon=True).start()
+            if _last_release_ts >= deadline:
+                finalize_now = True
+            else:
+                _latch_deadline = deadline
+                finalize_now = False
+        if finalize_now:
+            _begin_stop()
+        else:
+            threading.Thread(target=_latch_window_then_stop, args=(seq,), daemon=True).start()
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
