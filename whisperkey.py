@@ -1499,9 +1499,6 @@ def main():
         print(f"[FATAL] {e}")
         return
 
-    print("Готов! Зажми ПРАВЫЙ OPTION для записи.")
-    notify("WhisperKey", "Готов к работе!")
-
     try:
         ver = subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -1510,6 +1507,21 @@ def main():
     except Exception:
         ver = "nogit"
     _tlog(f"=== запуск, сборка {ver} ===")
+
+    # Версия — в health моста: в журнале voice-bridge на сервере видно, какая
+    # сборка реально стартовала. Работает и со старым лаунчером — главное,
+    # чтобы был жив туннель (REMOTE_ASR_URL ставится лаунчером ещё с 04.10).
+    if os.environ.get("REMOTE_ASR_URL"):
+        def _ping_bridge_version():
+            try:
+                http_session.get(os.environ["REMOTE_ASR_URL"].rsplit("/", 2)[0] + "/health",
+                                 params={"v": ver}, timeout=2)
+            except Exception:
+                pass
+        threading.Thread(target=_ping_bridge_version, daemon=True).start()
+
+    print("Готов! Зажми ПРАВЫЙ OPTION для записи.")
+    notify("WhisperKey", f"Готов к работе! (v{ver})")
 
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.start()
