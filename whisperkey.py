@@ -1077,15 +1077,18 @@ _AX_MENU_PASTE_SCRIPT = '''on run argv
     return "ERR"
 end run'''
 
-def _send_paste_via_menu(target_app: str) -> bool:
+def _send_paste_via_menu(target_app: str) -> tuple[bool, str]:
     if not target_app or not _IS_MAC:
-        return False
+        return False, "нет целевого приложения"
     try:
         r = subprocess.run(["/usr/bin/osascript", "-e", _AX_MENU_PASTE_SCRIPT,
                             target_app], capture_output=True, timeout=3, text=True)
-        return (r.stdout or "").strip() == "OK"
-    except Exception:
-        return False
+        if (r.stdout or "").strip() == "OK":
+            return True, ""
+        err = (r.stderr or "").strip()
+        return False, err or "меню «Вставить» не нашлось/не кликнулось"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 def _activate_app(name: str) -> bool:
     if not name:
@@ -1476,6 +1479,13 @@ def process_audio(audio_snapshot: list, session_id: int):
             print(f"\n--- ФИНАЛЬНЫЙ ТЕКСТ ---\n{text}\n-----------------------\n")
 
             last_text_context = text[-40:]
+            # Распознавание закончено — гасим спиннер сразу, до вставки.
+            # Иначе плашка крутит «загрузку» всё время опросов и добивок
+            # в direct_insert (~1 с), хотя работа для человека уже сделана
+            # (жалоба Егора 19.10.26: «плашка ещё загружается после текста»).
+            with state_lock:
+                if active_session_id == session_id:
+                    pill.set_state("idle")
             direct_insert(text + " ")
             finalize_eval_sample_meta(
                 session_id, dur, full_raw_text, text,
