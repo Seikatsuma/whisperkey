@@ -1230,8 +1230,16 @@ _BLIND_STRIKE_SCRIPT = '''on run argv
                             set mb to menu bar item m of menu bar 1
                             repeat with it in {"Paste", "Вставить"}
                                 try
-                                    click menu item it of menu 1 of mb
-                                    return "MENU"
+                                    set mi to menu item it of menu 1 of mb
+                                    if enabled of mi then
+                                        try
+                                            click mi
+                                        end try
+                                        -- Живой пункт нажали — это удар; код ошибки
+                                        -- клика может врать ПОСЛЕ вставки, добивка
+                                        -- клавишей даст дубль.
+                                        return "MENU"
+                                    end if
                                 end try
                             end repeat
                         end try
@@ -1299,9 +1307,11 @@ def _menu_paste_press(pid: int) -> bool:
                 _, en = _ax_get(it, "AXEnabled")
                 if en is False:
                     continue
-                perr = _AXAPI.AXUIElementPerformAction(it, "AXPress")
-                if perr == 0:
-                    return True
+                # Проба на ЖИВОМ пункте — сам удар, независимо от кода возврата:
+                # AXPress иногда отчитывается ошибкой ПОСЛЕ реального срабатывания,
+                # и добивка Cmd+V поверх давала дубль (скрин Егора 19.10.26).
+                _AXAPI.AXUIElementPerformAction(it, "AXPress")
+                return True
         return False
     except Exception:
         return False
@@ -1375,7 +1385,7 @@ def _is_browser(app: str) -> bool:
     a = (app or "").lower()
     return any(b in a for b in _JS_BROWSERS)
 
-_JS_INSERT_TEMPLATE = '''(function(){var t=decodeURIComponent(escape(window.atob("__B64__")));var el=document.activeElement;if(!el||el===document.body)return "NOFOCUS";var ce=el.isContentEditable===true;var fld=(el.tagName==="INPUT"||el.tagName==="TEXTAREA")&&typeof el.value==="string";if(!ce&&!fld)return "NOEL";var ok=false;try{ok=document.execCommand("insertText",false,t);}catch(e){}if(!ok&&typeof el.setRangeText==="function"){try{var s=el.selectionStart==null?0:el.selectionStart;var d=el.selectionEnd==null?s:el.selectionEnd;el.setRangeText(t,s,d,"end");el.dispatchEvent(new Event("input",{bubbles:true}));ok=true;}catch(e){}}if(!ok)return "FAIL";var a=ce?(el.textContent||""):(el.value||"");var tail=t.replace(/\\s+$/,"").slice(-24);return tail&&a.indexOf(tail)>=0?"OKVER":"OK";})()'''
+_JS_INSERT_TEMPLATE = '''(function(){var t=decodeURIComponent(escape(window.atob("__B64__")));var el=document.activeElement;if(!el||el===document.body)return "NOFOCUS";var ce=el.isContentEditable===true;var fld=(el.tagName==="INPUT"||el.tagName==="TEXTAREA")&&typeof el.value==="string";if(!ce&&!fld)return "NOEL";var ok=false;try{ok=document.execCommand("insertText",false,t);}catch(e){}if(!ok&&typeof el.setRangeText==="function"){try{var s=el.selectionStart==null?0:el.selectionStart;var d=el.selectionEnd==null?s:el.selectionEnd;el.setRangeText(t,s,d,"end");el.dispatchEvent(new Event("input",{bubbles:true}));ok=true;}catch(e){}}var a=ce?(el.textContent||""):(el.value||"");var tail=t.replace(/\\s+$/,"").slice(-24);var seen=tail&&a.indexOf(tail)>=0;if(!ok)return seen?"OKVER":"FAIL";return seen?"OKVER":"OK";})()'''
 
 def _js_insert(app: str, text: str) -> tuple:
     """(status, detail): VERIFIED | OK | FAIL | DISABLED | SKIP."""
