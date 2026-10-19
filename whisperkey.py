@@ -985,25 +985,53 @@ def _activate_app(name: str) -> bool:
     ok, _ = _osa(f'tell application "{safe}" to activate', timeout=3)
     return ok
 
+try:
+    import Quartz as _Quartz                       # приезжает с pynput (pyobjc)
+except Exception:
+    _Quartz = None
+_kCGFlagAlternate = 0x00080000    # kCGEventFlagMaskAlternate — бит Option
+_kCGHIDState = 1                  # kCGEventSourceStateHIDSystemState
+
+def _option_physically_down() -> bool | None:
+    """Реальное состояние Option по HID-флагам — в отличие от _opt_down не
+    залипает, когда событие отпускания потерялось в дороге. None — прочитать
+    не удалось, тогда верим флагу listener'а."""
+    if _Quartz is None or not _IS_MAC:
+        return None
+    try:
+        flags = _Quartz.CGEventSourceFlagsState(_kCGHIDState)
+        return bool(flags & _kCGFlagAlternate)
+    except Exception:
+        return None
+
+def _option_is_down() -> bool:
+    real = _option_physically_down()
+    return _opt_down if real is None else real
+
 def _wait_option_release() -> bool:
     """Ждёт отпускания Option перед вставкой (до OPTION_WAIT_SEC).
 
     Зажатый Option превращает Cmd+V в Cmd+Opt+V — «вставить и согласовать
     стиль», а в части приложений — в ничего. При залипшей записи или быстром
     следующем тапе клавиша легко ещё зажата к моменту вставки — живой класс
-    «курсор стоит, текста нет»."""
-    if not _opt_down:
+    «курсор стоит, текста нет». Читаем физическое состояние через Quartz:
+    _opt_down может застрять True при потерянном событии отпускания, и тогда
+    КАЖДАЯ вставка ждала бы 1.5 с и уходила в медленный посимвольный набор."""
+    if not _option_is_down():
         return True
     deadline = time.time() + OPTION_WAIT_SEC
-    while _opt_down and time.time() < deadline:
+    while _option_is_down() and time.time() < deadline:
         time.sleep(0.05)
-    return not _opt_down
+    return not _option_is_down()
 
 def direct_insert(text: str):
     """Вставка через буфер обмена с проверкой ФАКТА вставки на каждом шаге."""
     global _focus_app_at_start
     try:
-        app_now = _frontmost_app()
+        # Один AX-вызов даёт и снимок поля, и имя frontmost-приложения —
+        # отдельный _frontmost_app был бы лишним процессом osascript
+        # (сотни мс на каждую вставку, жалоба «стало дольше» 19.10.26).
+        before, app_now, ax_role = _ax_focused_value()
         if _focus_app_at_start and app_now and app_now != _focus_app_at_start:
             print(f"[insert] фокус за время распознавания: "
                   f"{_focus_app_at_start} → {app_now}")
@@ -1020,7 +1048,9 @@ def direct_insert(text: str):
                     reason = "буфер не записался"
                     time.sleep(0.15)
                     continue
-                before, ax_app, ax_role = _ax_focused_value()
+                if attempt == 2:
+                    before, ax_app, ax_role = _ax_focused_value()
+                    app_now = app_now or ax_app
                 if not _send_paste_keystroke():
                     reason = ("клавиша Cmd+V не отправлена — проверь права "
                               "Accessibility/Input Monitoring у Терминала")
