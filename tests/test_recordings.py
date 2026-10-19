@@ -18,6 +18,7 @@ import time
 import wave
 
 import numpy as np
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "..", "whisperkey.py")
@@ -55,15 +56,34 @@ def build_module():
                 continue
         if isinstance(node, ast.If):
             src_seg = ast.get_source_segment(source, node) or ""
-            if "sys.platform" in src_seg and "darwin" in src_seg:
+            if "__main__" in src_seg:
                 continue
         body.append(node)
 
-    code = compile(ast.Module(body=body, type_ignores=[]), SRC, "exec")
-    module = type(sys)("whisperkey")
-    module.__file__ = SRC
-    exec(code, module.__dict__)
-    return module
+    ns = {"__name__": "whisperkey_under_test", "__file__": SRC}
+    kb = types.SimpleNamespace(press=lambda *a: None, release=lambda *a: None, type=lambda *a: None)
+    ns["sd"] = types.SimpleNamespace(InputStream=lambda **kw: types.SimpleNamespace(
+        start=lambda: None, stop=lambda: None, close=lambda: None))
+    ns["WhisperModel"] = lambda *a, **k: None
+    ns["keyboard"] = types.SimpleNamespace(
+        Key=types.SimpleNamespace(alt_r="alt_r"), Listener=object)
+    ns["KeyboardController"] = lambda: kb
+    ns["KeyboardKey"] = types.SimpleNamespace(cmd="cmd")
+    ns["psutil"] = types.SimpleNamespace(Process=lambda pid: types.SimpleNamespace(
+        nice=lambda v: None, cpu_affinity=lambda v: None))
+    ns["pill"] = types.SimpleNamespace(create=lambda: types.SimpleNamespace(
+        active=False, set_state=lambda *a: None, set_level_rms=lambda *a: None))
+
+    class FakeSession:
+        def post(self, *a, **k):
+            raise AssertionError("network should be mocked")
+        def get(self, *a, **k):
+            return types.SimpleNamespace(status_code=200)
+
+    ns["requests"] = types.SimpleNamespace(Session=FakeSession, get=lambda *a, **k: None)
+
+    exec(compile(ast.Module(body=body, type_ignores=[]), SRC, "exec"), ns)
+    return ns
 
 
 def test_save_and_env_override():
