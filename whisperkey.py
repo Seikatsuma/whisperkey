@@ -1712,7 +1712,7 @@ def process_audio(audio_snapshot: list, session_id: int):
             with state_lock:
                 if active_session_id == session_id:
                     pill.set_state("idle")
-            ins_sec = direct_insert(text + " ")
+            ins_sec = direct_insert(text + " ") or 0.0
             # Раздельный замер: «стало дольше» почти всегда жило на стороне
             # вставки, а не ASR — путать их нельзя.
             print(f"[timing] asr={asr_sec:.2f}с insert={ins_sec:.2f}с "
