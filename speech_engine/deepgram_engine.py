@@ -31,6 +31,40 @@ class DeepgramState:
     blocked_until: float = 0.0
     last_reason: str = ""
     last_seconds: float = 0.0
+    # True, когда причина блокировки — сеть недоступна (таймаут/ConnectionError),
+    # а не отказ ключа. Такие блоки короткие (NETWORK_BLOCK_SECONDS) и их можно
+    # снимать пробой — см. maybe_probe_deepgram_if_blocked. Блок по 401/402/403
+    # пробой не лечится: ключ не починится за минуту.
+    blocked_by_network: bool = False
+
+
+# Сетевой блок держим коротким: домашний VPN мог включиться в любой момент,
+# и сидеть 15 минут без первой ступени из-за одного разрыва незачем.
+NETWORK_BLOCK_SECONDS = 120.0
+
+_DEEPGRAM_PROBE_URL = "https://api.deepgram.com/"
+
+
+def maybe_probe_deepgram_if_blocked(*, state: DeepgramState,
+                                    session: requests.Session | None = None) -> None:
+    """Проверяет, не вернулась ли сеть, пока ступень заблокирована сетевой причиной.
+
+    Аналог `groq_engine.maybe_probe_if_blocked` для первой ступени. Разница:
+    пробуем ТОЛЬКО сетевые блоки — блок по 401/402/403 живёт свой таймер целиком
+    (проба ключ не лечит, а запросы жгут). Проба — просто HEAD на хост: достаточно
+    факта, что TCP+TLS поднимаются; ответ любой (даже 404) = сеть есть.
+    """
+    if not state.blocked_by_network or time.time() < state.blocked_until:
+        return
+    try:
+        (session or requests).head(_DEEPGRAM_PROBE_URL, timeout=3.0)
+        state.blocked_until = 0.0
+        state.blocked_by_network = False
+        state.last_reason = ""
+        logger.info("deepgram: связь вернулась, ступень разблокирована")
+    except Exception:
+        # Тихо ждём следующего срока — запись состояния уже стоит.
+        state.blocked_until = time.time() + 30.0
 
 
 def transcribe_deepgram(audio_data, *, api_key: str, profile: Profile, sample_rate: int,
@@ -77,12 +111,14 @@ def transcribe_deepgram(audio_data, *, api_key: str, profile: Profile, sample_ra
                 try:
                     alt = response.json()["results"]["channels"][0]["alternatives"][0]
                 except (KeyError, IndexError, ValueError) as e:
+                    state.last_reason = f"ответ не разобран ({type(e).__name__})"
                     logger.info("deepgram: ответ не разобран (%s) — ухожу дальше по каскаду",
                                 type(e).__name__)
                     return None
                 text = (alt.get("transcript") or "").strip()
                 state.last_seconds = time.time() - t0
                 if not text:
+                    state.last_reason = "пустой ответ"
                     logger.info("deepgram: пусто — ухожу дальше по каскаду")
                     return None
                 return text
@@ -92,6 +128,7 @@ def transcribe_deepgram(audio_data, *, api_key: str, profile: Profile, sample_ra
                           403: "доступ запрещён"}[response.status_code]
                 state.blocked_until = time.time() + profile.deepgram_block_seconds
                 state.last_reason = reason
+                state.blocked_by_network = False
                 mins = int(profile.deepgram_block_seconds / 60)
                 logger.warning("deepgram: %s (HTTP %s). Перехожу на следующую ступень, "
                                "повторю попытку через %d мин.", reason, response.status_code, mins)
@@ -101,17 +138,26 @@ def transcribe_deepgram(audio_data, *, api_key: str, profile: Profile, sample_ra
                 time.sleep(0.5)
                 continue
 
+            state.last_reason = f"статус {response.status_code}"
             logger.info("deepgram: статус %s — ухожу дальше по каскаду", response.status_code)
             return None
 
-        except requests.Timeout:
-            logger.info("deepgram: не ответил за %.0fс — ухожу дальше по каскаду",
-                        profile.deepgram_timeout)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            # Хост недостижим (без VPN, обрыв сети, DNS): без блока КАЖДАЯ диктовка
+            # платит connect-таймаутом × retries — у Егора это были лишние ~10-20с
+            # на каждой записи, пока VPN выключен. Ставим короткий сетевой блок —
+            # снимается пробой (maybe_probe_deepgram_if_blocked) или таймером.
+            state.blocked_until = time.time() + NETWORK_BLOCK_SECONDS
+            state.blocked_by_network = True
+            state.last_reason = f"нет связи ({type(e).__name__})"
+            logger.warning("deepgram: нет связи (%s) — ступень выкл на %.0fс, "
+                           "ухожу дальше по каскаду", type(e).__name__, NETWORK_BLOCK_SECONDS)
             return None
         except Exception as e:
             if attempt + 1 < profile.deepgram_retries:
                 time.sleep(0.5)
                 continue
+            state.last_reason = f"исключение {type(e).__name__}"
             logger.info("deepgram: %s — ухожу дальше по каскаду", type(e).__name__)
             return None
 

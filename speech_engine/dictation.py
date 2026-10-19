@@ -18,11 +18,12 @@ import numpy as np
 
 from . import chunking
 from .context import Context
-from .deepgram_engine import transcribe_deepgram
+from .deepgram_engine import maybe_probe_deepgram_if_blocked, transcribe_deepgram
 from .density_gate import needs_retry
 from .groq_engine import maybe_probe_if_blocked, transcribe_groq
 from .local_engine import transcribe_local
 from .remote_engine import transcribe_remote
+from .yandex_engine import transcribe_yandex
 from .terms import fix_known_terms
 from .transfer import transfer_endings, transfer_punctuation
 from .terms import transfer_terms
@@ -178,67 +179,133 @@ def _recognize_with_groq_cascade(audio: np.ndarray, dur: float, ctx: Context):
 
 
 def recognize(audio: np.ndarray, dur: float, ctx: Context) -> RecognitionResult:
-    """Полный каскад dictation: Deepgram → Groq → локальная модель.
+    """Полный каскад dictation: Deepgram → Groq → мост/Yandex → локальная модель.
 
     fix_known_terms применяется всегда, вне зависимости от того, какая ступень
     дала текст (это поведение перенесено из process_audio дословно).
+
+    `ctx.engine_mode` меняет стратегию (см. ASR_ENGINE в .env):
+      "auto"   — порядок как описан выше (по умолчанию);
+      "remote" — мост пробуется ПЕРВЫМ: режим для сети, где Deepgram и Groq
+                 заведомо недоступны (нет VPN), чтобы не жечь их таймауты зря;
+      "local"  — только локальная модель, сеть не трогается вовсе.
+    Причина каждого переключения ступени складывается в meta["fallbacks"] —
+    вызывающий код печатает её строкой `[engine fallback] ...`, чтобы переход
+    на запасной путь не оставался невидимым (жалоба 19.10.26: «без VPN не
+    работает» при молча уходящем в local каскаде).
     """
     p = ctx.profile
+    mode = (ctx.engine_mode or "auto").strip().lower()
+    fallbacks: list[str] = []
+
+    # Сетевой блок первой ступени лечится пробой (VPN мог включиться в любой
+    # момент); блоки ключа (401/402/403) проба не трогает — см. функцию.
+    maybe_probe_deepgram_if_blocked(state=ctx.deepgram_state, session=ctx.session)
 
     full_raw_text = None
-    if p.deepgram_enabled and ctx.deepgram_api_key:
-        full_raw_text = transcribe_deepgram(
-            audio, api_key=ctx.deepgram_api_key, profile=p, sample_rate=ctx.sample_rate,
-            state=ctx.deepgram_state, session=ctx.session)
-        if full_raw_text and dur > 8.0:
-            # ВИДИМОСТЬ — расследование живого случая 16.08.26 (независимо подтверждено
-            # SaluteSpeech+Nexara на 4 записях: Deepgram/каскад молча теряет куски речи,
-            # не искажает слова, а целиком их не возвращает). У Deepgram, в отличие от
-            # groq_engine/density_gate.py, нет своего recovery-механизма — берём ответ
-            # как есть. Порог подобран грубо (не эталон, только для диагностики в логе):
-            # заметно ниже типичного темпа речи Егора (~1.5-2 слова/с на этом корпусе).
-            wps = len(full_raw_text.split()) / dur
-            if wps < 1.0:
-                logger.warning("deepgram: подозрительно мало текста на длину записи "
-                               "(%.2f слов/с за %.1fс, %d слов) — возможна потеря куска речи",
-                               wps, dur, len(full_raw_text.split()))
+    engine = ""
+    assembled_text = ""
+    lost_marks: list = []
+    chunk_quality: list[str] = []
+    degenerate: list = []
+    remote_tried = False
 
-    if full_raw_text:
-        engine = "deepgram"
-        assembled_text = full_raw_text
-        lost_marks: list = []
-        chunk_quality: list[str] = ['deepgram']
-        degenerate: list = []
+    def _try_remote() -> None:
+        nonlocal full_raw_text, engine, assembled_text, lost_marks, chunk_quality, degenerate
+        remote_tried_inner = transcribe_remote(audio, dur, ctx)
+        if remote_tried_inner:
+            full_raw_text = assembled_text = remote_tried_inner
+            engine, lost_marks, chunk_quality, degenerate = "remote", [], ['remote'], []
+        else:
+            fallbacks.append(f"remote: {ctx.remote_last_error or 'нет ответа'}")
+
+    if mode == "local":
+        # Явный офлайн-режим: ни одного облачного вызова.
+        engine, chunk_quality = "local", ["local"]
+        if ctx.local_model is not None:
+            try:
+                full_raw_text = transcribe_local(audio, ctx.local_model) or None
+            except Exception as e:
+                logger.warning("local: %s", type(e).__name__)
+        assembled_text = full_raw_text or ""
     else:
-        engine = "groq" if ctx.groq_api_key else "local"
-        degenerate = []
-        remote_tried = False
-        # Удалённая ступень — быстрый путь: Groq заведомо недоступен (ключа нет
-        # или свежий блок — на Mac'е у Егора это гео-блок 403 навсегда) →
-        # не жечь минуты на локальной модели, спросить каскад на сервере.
-        if ctx.remote_asr_url and (not ctx.groq_api_key or ctx.cloud_state.is_blocked):
+        # Режим "remote": мост первым — для сети без VPN, где обе облачные
+        # ступени заведомо мертвы и каждая попытка стоит таймаут.
+        if mode == "remote" and ctx.remote_asr_url:
             remote_tried = True
-            remote_text = transcribe_remote(audio, dur, ctx)
-            if remote_text:
-                full_raw_text = assembled_text = remote_text
-                engine, lost_marks, chunk_quality = "remote", [], ['remote']
+            _try_remote()
+
+        if not full_raw_text and p.deepgram_enabled and ctx.deepgram_api_key:
+            full_raw_text = transcribe_deepgram(
+                audio, api_key=ctx.deepgram_api_key, profile=p, sample_rate=ctx.sample_rate,
+                state=ctx.deepgram_state, session=ctx.session)
+            if full_raw_text:
+                engine = "deepgram"
+                assembled_text = full_raw_text
+                chunk_quality = ['deepgram']
+                if dur > 8.0:
+                    # ВИДИМОСТЬ — расследование живого случая 16.08.26 (независимо
+                    # подтверждено SaluteSpeech+Nexara на 4 записях: Deepgram молча
+                    # теряет куски речи, не искажает слова, а целиком не возвращает).
+                    # У Deepgram нет recovery — берём ответ как есть. Порог грубый,
+                    # только для диагностики в логе (~1.5-2 слов/с — темп Егора).
+                    wps = len(full_raw_text.split()) / dur
+                    if wps < 1.0:
+                        logger.warning("deepgram: подозрительно мало текста на длину записи "
+                                       "(%.2f слов/с за %.1fс, %d слов) — возможна потеря куска речи",
+                                       wps, dur, len(full_raw_text.split()))
+            else:
+                fallbacks.append(f"deepgram: {ctx.deepgram_state.last_reason or 'нет ответа'}")
+
         if not full_raw_text:
+            # Ранний вызов моста: Groq заведомо недоступен (ключа нет или свежий
+            # блок — на Mac'е у Егора гео-блок 403 навсегда) → не жечь минуты на
+            # локальной модели, спросить каскад на сервере.
+            if ctx.remote_asr_url and not remote_tried and \
+                    (not ctx.groq_api_key or ctx.cloud_state.is_blocked):
+                remote_tried = True
+                _try_remote()
+
+        if not full_raw_text:
+            # Groq мёртв, а мост не ответил — Yandex дешевле и быстрее, чем
+            # прогон локальной модели по кускам (облако, доступное без VPN).
+            if ctx.yandex_api_key and ctx.cloud_state.is_blocked:
+                ytext = transcribe_yandex(audio, dur, ctx)
+                if ytext:
+                    full_raw_text = assembled_text = ytext
+                    engine, chunk_quality = "yandex", ['yandex']
+                else:
+                    fallbacks.append(f"yandex: {ctx.yandex_last_error or 'нет ответа'}")
+
+        if not full_raw_text:
+            engine = "groq" if ctx.groq_api_key else "local"
             full_raw_text, assembled_text, lost_marks, chunk_quality = _recognize_with_groq_cascade(
                 audio, dur, ctx)
             degenerate = list(ctx.cloud_state.last_degenerate or [])
             if 'local' in chunk_quality and 'cloud' not in chunk_quality and 'cloud_retry' not in chunk_quality:
                 engine = "local"
-            # Спасательный путь: каскад кончился пустотой или целиком локальной
-            # моделью → последний облачный шанс — мост (там Deepgram и Groq живы).
+                if ctx.groq_api_key:
+                    fallbacks.append(f"groq: {ctx.cloud_state.last_reason or 'заблокирован'} → local")
+            if not full_raw_text:
+                fallbacks.append("groq/local: пустой результат")
+
+            # Спасательные ступени: каскад кончился пустотой или целиком
+            # локальной моделью → мост (там Deepgram и Groq живы), затем Yandex.
             if ctx.remote_asr_url and not remote_tried and (not full_raw_text or engine == "local"):
-                remote_text = transcribe_remote(audio, dur, ctx)
-                if remote_text:
-                    full_raw_text = assembled_text = remote_text
-                    engine, lost_marks, chunk_quality, degenerate = "remote", [], ['remote'], []
+                remote_tried = True
+                _try_remote()
+            if ctx.yandex_api_key and (not full_raw_text or engine == "local"):
+                ytext = transcribe_yandex(audio, dur, ctx)
+                if ytext:
+                    full_raw_text = assembled_text = ytext
+                    engine, lost_marks, chunk_quality, degenerate = "yandex", [], ['yandex'], []
+                else:
+                    fallbacks.append(f"yandex: {ctx.yandex_last_error or 'нет ответа'}")
 
     if not full_raw_text:
-        return RecognitionResult(text="", engine="", assembled_text="", lost_marks=lost_marks,
-                                 chunk_quality=chunk_quality, degenerate=degenerate)
+        return RecognitionResult(text="", engine=engine, assembled_text="", lost_marks=lost_marks,
+                                 chunk_quality=chunk_quality, degenerate=degenerate,
+                                 meta={"fallbacks": fallbacks})
 
     full_raw_text, n_fix = fix_known_terms(full_raw_text)
 
@@ -249,5 +316,6 @@ def recognize(audio: np.ndarray, dur: float, ctx: Context) -> RecognitionResult:
         meta={
             "deepgram_seconds": ctx.deepgram_state.last_seconds,
             "api_text": ctx.cloud_state.last_api_text,
+            "fallbacks": fallbacks,
         },
     )

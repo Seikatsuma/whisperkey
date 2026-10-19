@@ -37,6 +37,7 @@ class CloudState:
     consecutive_success: int = 0
     last_degenerate: list = field(default_factory=list)
     last_api_text: str = ""
+    last_reason: str = ""   # причина последнего отказа — для строки [engine fallback]
 
 
 class Throttle:
@@ -181,6 +182,7 @@ def transcribe_groq(audio_data, *, api_key: str, profile: Profile, sample_rate: 
             if response.status_code == 403:
                 logger.warning("groq: 403 (гео-блок). Ухожу на следующую ступень.")
                 state.is_blocked = True
+                state.last_reason = "403 гео-блок"
                 state.last_check_time = time.time()
                 background_cloud_probe(api_key=api_key, state=state, session=session)
                 return empty
@@ -194,10 +196,12 @@ def transcribe_groq(audio_data, *, api_key: str, profile: Profile, sample_rate: 
                 files = {'file': (up_name, io.BytesIO(payload), up_mime)}
                 continue
 
+            state.last_reason = f"статус {response.status_code}"
             logger.warning("groq: статус %s, отказ", response.status_code)
             return empty
 
         except Exception as e:
+            state.last_reason = f"исключение {type(e).__name__}"
             logger.warning("groq: исключение %s", type(e).__name__)
             if allow_retry and attempt < 3:
                 time.sleep(2 ** attempt)

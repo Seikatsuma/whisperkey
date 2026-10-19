@@ -21,14 +21,32 @@ import numpy as np
 
 
 def change_tempo(audio_data: np.ndarray, factor: float) -> np.ndarray:
-    """Меняет темп линейной интерполяцией по новой сетке отсчётов. factor=1.0 — тождество."""
+    """Меняет темп линейной интерполяцией по новой сетке отсчётов. factor=1.0 — тождество.
+
+    Блочная версия прежнего `np.interp(linspace, arange, a)`: та же линейная
+    интерполяция и тот же результат, но без трёх float64-массивов на всю запись
+    разом — на 10-минутной диктовке одни сетки съедали ~230 МБ и подносили
+    процесс к MemoryMax (14.10.26, voice-bridge). Временные массивы блока —
+    единицы МБ.
+    """
     if factor == 1.0:
         return audio_data
     n = int(len(audio_data) / factor)
     if n < 2:
         return audio_data
-    grid = np.linspace(0, len(audio_data) - 1, n)
-    return np.interp(grid, np.arange(len(audio_data)), audio_data).astype(np.float32)
+    src = np.asarray(audio_data, dtype=np.float32)
+    out = np.empty(n, dtype=np.float32)
+    last = len(src) - 1
+    step = (len(src) - 1) / (n - 1) if n > 1 else 0.0  # linspace(0, len-1, n) без самой сетки
+    block = 16000 * 30
+    for start in range(0, n, block):
+        end = min(start + block, n)
+        pos = np.arange(start, end, dtype=np.float64) * step
+        i0 = pos.astype(np.int64)
+        frac = (pos - i0).astype(np.float32)
+        i1 = np.minimum(i0 + 1, last)
+        out[start:end] = src[i0] * (np.float32(1.0) - frac) + src[i1] * frac
+    return out
 
 
 def restore_timeline(result: dict, tempo: float) -> None:
@@ -56,7 +74,9 @@ def create_audio_wav(audio_data: np.ndarray, sample_rate: int, tempo: float = 1.
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(sample_rate)
-            wf.writeframes((audio_data * 32767).astype(np.int16).tobytes())
+            pcm = np.empty(audio_data.shape, dtype=np.int16)
+            np.multiply(audio_data, 32767, out=pcm, casting="unsafe")
+            wf.writeframes(pcm)
 
         return wav_io.getvalue()
     except Exception:
@@ -107,7 +127,8 @@ def create_upload_audio(audio_data, sample_rate: int, tempo: float = 1.0):
         if tempo != 1.0:
             audio_data = change_tempo(audio_data, tempo)
         audio_data = np.clip(audio_data, -1.0, 1.0)
-        pcm = (audio_data * 32767).astype(np.int16)
+        pcm = np.empty(audio_data.shape, dtype=np.int16)
+        np.multiply(audio_data, 32767, out=pcm, casting="unsafe")
 
         flac = _encode_flac(pcm, sample_rate)
         if flac:
@@ -118,7 +139,7 @@ def create_upload_audio(audio_data, sample_rate: int, tempo: float = 1.0):
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(sample_rate)
-            wf.writeframes(pcm.tobytes())
+            wf.writeframes(pcm)
         return wav_io.getvalue(), "audio.wav", "audio/wav"
     except Exception:
         return None

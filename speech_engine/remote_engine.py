@@ -52,12 +52,17 @@ def transcribe_remote(audio: np.ndarray, dur: float, ctx: Context) -> str:
     try:
         r = ctx.session.post(url, files=files, headers=headers, timeout=REMOTE_TIMEOUT)
         if r.status_code != 200:
+            ctx.remote_last_error = f"статус {r.status_code}"
             logger.warning("remote: статус %s, отказ", r.status_code)
             return ""
         text = (r.json().get("text") or "").strip()
         if not text:
+            ctx.remote_last_error = "пустой ответ"
             logger.info("remote: пустой ответ")
+        else:
+            ctx.remote_last_error = ""
         return text
     except Exception as e:
+        ctx.remote_last_error = f"исключение {type(e).__name__}"
         logger.warning("remote: исключение %s", type(e).__name__)
         return ""

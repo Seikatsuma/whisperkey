@@ -31,7 +31,12 @@ class Context:
     deepgram_api_key: str = ""
     remote_asr_url: str = ""     # мост на серверный каскад (http_bridge), пусто = ступени нет
     remote_asr_token: str = ""   # X-Bridge-Token, если мост выставлен наружу
+    remote_last_error: str = ""  # причина последнего отказа моста — для [engine fallback]
+    yandex_api_key: str = ""     # резервная облачная ступень без VPN (Yandex SpeechKit)
+    yandex_folder_id: str = ""   # folderId — нужен только для IAM-аккаунтов, не для Api-Key
+    yandex_last_error: str = ""
     local_model: object = None   # faster_whisper.WhisperModel-подобный объект или None
+    engine_mode: str = "auto"    # auto | remote | local — выбор стратегии каскада (ASR_ENGINE)
     session: requests.Session = field(default_factory=requests.Session)
     cloud_state: CloudState = field(default_factory=CloudState)
     deepgram_state: DeepgramState = field(default_factory=DeepgramState)

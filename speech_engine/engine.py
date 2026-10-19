@@ -24,6 +24,8 @@ class Engine:
     def __init__(self, *, profile: Profile = DICTATION, groq_api_key: str = "",
                 deepgram_api_key: str = "", sample_rate: int = 16000,
                 remote_asr_url: str | None = None, remote_asr_token: str | None = None,
+                yandex_api_key: str | None = None, yandex_folder_id: str | None = None,
+                engine_mode: str | None = None,
                 local_model=None, session: requests.Session | None = None):
         self.ctx = Context(
             profile=profile, sample_rate=sample_rate, groq_api_key=groq_api_key,
@@ -32,6 +34,12 @@ class Engine:
                            else remote_asr_url,
             remote_asr_token=os.environ.get("REMOTE_ASR_TOKEN", "") if remote_asr_token is None
                              else remote_asr_token,
+            yandex_api_key=os.environ.get("YANDEX_API_KEY", "") if yandex_api_key is None
+                           else yandex_api_key,
+            yandex_folder_id=os.environ.get("YANDEX_FOLDER_ID", "") if yandex_folder_id is None
+                             else yandex_folder_id,
+            engine_mode=os.environ.get("ASR_ENGINE", "auto") if engine_mode is None
+                        else engine_mode,
             local_model=local_model,
             session=session or requests.Session(),
         )
