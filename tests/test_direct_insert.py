@@ -43,7 +43,7 @@ ns = {
     "_put_clipboard": lambda d: SC["put"](d),
     "_send_paste_keystroke": lambda app="": SC["paste"](app),
     "_poll_insert": lambda t, b, timeout=1.2: SC["poll"](t, b),
-    "_send_paste_via_menu": lambda app: SC["menu"](app),
+    "_send_paste_via_menu": lambda app: (SC["menu"](app), ""),
     "_activate_app": lambda n: False,
     "_restore_clipboard_async": lambda o, d: calls.__setitem__("restore", calls["restore"] + 1),
     "_fail_sound": lambda: calls.__setitem__("sound", calls["sound"] + 1),
