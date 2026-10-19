@@ -931,14 +931,30 @@ def _insert_verified(inserted: str, before, after) -> bool | None:
         return True
     return False
 
+def _send_paste_keystroke_pynput() -> bool:
+    """Cmd+V через pynput — другой транспорт, на случай если System Events не дошёл."""
+    try:
+        kb.press(KeyboardKey.cmd)
+        kb.press('v')
+        kb.release('v')
+        kb.release(KeyboardKey.cmd)
+        return True
+    except Exception:
+        return False
+
 def _poll_insert(text: str, before, timeout: float = INSERT_VERIFY_SEC):
-    """Опрашивает AX-значение фокусного поля после отправки вставки."""
+    """Опрашивает AX-значение фокусного поля после отправки вставки.
+    Поле, которое за ~0.35с ни разу не отдало значение, нечитаемо — дальше
+    крутить опрос бессмысленно и это лишняя задержка перед ответом."""
     deadline = time.time() + timeout
+    unreadable_deadline = time.time() + 0.35
     saw_readable = False
     while time.time() < deadline:
         time.sleep(0.12)
         after, _app, _role = _ax_focused_value()
         if after is None:
+            if not saw_readable and time.time() > unreadable_deadline:
+                return None
             continue
         saw_readable = True
         if _insert_verified(text, before, after):
@@ -1023,9 +1039,16 @@ def direct_insert(text: str):
                               f"и повторяю")
                         time.sleep(0.35)
                     continue    # вторая попытка — приложение могло проспать событие
-                break           # verdict None — повторять небезопасно (двойной текст)
-        else:
-            reason = "Option остался зажат — Cmd+V вставил бы «со стилем» или ничего"
+                # verdict None — поле не отвечает на AX (Brave/веб-контролы):
+                # проверить нечем, а paste мог тихо не дойти (живой случай
+                # 19.10.26 — вторая диктовка не встала). Делаем один повтор
+                # ДРУГИМ транспортом (pynput): если первый дошёл — худший исход
+                # видимый дубль, если не дошёл — спасённая диктовка. Пропуск
+                # без всякого следа хуже дубля.
+                if attempt == 1 and _send_paste_keystroke_pynput():
+                    print("[insert] проверка недоступна — повтор Cmd+V вторым транспортом")
+                    time.sleep(0.2)
+                break
 
         # Откат на посимвольный ввод: подтверждённый отказ поля или неотправленная
         # клавиша. Unicode-событиям не мешают ни буфер, ни зажатый модификатор,
