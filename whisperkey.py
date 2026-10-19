@@ -1376,18 +1376,14 @@ def _cgevent_paste(pid: int = 0) -> bool:
         return False
 
 def _blind_strike_fast(app: str):
-    """Тот же один удар, что _blind_strike, но внутри процесса:
-    меню «Вставить» AXPress → Cmd+V в pid → Cmd+V во frontmost.
-    None — быстрый путь не сработал, пробуем osascript-версию."""
+    """Один удар внутри процесса: живой пункт меню либо один Cmd+V."""
     if _AXAPI is None:
         return None
     pid = _pid_of_app(app)
     if pid and _menu_paste_press(pid):
         return "MENU", ""
-    if pid and _cgevent_paste(pid):
-        return "KEY", ""
-    if _cgevent_paste(0):
-        return "KEYF", ""
+    if _cgevent_paste(pid):
+        return "KEY" if pid else "KEYF", ""
     return None
 
 def _blind_strike(app: str) -> tuple:
@@ -1502,32 +1498,18 @@ def _poll_insert(text: str, before, timeout: float = INSERT_VERIFY_SEC):
     return False if saw_readable else None
 
 def _send_paste_keystroke(target_app: str = "") -> bool:
-    """Cmd+V: сначала ТОЧЕЧНО в процесс поля (key code и keystroke — два имени
-    события, у разных приложений принимается разное), затем во frontmost,
-    затем pynput. True — транспорт принял событие; это НЕ доказательство
-    вставки — факт проверяет _poll_insert."""
-    if target_app:
-        safe = target_app.replace("\\", "\\\\").replace('"', '\\"')
+    """Ровно один Cmd+V в целевой процесс; True — событие отправлено."""
+    pid = _pid_of_app(target_app)
+    if _Quartz is not None:
+        return _cgevent_paste(pid)
+    safe = target_app.replace("\\", "\\\\").replace('"', '\\"')
+    if safe:
         ok, _ = _osa(f'tell application "System Events" to tell process "{safe}" '
                      'to key code 9 using command down', timeout=5)
-        if ok:
-            return True
-        ok, _ = _osa(f'tell application "System Events" to tell process "{safe}" '
-                     'to keystroke "v" using command down', timeout=5)
-        if ok:
-            return True
-    ok, _ = _osa('tell application "System Events" to key code 9 using command down',
-                 timeout=5)
-    if ok:
-        return True
-    try:
-        kb.press(KeyboardKey.cmd)
-        kb.press('v')
-        kb.release('v')
-        kb.release(KeyboardKey.cmd)
-        return True
-    except Exception:
-        return False
+    else:
+        ok, _ = _osa('tell application "System Events" to key code 9 using command down',
+                     timeout=5)
+    return ok
 
 # Третий транспорт вставки: сама команда меню «Правка → Вставить» целевого
 # приложения. Это другой механизм — не синтетическая клавиша, а вызов команды,
@@ -1636,23 +1618,17 @@ def direct_insert(text: str) -> float:
             _ax_unlock_failed.add(focus_hint)
 
         if st == "WROTE":
+            # WROTE означает, что AXSetValue уже выполнился. Текст может исчезнуть
+            # из поля до read-back, если пользователь мгновенно нажал Enter.
+            # Поэтому отсутствие текста после записи — не разрешение на второй
+            # транспорт: иначе отправленное сообщение тут же появится в поле снова.
+            sent, via = True, "ax-write"
             if _insert_verified(text, None, val):
-                verdict, via = True, "ax-write"
+                verdict = True
                 print("[insert] прямая запись в поле (AX) — проверено")
             else:
-                # Запись принята, но в поле не наш текст — либо приложение
-                # переписало, либо чтение вернуло устаревшее значение.
-                # Сначала короткий повторный опрос — если запись всё же встала,
-                # буферный удар поверх дал бы ДУБЛЬ; опрос стоит дешевле дубля.
-                v_late = _poll_insert(text, None, timeout=0.6)
-                if v_late is True:
-                    verdict, via = True, "ax-write"
-                    print("[insert] прямая запись в поле (AX) — проверено с задержкой")
-                else:
-                    readable = True
-                    before = val
-                    reason = f"поле переписало вставку ({app or '?'})"
-                    print(f"[insert] {reason} — буферный путь")
+                print("[insert] прямая запись в поле (AX) отправлена; "
+                      "поле уже изменилось — без повторной вставки")
         elif st == "WRITEFAIL":
             reason = f"поле отклонило прямую запись ({app or '?'})"
             print(f"[insert] {reason} — буферный путь")
@@ -1693,40 +1669,33 @@ def direct_insert(text: str) -> float:
             else:
                 old_clipboard = _clipboard_now()
                 if readable:
-                    # Читаемое поле, отказавшее AX-записи: реальные вердикты.
-                    for attempt in (1, 2):
-                        if not _put_clipboard(text_bytes):
-                            reason = "буфер не записался"
-                            time.sleep(0.15)
-                            continue
+                    # Один отправленный транспорт на диктовку. Пустое поле после
+                    # Cmd+V может означать, что пользователь уже отправил текст.
+                    if not _put_clipboard(text_bytes):
+                        reason = "буфер не записался"
+                    else:
                         clipboard_touched = True
-                        if not _send_paste_keystroke(app):
+                        if _send_paste_keystroke(app):
+                            sent, via = True, "paste"
+                            verdict = _poll_insert(text, before)
+                            if verdict is True:
+                                print("[insert] Cmd+V — проверено")
+                            else:
+                                verdict = None
+                                print("[insert] Cmd+V отправлен; поле уже изменилось — "
+                                      "без повторной вставки")
+                        else:
                             reason = ("клавиша Cmd+V не отправлена — проверь права "
                                       "Accessibility/Input Monitoring у Терминала")
-                            continue
-                        sent = True
-                        verdict = _poll_insert(text, before)
-                        if verdict is True:
-                            via = "paste"
-                            break
-                        if verdict is False:
-                            reason = (f"поле не приняло вставку "
-                                      f"({app or '?'}, роль {role or '?'})")
-                            continue  # приложение могло проспать событие
-                        break   # None: поле потеряло читаемость — удар уже был
-                    # Доказанный отказ клавиши → команда меню (другой механизм).
-                    if verdict is False:
-                        ok_m, m_err = _send_paste_via_menu(app)
-                        if ok_m:
-                            sent = True
-                            v = _poll_insert(text, before)
-                            if v is True:
-                                verdict, via = True, "menu"
-                            elif v is False:
-                                reason = "меню «Вставить» тоже отклонено полем"
-                        else:
-                            print(f"[insert] меню «Вставить» не сработало: {m_err}")
-                            reason = reason or f"меню: {m_err}"
+                            ok_m, m_err = _send_paste_via_menu(app)
+                            if ok_m:
+                                sent, via = True, "menu"
+                                verdict = _poll_insert(text, before)
+                                if verdict is not True:
+                                    verdict = None
+                            else:
+                                print(f"[insert] меню «Вставить» не сработало: {m_err}")
+                                reason = reason or f"меню: {m_err}"
                 else:
                     # Нечитаемое поле: РОВНО ОДИН слепой удар одним вызовом —
                     # меню «Вставить», при отказе точечный Cmd+V, во frontmost —

@@ -120,25 +120,23 @@ run("ax-verified", dict(
     ["прямая запись", "[insert success]", "ax-write"],
     [("ax", 1), ("put", 0), ("paste", 0), ("restore", 0), ("blind", 0)])
 
-# 2. AX-запись принята, но verify не нашёл хвост → короткий повторный опрос
-#    (страховка от дубля), затем буферный путь с реальными вердиктами
-run("ax-rewrote", dict(
-    ax=lambda t: ("TextEdit", "WROTE", "AXTextArea", "переписано приложением"),
+# 2. AX-запись прошла, пользователь мгновенно отправил сообщение и очистил поле:
+#    отсутствие текста при read-back не разрешает второй транспорт.
+run("ax-immediate-send", dict(
+    ax=lambda t: ("Claude UI", "WROTE", "AXTextArea", ""),
     js=JS_SKIP, option=OPT_OK, put=PUT_OK, paste=PASTE_OK,
-    blind=BLIND_ERR,
-    poll=lambda t, b: True if calls["paste"] else False,
-    menu=MENU_ERR, activate=NOACT),
-    ["переписало вставку", "[insert success]", "paste"],
-    [("put", 1), ("paste", 1), ("menu", 0), ("restore", 1)])
+    blind=BLIND_ERR, poll=lambda t, b: False, menu=MENU_ERR, activate=NOACT),
+    ["без повторной вставки", "[insert sent]", "ax-write"],
+    [("put", 0), ("paste", 0), ("menu", 0), ("type", 0), ("restore", 0)])
 
-# 2b. AX-запись принята, read-back вернул устаревшее → повторный опрос видит
-#     текст → success БЕЗ буферного удара (страховка от дубля сработала)
-run("ax-late-verify", dict(
+# 2b. AXSetValue отработал, но приложение вернуло устаревшее значение:
+#     также не добиваем текст другим транспортом.
+run("ax-stale-readback", dict(
     ax=lambda t: ("TextEdit", "WROTE", "AXTextArea", "старое значение"),
     js=JS_SKIP, option=OPT_OK, put=PUT_OK, paste=PASTE_OK,
     blind=BLIND_ERR, poll=lambda t, b: True, menu=MENU_ERR, activate=NOACT),
-    ["проверено с задержкой", "[insert success]"],
-    [("put", 0), ("paste", 0), ("restore", 0)])
+    ["без повторной вставки", "[insert sent]"],
+    [("put", 0), ("paste", 0), ("type", 0), ("restore", 0)])
 
 # 3. Читаемое поле отказало AX-записи (WRITEFAIL) → Cmd+V → poll True
 run("writefail-paste", dict(
@@ -148,25 +146,25 @@ run("writefail-paste", dict(
     ["отклонило прямую запись", "[insert success]"],
     [("put", 1), ("paste", 1), ("menu", 0), ("blind", 0)])
 
-# 4. Поле дважды отвергло Cmd+V → меню → poll True
-run("reject-menu", dict(
-    ax=lambda t: ("TextEdit", "WRITEFAIL", "AXTextArea", "старый текст"),
+# 4. Cmd+V прошёл, пользователь сразу отправил сообщение: пустое поле не
+#    запускает повторный Cmd+V, меню или посимвольный набор.
+run("paste-immediate-send", dict(
+    ax=lambda t: ("Claude UI", "WRITEFAIL", "AXTextArea", "старый текст"),
     js=JS_SKIP, option=OPT_OK, put=PUT_OK, paste=PASTE_OK,
-    blind=BLIND_ERR,
-    poll=lambda t, b: True if calls["menu"] else False,
+    blind=BLIND_ERR, poll=lambda t, b: False,
     menu=MENU_OK, activate=NOACT),
-    ["[insert success]", "menu"],
-    [("paste", 2), ("menu", 1), ("type", 0)])
+    ["без повторной вставки", "[insert sent]", "paste"],
+    [("paste", 1), ("menu", 0), ("type", 0)])
 
-# 5. Поле отвергло всё → посимвольный набор → poll True
-run("reject-type", dict(
+# 5. Cmd+V доказанно не отправлен → разрешён один другой транспорт (меню),
+#    после него повторов также нет, даже если поле уже очистилось.
+run("paste-not-sent-menu-once", dict(
     ax=lambda t: ("TextEdit", "WRITEFAIL", "AXTextArea", "старый текст"),
-    js=JS_SKIP, option=OPT_OK, put=PUT_OK, paste=PASTE_OK,
-    blind=BLIND_ERR,
-    poll=lambda t, b: True if calls["type"] else False,
-    menu=MENU_ERR, activate=NOACT),
-    ["вставка набором", "[insert success]"],
-    [("paste", 2), ("menu", 1), ("type", 1)])
+    js=JS_SKIP, option=OPT_OK, put=PUT_OK, paste=PASTE_ERR,
+    blind=BLIND_ERR, poll=lambda t, b: False,
+    menu=MENU_OK, activate=NOACT),
+    ["[insert sent]", "menu"],
+    [("paste", 1), ("menu", 1), ("type", 0)])
 
 # 6. Нечитаемое поле НЕ в браузере: JS пропускается → один слепой удар (MENU)
 run("blind-nonbrowser", dict(
@@ -269,6 +267,19 @@ run("blind-put-fail", dict(
     blind=BLIND_ERR, poll=lambda t, b: None, menu=MENU_ERR, activate=NOACT),
     ["[insert sent]", "type"],
     [("blind", 0), ("type", 1)])
+
+send_node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                 and n.name == "_send_paste_keystroke")
+key_calls = {"pid": 0, "cg": 0, "osa": 0}
+key_ns = {
+    "_Quartz": object(),
+    "_pid_of_app": lambda app: key_calls.__setitem__("pid", key_calls["pid"] + 1) or 42,
+    "_cgevent_paste": lambda pid: key_calls.__setitem__("cg", key_calls["cg"] + 1) or True,
+    "_osa": lambda *a, **k: (key_calls.__setitem__("osa", key_calls["osa"] + 1) or True, ""),
+}
+exec(compile(ast.Module(body=[send_node], type_ignores=[]), SRC, "exec"), key_ns)
+check("один Cmd+V: одно CGEvent", key_ns["_send_paste_keystroke"]("Claude UI")
+      and key_calls == {"pid": 1, "cg": 1, "osa": 0}, str(key_calls))
 
 print()
 print("ВСЕ ПРОШЛИ" if FAIL == 0 else f"ПРОВАЛОВ: {FAIL}")
