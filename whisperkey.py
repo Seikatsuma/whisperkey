@@ -1126,8 +1126,10 @@ def _ax_smart_insert_fast(text: str, try_unlock: bool = True):
                 okv, cf = _AXAPI.AXValueGetValue(
                     rng, _AXAPI.AXValueGetType(rng), None)
                 if okv:
-                    loc = int(getattr(cf, "location", cf[0]))
-                    sel_len = int(getattr(cf, "length", cf[1]))
+                    try:
+                        loc, sel_len = int(cf.location), int(cf.length)
+                    except AttributeError:
+                        loc, sel_len = int(cf[0]), int(cf[1])
             except Exception:
                 pass
         loc = max(0, min(loc, len(cur)))
@@ -1253,11 +1255,101 @@ _BLIND_STRIKE_SCRIPT = '''on run argv
     return "ERR"
 end run'''
 
+def _pid_of_app(app: str) -> int:
+    """pid приложения по имени (для точечных AX/CGEvent); 0 — не нашли."""
+    if _NSWorkspace is None:
+        return 0
+    try:
+        if app:
+            low = app.lower()
+            for a in _NSWorkspace.sharedWorkspace().runningApplications():
+                if (a.localizedName() or "").lower() == low:
+                    return int(a.processIdentifier())
+        fa = _NSWorkspace.sharedWorkspace().frontmostApplication()
+        return int(fa.processIdentifier()) if fa is not None else 0
+    except Exception:
+        return 0
+
+def _menu_paste_press(pid: int) -> bool:
+    """AXPress на пункте «Paste/Вставить» меню «Edit/Правка» — прямой вызов,
+    без osascript. Нажимаем только ЖИВОЙ пункт (AXEnabled): клик по мёртвому
+    вернул бы успех без вставки — тихая потеря."""
+    try:
+        app_el = _AXAPI.AXUIElementCreateApplication(pid)
+        ok, mb = _ax_get(app_el, "AXMenuBar")
+        if not ok or mb is None:
+            return False
+        ok, bar_items = _ax_get(mb, "AXChildren")
+        if not ok or not bar_items:
+            return False
+        for bi in bar_items:
+            _, t = _ax_get(bi, "AXTitle")
+            if t not in ("Edit", "Правка"):
+                continue
+            ok, menus = _ax_get(bi, "AXChildren")
+            if not ok or not menus:
+                continue
+            ok, items = _ax_get(menus[0], "AXChildren")
+            if not ok or not items:
+                continue
+            for it in items:
+                _, t2 = _ax_get(it, "AXTitle")
+                if t2 not in ("Paste", "Вставить"):
+                    continue
+                _, en = _ax_get(it, "AXEnabled")
+                if en is False:
+                    continue
+                perr = _AXAPI.AXUIElementPerformAction(it, "AXPress")
+                if perr == 0:
+                    return True
+        return False
+    except Exception:
+        return False
+
+def _cgevent_paste(pid: int = 0) -> bool:
+    """Cmd+V синтезированным событием Quartz: в процесс pid или во frontmost."""
+    if _Quartz is None:
+        return False
+    try:
+        src = _Quartz.CGEventSourceCreate(
+            _Quartz.kCGEventSourceStateHIDSystemState)
+        down = _Quartz.CGEventCreateKeyboardEvent(src, 0x09, True)
+        up = _Quartz.CGEventCreateKeyboardEvent(src, 0x09, False)
+        _Quartz.CGEventSetFlags(down, _Quartz.kCGEventFlagMaskCommand)
+        _Quartz.CGEventSetFlags(up, _Quartz.kCGEventFlagMaskCommand)
+        if pid:
+            _Quartz.CGEventPostToPid(pid, down)
+            _Quartz.CGEventPostToPid(pid, up)
+        else:
+            _Quartz.CGEventPost(_Quartz.kCGHIDEventTap, down)
+            _Quartz.CGEventPost(_Quartz.kCGHIDEventTap, up)
+        return True
+    except Exception:
+        return False
+
+def _blind_strike_fast(app: str):
+    """Тот же один удар, что _blind_strike, но внутри процесса:
+    меню «Вставить» AXPress → Cmd+V в pid → Cmd+V во frontmost.
+    None — быстрый путь не сработал, пробуем osascript-версию."""
+    if _AXAPI is None:
+        return None
+    pid = _pid_of_app(app)
+    if pid and _menu_paste_press(pid):
+        return "MENU", ""
+    if pid and _cgevent_paste(pid):
+        return "KEY", ""
+    if _cgevent_paste(0):
+        return "KEYF", ""
+    return None
+
 def _blind_strike(app: str) -> tuple:
     """Один слепой удар в нечитаемое поле, одним osascript.
     (transport, err) — transport: MENU|KEY|KEYF|"" при полном отказе."""
     if not _IS_MAC:
         return "", "not mac"
+    fast = _blind_strike_fast(app)
+    if fast is not None:
+        return fast
     try:
         r = subprocess.run(["/usr/bin/osascript", "-e", _BLIND_STRIKE_SCRIPT,
                             app or ""], capture_output=True, timeout=4, text=True)
