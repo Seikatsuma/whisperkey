@@ -10,13 +10,20 @@
 set -euo pipefail
 
 RECORDINGS_DIR="${1:-$HOME/Library/Application Support/WhisperKey/Recordings}"
-LOG_DIR="$HOME/Library/Logs"
-LOG_FILE="$LOG_DIR/whisperkey-cleanup.log"
+LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 PLIST_LABEL="com.seikatsuma.whisperkey.recording-cleanup"
-PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
+PLIST_PATH="$LAUNCH_AGENTS_DIR/${PLIST_LABEL}.plist"
 
-mkdir -p "$LOG_DIR"
-mkdir -p "$HOME/Library/LaunchAgents"
+TOOLS_DIR="$(cd "$(dirname "$0")" && pwd)"
+RUNNER="$TOOLS_DIR/whisperkey-cleanup-runner.sh"
+
+if [ ! -x "$RUNNER" ]; then
+    echo "Не найден runner: $RUNNER"
+    echo "Убедитесь, что скрипт tools/whisperkey-cleanup-runner.sh лежит рядом и исполняемый."
+    exit 1
+fi
+
+mkdir -p "$LAUNCH_AGENTS_DIR"
 
 # Простая проверка: если папки ещё нет, предупреждаем, но не ломаемся.
 if [ ! -d "$RECORDINGS_DIR" ]; then
@@ -27,6 +34,7 @@ fi
 
 # Абсолютный путь для plist (LaunchAgent не любит тильды и переменные).
 ABS_RECORDINGS_DIR="$(cd "$RECORDINGS_DIR" && pwd -P)"
+ABS_RUNNER="$(cd "$TOOLS_DIR" && pwd -P)/whisperkey-cleanup-runner.sh"
 
 cat > "$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -39,36 +47,13 @@ cat > "$PLIST_PATH" <<EOF
     <integer>3600</integer>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/find</string>
+        <string>${ABS_RUNNER}</string>
         <string>${ABS_RECORDINGS_DIR}</string>
-        <string>-maxdepth</string>
-        <string>1</string>
-        <string>-type</string>
-        <string>f</string>
-        <string>\(</string>
-        <string>-name</string>
-        <string>*.m4a</string>
-        <string>-o</string>
-        <string>-name</string>
-        <string>*.wav</string>
-        <string>-o</string>
-        <string>-name</string>
-        <string>*.caf</string>
-        <string>-o</string>
-        <string>-name</string>
-        <string>*.aac</string>
-        <string>-o</string>
-        <string>-name</string>
-        <string>*.mp3</string>
-        <string>\)</string>
-        <string>-mmin</string>
-        <string>+1440</string>
-        <string>-delete</string>
     </array>
     <key>StandardOutPath</key>
-    <string>${LOG_FILE}</string>
+    <string>$HOME/Library/Logs/whisperkey-cleanup.log</string>
     <key>StandardErrorPath</key>
-    <string>${LOG_FILE}</string>
+    <string>$HOME/Library/Logs/whisperkey-cleanup.log</string>
 </dict>
 </plist>
 EOF
@@ -82,5 +67,6 @@ launchctl start "$PLIST_LABEL"
 
 echo "LaunchAgent установлен: $PLIST_PATH"
 echo "Папка очистки: $ABS_RECORDINGS_DIR"
-echo "Журнал: $LOG_FILE"
+echo "Runner: $ABS_RUNNER"
+echo "Журнал: $HOME/Library/Logs/whisperkey-cleanup.log"
 echo "Первый запрос сделан. Проверить состояние: launchctl list | grep $PLIST_LABEL"

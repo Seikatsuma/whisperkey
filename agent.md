@@ -835,8 +835,9 @@ pbcopy/pbpaste. Импорты pyobjc под try — нет пакета → с�
    Статусы: WROTE (verify в Python через `_insert_verified`), WRITEFAIL
    (читаемо, запись отказана → буферный путь с реальными вердиктами),
    UNREADABLE / NOFOCUS / ERROR. Буфер обмена и клавиши не трогаются.
-   Ушёл фокус за время ASR → `_activate_app` на приложение начала записи,
-   повтор ступени.
+   Цель выбирается в момент вставки (frontmost/focused), не на момент начала
+   записи: приложение не активируется обратно, пользователь переключается
+   свободно во время диктовки.
 2. UNREADABLE/NOFOCUS + браузер → `_js_insert`: AppleScript-JS
    активной вкладки `execCommand('insertText')` + чтение
    `document.activeElement` назад — настоящая проверка там, где AX молчит.

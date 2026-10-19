@@ -824,7 +824,6 @@ OPTION_WAIT_SEC = 1.5         # сколько ждём отпускания Opt
 
 _IS_MAC = (sys.platform == "darwin")
 _opt_down = False             # Option физически зажат — по событиям listener'а
-_focus_app_at_start = ""      # frontmost-приложение на момент начала записи
 
 # ─── Быстрый путь вставки внутри процесса (pyobjc) ──────────────────────────
 # Каждый вызов osascript — порождение процесса ~0.1–0.3с; на нечитаемом поле
@@ -1616,7 +1615,6 @@ def _wait_option_release() -> bool:
 def direct_insert(text: str) -> float:
     """Лестница транспортов с проверкой факта на каждой ступени.
     Возвращает длительность вставки, сек (для строки [timing])."""
-    global _focus_app_at_start
     t_ins0 = time.time()
     try:
         text_bytes = text.encode('utf-8')
@@ -1628,28 +1626,14 @@ def direct_insert(text: str) -> float:
         reason = ""
 
         # ── Ступень 1: прямая AX-запись с verify одним вызовом ───────────────
+        # Цель — текущее поле на момент вставки, не на момент начала записи.
         # Разблокировку пропускаем для приложений, где она уже не помогла.
-        focus_hint = (_focus_app_at_start or "").lower()
-        app, st, role, val = _ax_smart_insert(
-            text, try_unlock=(focus_hint not in _ax_unlock_failed))
+        app, st, role, val = _ax_smart_insert(text, try_unlock=True)
+        focus_hint = (app or "").lower()
         readable = st in ("WROTE", "WRITEFAIL")
         before = val if readable else None
         if st == "UNREADABLE":
-            _ax_unlock_failed.add((app or _focus_app_at_start or "").lower())
-
-        # Фокус ушёл за время распознавания — возвращаем в приложение,
-        # где диктовка началась, и повторяем ступень.
-        if app and _focus_app_at_start and app != _focus_app_at_start:
-            print(f"[insert] фокус за время распознавания: "
-                  f"{_focus_app_at_start} → {app} — возвращаю")
-            if _activate_app(_focus_app_at_start):
-                time.sleep(0.25)
-                app, st, role, val = _ax_smart_insert(
-                    text, try_unlock=(focus_hint not in _ax_unlock_failed))
-                readable = st in ("WROTE", "WRITEFAIL")
-                before = val if readable else before
-                if st == "UNREADABLE":
-                    _ax_unlock_failed.add((app or "").lower())
+            _ax_unlock_failed.add(focus_hint)
 
         if st == "WROTE":
             if _insert_verified(text, None, val):
@@ -2234,7 +2218,7 @@ def _latch_watchdog(sid: int) -> None:
 def on_press(key):
     global is_recording, recording_data, processing, trigger_held, last_trigger_ts, session_counter, active_session_id, session_phase
     global latch_active, _latch_deadline, _latch_started_ts, _last_release_ts, _release_seq
-    global _opt_down, _focus_app_at_start
+    global _opt_down
     now = time.time()
     if _fam(key):
         _opt_down = True
@@ -2337,13 +2321,6 @@ def on_press(key):
 
                 audio_dropouts.clear()
                 is_recording = True
-                # Приложение, в котором начали диктовку: если за время
-                # распознавания фокус уйдёт, вставка вернёт его сюда.
-                _focus_app_at_start = ""
-                def _cap_focus():
-                    global _focus_app_at_start
-                    _focus_app_at_start = _frontmost_app()
-                threading.Thread(target=_cap_focus, daemon=True).start()
                 # Уведомление ПОСЛЕ фактического начала захвата: раньше «говори»
                 # выдавалось до того, как микрофон отдавал первый сэмпл.
                 pill.set_state("recording")
