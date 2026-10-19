@@ -1481,8 +1481,10 @@ def _latch_watchdog(sid: int) -> None:
 def on_press(key):
     global is_recording, recording_data, processing, trigger_held, last_trigger_ts, session_counter, active_session_id, session_phase
     global latch_active, _latch_deadline, _latch_started_ts, _last_release_ts, _release_seq
+    global _opt_down, _focus_app_at_start
     now = time.time()
     if _fam(key):
+        _opt_down = True
         _tlog(f"P {key} trig={is_trigger(key)} held={trigger_held} ph={session_phase} "
               f"latch={int(latch_active)} win={_latch_deadline - now:+.3f} "
               f"postRel={now - _last_release_ts:.3f}")
@@ -1582,6 +1584,13 @@ def on_press(key):
 
                 audio_dropouts.clear()
                 is_recording = True
+                # Приложение, в котором начали диктовку: если за время
+                # распознавания фокус уйдёт, вставка вернёт его сюда.
+                _focus_app_at_start = ""
+                def _cap_focus():
+                    global _focus_app_at_start
+                    _focus_app_at_start = _frontmost_app()
+                threading.Thread(target=_cap_focus, daemon=True).start()
                 # Уведомление ПОСЛЕ фактического начала захвата: раньше «говори»
                 # выдавалось до того, как микрофон отдавал первый сэмпл.
                 pill.set_state("recording")
@@ -1614,7 +1623,9 @@ def on_press(key):
 
 def on_release(key):
     global is_recording, processing, trigger_held, session_counter, session_phase, _latch_deadline, _last_release_ts, _release_seq
+    global _opt_down
     if _fam(key):
+        _opt_down = False
         _tlog(f"R {key} trig={is_trigger(key)} latch={int(latch_active)} "
               f"rec={int(is_recording)} ph={session_phase}")
     if is_trigger(key):
@@ -1647,6 +1658,111 @@ def on_release(key):
             _begin_stop()
         else:
             threading.Thread(target=_latch_window_then_stop, args=(seq,), daemon=True).start()
+
+# ─── Серверный мост: сторож туннеля (19.10.26) ────────────────────────────────
+# Туннель поднимал только лаунчер и только один раз: ssh без перезапуска умирал
+# от любого разрыва сети, и мост был мёртв до перезапуска WhisperKey — а при
+# запуске напрямую python3 его не было вовсе. Жалоба «без VPN не работает»
+# именно про это: без VPN мост — единственный живой путь распознавания.
+# Теперь сторож раз в BRIDGE_CHECK_SEC проверяет /health и переподнимает
+# туннель сам. Работает только на macOS: на сервере мост и так локальный.
+
+BRIDGE_HOST = "claude@45.39.60.20"
+BRIDGE_PID_FILE = "/tmp/whisperkey_tunnel.pid"
+BRIDGE_ASR_URL = "http://127.0.0.1:8092/audio/transcriptions"
+BRIDGE_CHECK_SEC = 30
+
+def _bridge_health_url() -> str:
+    url = _engine.ctx.remote_asr_url or BRIDGE_ASR_URL
+    return url.rsplit("/", 2)[0] + "/health"
+
+def _bridge_alive() -> bool:
+    try:
+        return http_session.get(_bridge_health_url(), timeout=3.0).status_code == 200
+    except Exception:
+        return False
+
+def _kill_stale_tunnel() -> None:
+    """Гасит висючий ssh-туннель строго по сохранённому PID — и только если это
+    действительно наш туннель (PID за время мог переиспользоваться)."""
+    try:
+        pid = int(open(BRIDGE_PID_FILE).read().strip())
+    except Exception:
+        return
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=3).stdout
+        if "8092:127.0.0.1:8092" not in out:
+            return
+        os.kill(pid, 15)
+    except Exception:
+        pass
+
+def _spawn_tunnel() -> bool:
+    """Поднимает ssh-туннель и ждёт /health. True — мост доступен."""
+    _kill_stale_tunnel()
+    try:
+        p = subprocess.Popen(
+            ["ssh", "-N", "-L", "8092:127.0.0.1:8092",
+             "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+             "-o", "ExitOnForwardFailure=yes",
+             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2",
+             BRIDGE_HOST],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            with open(BRIDGE_PID_FILE, "w") as f:
+                f.write(str(p.pid))
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[bridge] туннель не поднялся: {e}")
+        return False
+    for _ in range(5):
+        time.sleep(0.7)
+        if _bridge_alive():
+            return True
+    return False
+
+def _bridge_watchdog() -> None:
+    while True:
+        if _bridge_alive():
+            if not _engine.ctx.remote_asr_url:
+                _engine.ctx.remote_asr_url = BRIDGE_ASR_URL
+                print("[bridge] серверный мост подключён — резерв через сервер")
+        else:
+            if _engine.ctx.remote_asr_url:
+                _engine.ctx.remote_asr_url = ""
+                print("[bridge] мост не отвечает — переподнимаю туннель")
+            if _spawn_tunnel():
+                _engine.ctx.remote_asr_url = BRIDGE_ASR_URL
+                print("[bridge] туннель поднят — мост снова доступен")
+        time.sleep(BRIDGE_CHECK_SEC)
+
+def _probe_asr_paths() -> None:
+    """Разовая проверка доступности облачных ступеней на старте.
+
+    Без VPN Deepgram с домашнего IP недоступен (проверено поведением 19.10.26),
+    а Groq в гео-блоке 403 — и без пробы каждая диктовка платила их таймаутами
+    (~10-20с на Deepgram + ретраи Groq), прежде чем каскад доходил до моста.
+    Мёртвый путь помечается сетевым блоком сразу — дальше каскад идёт мимо него.
+    """
+    try:
+        http_session.head("https://api.deepgram.com/", timeout=3.0)
+    except Exception as e:
+        from speech_engine.deepgram_engine import NETWORK_BLOCK_SECONDS
+        st = _engine.ctx.deepgram_state
+        st.blocked_until = time.time() + NETWORK_BLOCK_SECONDS
+        st.blocked_by_network = True
+        st.last_reason = f"нет связи ({type(e).__name__})"
+        print(f"[engine fallback] deepgram: нет связи при старте ({type(e).__name__}) "
+              f"— ступень выкл на {int(NETWORK_BLOCK_SECONDS)}с")
+    if GROQ_API_KEY and GROQ_API_KEY != "YOUR_GROQ_API_KEY_HERE":
+        try:
+            from speech_engine.groq_engine import background_cloud_probe
+            background_cloud_probe(api_key=GROQ_API_KEY,
+                                   state=_engine.ctx.cloud_state, session=http_session)
+        except Exception:
+            pass
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
@@ -1785,6 +1901,16 @@ def main():
             except Exception:
                 pass
         threading.Thread(target=_ping_bridge_version, daemon=True).start()
+
+    # Проба доступности облачных ступеней + сторож туннеля моста (см. выше).
+    threading.Thread(target=_probe_asr_paths, daemon=True).start()
+    if _IS_MAC and not os.environ.get("WHISPERKEY_NO_TUNNEL"):
+        threading.Thread(target=_bridge_watchdog, daemon=True).start()
+
+    if _engine.ctx.engine_mode != "auto":
+        print(f"Режим движков: {_engine.ctx.engine_mode} (ASR_ENGINE в .env)")
+    if _engine.ctx.yandex_api_key:
+        print("Резерв без VPN: Yandex SpeechKit подключён")
 
     print("Готов! Зажми ПРАВЫЙ OPTION для записи.")
     notify("WhisperKey", f"Готов к работе! (v{ver})")
