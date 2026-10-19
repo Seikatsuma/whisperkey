@@ -513,6 +513,33 @@ def _eval_collect_worker(audio: np.ndarray, dur: float, session_id: int) -> None
         except Exception as e:
             print(f"[eval] save error: {e}")
 
+def _recording_collect_worker(audio: np.ndarray, dur: float, session_id: int) -> None:
+    """Сохраняет запись в постоянное локальное хранилище (24 часа)."""
+    if not RECORDINGS_ENABLED or dur < RECORDINGS_MIN_DURATION:
+        return
+    try:
+        os.makedirs(RECORDINGS_ROOT, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        fname = f"{stamp}_{dur:.1f}s_id{session_id}.wav"
+        wav_path = os.path.join(RECORDINGS_ROOT, fname)
+        _write_raw_recording_wav(audio, wav_path)
+        print(f"[recordings] Сохранено: {fname}")
+    except Exception as e:
+        print(f"[recordings] save error: {e}")
+
+
+def schedule_recording_collect(audio: np.ndarray, dur: float, session_id: int) -> None:
+    """Фоновое сохранение записи в 24-часовое хранилище."""
+    if not RECORDINGS_ENABLED or dur < RECORDINGS_MIN_DURATION:
+        return
+    audio_copy = np.array(audio, dtype=np.float32, copy=True)
+    threading.Thread(
+        target=_recording_collect_worker,
+        args=(audio_copy, dur, session_id),
+        daemon=True,
+    ).start()
+
+
 def schedule_eval_sample_collect(audio: np.ndarray, dur: float, session_id: int) -> None:
     """Фоновое сохранение записи — не блокирует распознавание."""
     if not EVAL_SAMPLES_ENABLED or dur < 0.5:
@@ -1922,6 +1949,7 @@ def process_audio(audio_snapshot: list, session_id: int):
                 return
 
         schedule_eval_sample_collect(audio, dur, session_id)
+        schedule_recording_collect(audio, dur, session_id)
 
         print(f"[rec] {dur:.1f}s → распознаю...")
         t_start = time.time()
