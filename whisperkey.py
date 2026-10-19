@@ -787,7 +787,39 @@ _IS_MAC = (sys.platform == "darwin")
 _opt_down = False             # Option физически зажат — по событиям listener'а
 _focus_app_at_start = ""      # frontmost-приложение на момент начала записи
 
+# ─── Быстрый путь вставки внутри процесса (pyobjc) ──────────────────────────
+# Каждый вызов osascript — порождение процесса ~0.1–0.3с; на нечитаемом поле
+# их шло 3–4 подряд — это почти вся видимая секунда между гашением плашки и
+# текстом (Егор 19.10.26: «после загрузки жду ~секунду»). AppKit/Quartz уже
+# приезжают с pynput, поэтому AX-запись, буфер, пункт меню «Вставить» и Cmd+V
+# делаем прямыми вызовами API за миллисекунды; любой отказ быстрого пути →
+# прежний osascript-путь, поведение не меняется.
+_AXAPI = None
+_NSWorkspace = None
+_NSPasteboard = None
+_PBSTR = None
+try:
+    if _IS_MAC:
+        import ApplicationServices as _AXAPI_mod
+        from AppKit import NSWorkspace as _NSW, NSPasteboard as _NSP
+        try:
+            from AppKit import NSPasteboardTypeString as _PBSTR_mod
+        except ImportError:
+            from AppKit import NSStringPboardType as _PBSTR_mod
+        _AXAPI = _AXAPI_mod
+        _NSWorkspace = _NSW
+        _NSPasteboard = _NSP
+        _PBSTR = _PBSTR_mod
+except Exception:
+    _AXAPI = None
+
 def _clipboard_now() -> bytes:
+    if _NSPasteboard is not None:
+        try:
+            s = _NSPasteboard.generalPasteboard().stringForType_(_PBSTR)
+            return (s or "").encode("utf-8")
+        except Exception:
+            pass
     try:
         return subprocess.run(['pbpaste'], capture_output=True, timeout=2).stdout
     except Exception:
@@ -801,6 +833,15 @@ def _put_clipboard(data: bytes) -> bool:
     а на экран приезжало то, что человек копировал до этого.
     """
     try:
+        if _NSPasteboard is not None:
+            try:
+                pb = _NSPasteboard.generalPasteboard()
+                pb.clearContents()
+                pb.setString_forType_(data.decode("utf-8"), _PBSTR)
+                if (pb.stringForType_(_PBSTR) or "").encode("utf-8") == data:
+                    return True
+            except Exception:
+                pass
         subprocess.run(['pbcopy'], input=data, check=True, timeout=5)
     except Exception as e:
         print(f"[insert] буфер не записался: {e}")
@@ -1035,6 +1076,77 @@ end run'''
 # (жалоба «долго жду вставки», 19.10.26).
 _ax_unlock_failed: set = set()
 
+def _ax_get(el, attr):
+    """(ok, value) для AX-атрибута в обёртке — pyobjc возвращает (err, val)."""
+    try:
+        err, val = _AXAPI.AXUIElementCopyAttributeValue(el, attr, None)
+        return err == 0, val
+    except Exception:
+        return False, None
+
+def _ax_smart_insert_fast(text: str, try_unlock: bool = True):
+    """Тот же контракт, что у _ax_smart_insert, но прямыми AX-вызовами —
+    без osascript (~0.01–0.03с вместо ~0.15–0.3с). None — быстрый путь
+    недоступен/сброшен, работает медленный."""
+    if _AXAPI is None or _NSWorkspace is None:
+        return None
+    try:
+        fa = _NSWorkspace.sharedWorkspace().frontmostApplication()
+        if fa is None:
+            return "", "NOFOCUS", "", ""
+        app = fa.localizedName() or ""
+        pid = fa.processIdentifier()
+        sw = _AXAPI.AXUIElementCreateSystemWide()
+        ok, el = _ax_get(sw, "AXFocusedUIElement")
+        app_el = _AXAPI.AXUIElementCreateApplication(pid)
+        if (not ok or el is None) and try_unlock:
+            _AXAPI.AXUIElementSetAttributeValue(
+                app_el, "AXEnhancedUserInterface", True)
+            time.sleep(0.03)
+            ok, el = _ax_get(sw, "AXFocusedUIElement")
+        if not ok or el is None:
+            return app, "NOFOCUS", "", ""
+        _, role = _ax_get(el, "AXRole")
+        role = role or ""
+        ok, cur = _ax_get(el, "AXValue")
+        if (not ok or not isinstance(cur, str)) and try_unlock:
+            _AXAPI.AXUIElementSetAttributeValue(
+                app_el, "AXEnhancedUserInterface", True)
+            time.sleep(0.03)
+            ok2, el2 = _ax_get(sw, "AXFocusedUIElement")
+            if ok2 and el2 is not None:
+                el = el2
+            ok, cur = _ax_get(el, "AXValue")
+        if not ok or not isinstance(cur, str):
+            return app, "UNREADABLE", role, ""
+        loc, sel_len = len(cur), 0
+        okr, rng = _ax_get(el, "AXSelectedTextRange")
+        if okr and rng is not None:
+            try:
+                okv, cf = _AXAPI.AXValueGetValue(
+                    rng, _AXAPI.AXValueGetType(rng), None)
+                if okv:
+                    loc = int(getattr(cf, "location", cf[0]))
+                    sel_len = int(getattr(cf, "length", cf[1]))
+            except Exception:
+                pass
+        loc = max(0, min(loc, len(cur)))
+        sel_len = max(0, min(sel_len, len(cur) - loc))
+        new = cur[:loc] + text + cur[loc + sel_len:]
+        werr = _AXAPI.AXUIElementSetAttributeValue(el, "AXValue", new)
+        if werr != 0:
+            return app, "WRITEFAIL", role, cur
+        try:
+            r2 = _AXAPI.AXValueCreate(
+                _AXAPI.kAXValueCFRangeType, (loc + len(text), 0))
+            _AXAPI.AXUIElementSetAttributeValue(el, "AXSelectedTextRange", r2)
+        except Exception:
+            pass
+        okv2, v2 = _ax_get(el, "AXValue")
+        return app, "WROTE", role, (v2 if okv2 and isinstance(v2, str) else "")
+    except Exception:
+        return None
+
 def _ax_smart_insert(text: str, try_unlock: bool = True) -> tuple:
     """Запись в фокусное поле одним вызовом: (app, status, role, value).
     status: WROTE | WRITEFAIL | UNREADABLE | NOFOCUS | ERROR | NOMAC.
@@ -1042,6 +1154,9 @@ def _ax_smart_insert(text: str, try_unlock: bool = True) -> tuple:
     этого приложения она уже не сработала в этой сессии)."""
     if not _IS_MAC:
         return "", "NOMAC", "", ""
+    fast = _ax_smart_insert_fast(text, try_unlock)
+    if fast is not None:
+        return fast
     try:
         r = subprocess.run(["/usr/bin/osascript", "-e", _AX_SMART_SCRIPT, text,
                             "1" if try_unlock else "0"],
