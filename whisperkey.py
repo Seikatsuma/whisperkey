@@ -1025,10 +1025,21 @@ def _poll_insert(text: str, before, timeout: float = INSERT_VERIFY_SEC):
             return True
     return False if saw_readable else None
 
-def _send_paste_keystroke() -> bool:
-    """Cmd+V: сначала System Events (права Accessibility), затем pynput
-    (права Input Monitoring). True — транспорт принял событие; это НЕ
-    доказательство вставки — факт проверяет _poll_insert."""
+def _send_paste_keystroke(target_app: str = "") -> bool:
+    """Cmd+V: сначала ТОЧЕЧНО в процесс поля (key code и keystroke — два имени
+    события, у разных приложений принимается разное), затем во frontmost,
+    затем pynput. True — транспорт принял событие; это НЕ доказательство
+    вставки — факт проверяет _poll_insert."""
+    if target_app:
+        safe = target_app.replace("\\", "\\\\").replace('"', '\\"')
+        ok, _ = _osa(f'tell application "System Events" to tell process "{safe}" '
+                     'to key code 9 using command down', timeout=5)
+        if ok:
+            return True
+        ok, _ = _osa(f'tell application "System Events" to tell process "{safe}" '
+                     'to keystroke "v" using command down', timeout=5)
+        if ok:
+            return True
     ok, _ = _osa('tell application "System Events" to key code 9 using command down',
                  timeout=5)
     if ok:
@@ -1039,6 +1050,40 @@ def _send_paste_keystroke() -> bool:
         kb.release('v')
         kb.release(KeyboardKey.cmd)
         return True
+    except Exception:
+        return False
+
+# Третий транспорт вставки: сама команда меню «Правка → Вставить» целевого
+# приложения. Это другой механизм — не синтетическая клавиша, а вызов команды,
+# который приложение обрабатывает само. Живой случай 19.10.26: два Cmd+V
+# (System Events + pynput) «ушли», поле Brave их проглотило молча.
+_AX_MENU_PASTE_SCRIPT = '''on run argv
+    set proc to item 1 of argv
+    tell application "System Events"
+        tell process proc
+            repeat with m in {"Edit", "Правка"}
+                try
+                    set mb to menu bar item m of menu bar 1
+                    repeat with it in {"Paste", "Вставить"}
+                        try
+                            click menu item it of menu 1 of mb
+                            return "OK"
+                        end try
+                    end repeat
+                end try
+            end repeat
+        end tell
+    end tell
+    return "ERR"
+end run'''
+
+def _send_paste_via_menu(target_app: str) -> bool:
+    if not target_app or not _IS_MAC:
+        return False
+    try:
+        r = subprocess.run(["/usr/bin/osascript", "-e", _AX_MENU_PASTE_SCRIPT,
+                            target_app], capture_output=True, timeout=3, text=True)
+        return (r.stdout or "").strip() == "OK"
     except Exception:
         return False
 
@@ -1126,7 +1171,7 @@ def direct_insert(text: str):
                 if attempt == 2:
                     before, ax_app, ax_role = _ax_focused_value()
                     app_now = app_now or ax_app
-                if not _send_paste_keystroke():
+                if not _send_paste_keystroke(ax_app or app_now):
                     reason = ("клавиша Cmd+V не отправлена — проверь права "
                               "Accessibility/Input Monitoring у Терминала")
                     continue
@@ -1146,13 +1191,22 @@ def direct_insert(text: str):
                     continue    # вторая попытка — приложение могло проспать событие
                 # verdict None — поле не отвечает на AX (Brave/веб-контролы):
                 # проверить нечем, а paste мог тихо не дойти (живой случай
-                # 19.10.26 — вторая диктовка не встала). Делаем один повтор
-                # ДРУГИМ транспортом (pynput): если первый дошёл — худший исход
-                # видимый дубль, если не дошёл — спасённая диктовка. Пропуск
+                # 19.10.26: третья подряд диктовка пропала при двух «ушедших»
+                # Cmd+V). Добиваем ДРУГИМИ механизмами: команда меню
+                # «Правка → Вставить» самого приложения и pynput — у каждого
+                # свой путь события. Худший исход — видимый дубль; пропуск
                 # без всякого следа хуже дубля.
-                if attempt == 1 and _send_paste_keystroke_pynput():
-                    print("[insert] проверка недоступна — повтор Cmd+V вторым транспортом")
-                    time.sleep(0.2)
+                if attempt == 1:
+                    tgt = ax_app or app_now
+                    fired = []
+                    if _send_paste_via_menu(tgt):
+                        fired.append("меню")
+                    if _send_paste_keystroke_pynput():
+                        fired.append("pynput")
+                    if fired:
+                        print(f"[insert] проверка недоступна — повтор вставки "
+                              f"({' + '.join(fired)})")
+                        time.sleep(0.2)
                 break
 
         # Откат на посимвольный ввод: подтверждённый отказ поля или неотправленная
