@@ -115,15 +115,26 @@ run("ax-verified", dict(
     ["прямая запись", "[insert success]", "ax-write"],
     [("ax", 1), ("put", 0), ("paste", 0), ("restore", 0)])
 
-# 2. AX-запись принята, но поле переписало (verify не нашёл хвост) →
-#    буферный путь с реальными вердиктами
+# 2. AX-запись принята, но verify не нашёл хвост → короткий повторный опрос
+#    (страховка от дубля), затем буферный путь с реальными вердиктами
 run("ax-rewrote", dict(
     ax=lambda t: ("TextEdit", "WROTE", "AXTextArea", "переписано приложением"),
     axsel=AXSEL_NO, js=lambda a, t: ("SKIP", ""),
-    option=OPT_OK, put=PUT_OK, paste=PASTE_OK, poll=lambda t, b: True,
+    option=OPT_OK, put=PUT_OK, paste=PASTE_OK,
+    poll=lambda t, b: True if calls["paste"] else False,
     menu=MENU_ERR, activate=NOACT),
     ["переписало вставку", "[insert success]", "paste"],
     [("put", 1), ("paste", 1), ("menu", 0), ("restore", 1)])
+
+# 2b. AX-запись принята, read-back вернул устаревшее → повторный опрос видит
+#     текст → success БЕЗ буферного удара (страховка от дубля сработала)
+run("ax-late-verify", dict(
+    ax=lambda t: ("TextEdit", "WROTE", "AXTextArea", "старое значение"),
+    axsel=AXSEL_NO, js=lambda a, t: ("SKIP", ""),
+    option=OPT_OK, put=PUT_OK, paste=PASTE_OK, poll=lambda t, b: True,
+    menu=MENU_ERR, activate=NOACT),
+    ["проверено с задержкой", "[insert success]"],
+    [("put", 0), ("paste", 0), ("restore", 0)])
 
 # 3. Читаемое поле отказало AX-записи (WRITEFAIL) → Cmd+V → poll True
 run("writefail-paste", dict(

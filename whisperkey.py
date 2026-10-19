@@ -1329,13 +1329,19 @@ def direct_insert(text: str) -> float:
                 verdict, via = True, "ax-write"
                 print("[insert] прямая запись в поле (AX) — проверено")
             else:
-                # Запись принята, но прочитали не наш текст — приложение
-                # переписало/отклонило. Поле читаемо → буферный путь с
-                # реальными вердиктами; before = то, что в поле сейчас.
-                readable = True
-                before = val
-                reason = f"поле переписало вставку ({app or '?'})"
-                print(f"[insert] {reason} — буферный путь")
+                # Запись принята, но в поле не наш текст — либо приложение
+                # переписало, либо чтение вернуло устаревшее значение.
+                # Сначала короткий повторный опрос — если запись всё же встала,
+                # буферный удар поверх дал бы ДУБЛЬ; опрос стоит дешевле дубля.
+                v_late = _poll_insert(text, None, timeout=0.6)
+                if v_late is True:
+                    verdict, via = True, "ax-write"
+                    print("[insert] прямая запись в поле (AX) — проверено с задержкой")
+                else:
+                    readable = True
+                    before = val
+                    reason = f"поле переписало вставку ({app or '?'})"
+                    print(f"[insert] {reason} — буферный путь")
         elif st == "WRITEFAIL":
             reason = f"поле отклонило прямую запись ({app or '?'})"
             print(f"[insert] {reason} — буферный путь")
