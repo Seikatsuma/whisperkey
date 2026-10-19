@@ -23,6 +23,14 @@ TERM_CANON = {
     "github": "GitHub", "telegram": "Telegram", "groq": "Groq",
     "deepgram": "DeepGram", "ceo": "CEO", "ipad": "iPad",
     "ozon": "Ozon", "wildberries": "Wildberries",
+    # Словарь Егора 20.10.26 — его имена и названия, чтобы whisper/Deepgram
+    # писали их точно (юджайл, qlotui, мест система и т.п. со скриншотов).
+    "yougile": "YouGile", "ui": "UI", "salutespeech": "SaluteSpeech",
+    "telemost": "Телемост", "wispr": "Wispr", "flow": "Flow",
+    "brave": "Brave", "zoom": "Zoom", "miro": "Miro",
+    "termius": "Termius", "ideogram": "Ideogram", "devin": "Devin",
+    "sonnet": "Sonnet", "opus": "Opus", "haiku": "Haiku",
+    "camoufox": "Camoufox", "patchright": "Patchright",
 }
 
 TERM_FIX = [
@@ -48,6 +56,29 @@ TERM_FIX = [
     (r"\bмного(?:ген|гент)(ную|ная|ной|ные|ных|ное)\b", r"многоагент\1"),
     (r"\bмаскриб(\w*)\b", r"транскриб\1"),            # живой случай 04.10.26: «mascribator» в диктовке Егора
     (r"\bmascrib\w*\b", "транскрибатор"),
+    # Живые сбои со скриншотов Егора 20.10.26 + его словарь.
+    (r"\b(?:q[\s.]?lotui|клотуи|клод\s*ю\s*ай|claude\s*ui)\b", "Claude UI"),
+    (r"\b(?:юджайл|ugile|югайл)\w*\b", "YouGile"),
+    (r"\b(?:мест[\s-]систем\w*)\b", "мест-система"),
+    (r"\b(?:телемост|telemost)\b", "Телемост"),
+    (r"\b(?:виспр|wispr)\s*флоу\b", "Wispr Flow"),
+    (r"\b(?:салют\s*спич|salute\s*speech)\b", "SaluteSpeech"),
+    (r"\b(?:брейв|brave)\b", "Brave"),
+    (r"\b(?:текст\s*едит|textedit)\b", "TextEdit"),
+    (r"\bдевин\w*\b", "Devin"),
+    (r"\b(?:мира|miro)\b", "Miro"),
+    (r"\b(?:зум|zoom)\b", "Zoom"),
+    (r"\b(?:термиус|termius)\b", "Termius"),
+    (r"\b(?:идеограм|ideogram)\w*\b", "Ideogram"),
+    (r"\b(?:соннет|sonnet)\b", "Sonnet"),
+    (r"\b(?:опус|opus)\b", "Opus"),
+    (r"\b(?:хайку|haiku)\b", "Haiku"),
+    (r"\b(?:камуфокс|camoufox)\b", "Camoufox"),
+    (r"\b(?:патчрайт|patchright)\b", "Patchright"),
+    (r"\b(?:зарайск)\b", "Зарайск"),
+    (r"\b(?:сан\s*школ\w*|саншкол\w*)\b", "СанШкола"),
+    (r"\b(?:артрайд|artraid)\b", "Артрейд"),
+    (r"\b(?:строчков|строков)\w*\b", "Строков"),
 ]
 
 _TERM_FIX_RX: list = []   # компилируется при первом вызове
