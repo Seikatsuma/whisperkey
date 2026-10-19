@@ -1030,17 +1030,22 @@ _AX_SMART_SCRIPT = '''on run argv
     end tell
 end run'''
 
-def _ax_smart_insert(text: str) -> tuple:
+# Приложения, где разблокировка AXEnhancedUserInterface уже не помогла в этой
+# сессии — повторные попытки внутри вызова стоят ~0.1с на каждой диктовке
+# (жалоба «долго жду вставки», 19.10.26).
+_ax_unlock_failed: set = set()
+
+def _ax_smart_insert(text: str, try_unlock: bool = True) -> tuple:
     """Запись в фокусное поле одним вызовом: (app, status, role, value).
     status: WROTE | WRITEFAIL | UNREADABLE | NOFOCUS | ERROR | NOMAC.
-    Имя приложения до вызова неизвестно — разблокировку скрипт делает сам
-    внутри того же процесса (set AXEnhancedUserInterface идемпотентен и
-    дешёв: повторная выставка на следующей диктовке — миллисекунды)."""
+    try_unlock=False — пропустить попытки AXEnhancedUserInterface (когда для
+    этого приложения она уже не сработала в этой сессии)."""
     if not _IS_MAC:
         return "", "NOMAC", "", ""
     try:
         r = subprocess.run(["/usr/bin/osascript", "-e", _AX_SMART_SCRIPT, text,
-                            "1"], capture_output=True, timeout=4, text=True)
+                            "1" if try_unlock else "0"],
+                           capture_output=True, timeout=4, text=True)
         out = (r.stdout or "").rstrip("\n")
     except Exception:
         return "", "ERROR", "", ""
@@ -1089,6 +1094,64 @@ def _ax_selected_text_insert(text: str) -> tuple:
     if not ok and len(parts) > 1:
         print(f"[insert] AXSelectedText отклонён ({parts[1].strip()[:80]})")
     return app, ok
+
+# ─── Один слепой удар одним вызовом ─────────────────────────────────────────
+# Для нечитаемого поля проверить вставку нечем, и каждый лишний osascript —
+# ~0.1-0.15с ожидания у человека (жалоба «долго жду вставки», 19.10.26).
+# Вся лестница слепого пути — в одном процессе: меню «Вставить» целевого
+# приложения (не клавиша, а команда приложения; ошибка клика — доказанный
+# отказ), при отказе — Cmd+V точечно в процесс, затем во frontmost.
+# Между попытками — доказанные отказы, поэтому это ОДИН удар, не добивка.
+_BLIND_STRIKE_SCRIPT = '''on run argv
+    set proc to item 1 of argv
+    tell application "System Events"
+        if proc is not "" then
+            try
+                tell process proc
+                    repeat with m in {"Edit", "Правка"}
+                        try
+                            set mb to menu bar item m of menu bar 1
+                            repeat with it in {"Paste", "Вставить"}
+                                try
+                                    click menu item it of menu 1 of mb
+                                    return "MENU"
+                                end try
+                            end repeat
+                        end try
+                    end repeat
+                end tell
+            end try
+            try
+                tell process proc to key code 9 using command down
+                return "KEY"
+            end try
+            try
+                tell process proc to keystroke "v" using command down
+                return "KEY"
+            end try
+        end if
+        try
+            key code 9 using command down
+            return "KEYF"
+        end try
+    end tell
+    return "ERR"
+end run'''
+
+def _blind_strike(app: str) -> tuple:
+    """Один слепой удар в нечитаемое поле, одним osascript.
+    (transport, err) — transport: MENU|KEY|KEYF|"" при полном отказе."""
+    if not _IS_MAC:
+        return "", "not mac"
+    try:
+        r = subprocess.run(["/usr/bin/osascript", "-e", _BLIND_STRIKE_SCRIPT,
+                            app or ""], capture_output=True, timeout=4, text=True)
+        out = (r.stdout or "").strip()
+    except Exception as e:
+        return "", type(e).__name__
+    if not out or out.startswith("ERR"):
+        return "", out or "пустой ответ osascript"
+    return out, ""
 
 # ─── JS-путь для браузеров ───────────────────────────────────────────────────
 # AppleScript-JavaScript активной вкладки: вставка через execCommand('insertText')
@@ -1309,9 +1372,14 @@ def direct_insert(text: str) -> float:
         reason = ""
 
         # ── Ступень 1: прямая AX-запись с verify одним вызовом ───────────────
-        app, st, role, val = _ax_smart_insert(text)
+        # Разблокировку пропускаем для приложений, где она уже не помогла.
+        focus_hint = (_focus_app_at_start or "").lower()
+        app, st, role, val = _ax_smart_insert(
+            text, try_unlock=(focus_hint not in _ax_unlock_failed))
         readable = st in ("WROTE", "WRITEFAIL")
         before = val if readable else None
+        if st == "UNREADABLE":
+            _ax_unlock_failed.add((app or _focus_app_at_start or "").lower())
 
         # Фокус ушёл за время распознавания — возвращаем в приложение,
         # где диктовка началась, и повторяем ступень.
@@ -1320,9 +1388,12 @@ def direct_insert(text: str) -> float:
                   f"{_focus_app_at_start} → {app} — возвращаю")
             if _activate_app(_focus_app_at_start):
                 time.sleep(0.25)
-                app, st, role, val = _ax_smart_insert(text)
+                app, st, role, val = _ax_smart_insert(
+                    text, try_unlock=(focus_hint not in _ax_unlock_failed))
                 readable = st in ("WROTE", "WRITEFAIL")
                 before = val if readable else before
+                if st == "UNREADABLE":
+                    _ax_unlock_failed.add((app or "").lower())
 
         if st == "WROTE":
             if _insert_verified(text, None, val):
@@ -1346,26 +1417,21 @@ def direct_insert(text: str) -> float:
             reason = f"поле отклонило прямую запись ({app or '?'})"
             print(f"[insert] {reason} — буферный путь")
 
-        # ── Ступень 2: нечитаемое поле — детерминированные пути без буфера ───
-        if verdict is not True and st in ("UNREADABLE", "NOFOCUS"):
-            app2, ok_sel = _ax_selected_text_insert(text)
-            app = app or app2
-            if ok_sel:
-                sent, via = True, "axsel"
-                print("[insert] запись в AXSelectedText принята")
-            elif _is_browser(app):
-                st2, det = _js_insert(app, text)
-                if st2 == "VERIFIED":
-                    verdict, via = True, "js"
-                    print("[insert] вставка через JS вкладки — проверено")
-                elif st2 == "OK":
-                    sent, via = True, "js"
-                    print("[insert] JS вставил, чтение назад не подтвердило")
-                elif st2 == "DISABLED":
-                    _js_flag_notify_once(app)
-                    print(f"[insert] JS в {app} выключен — {det[:80]}")
-                else:
-                    print(f"[insert] JS-путь не сработал ({st2}: {det[:80]})")
+        # ── Ступень 2: нечитаемое поле — JS-путь браузера (проверяемая вставка)
+        if verdict is not True and st in ("UNREADABLE", "NOFOCUS") \
+                and _is_browser(app):
+            st2, det = _js_insert(app, text)
+            if st2 == "VERIFIED":
+                verdict, via = True, "js"
+                print("[insert] вставка через JS вкладки — проверено")
+            elif st2 == "OK":
+                sent, via = True, "js"
+                print("[insert] JS вставил, чтение назад не подтвердило")
+            elif st2 == "DISABLED":
+                _js_flag_notify_once(app)
+                print(f"[insert] JS в {app} выключен — {det[:80]}")
+            else:
+                print(f"[insert] JS-путь не сработал ({st2}: {det[:80]})")
 
         # ── Ступень 3: буферный путь (только если детерминированные не сработали)
         if verdict is not True and not sent:
@@ -1422,24 +1488,20 @@ def direct_insert(text: str) -> float:
                             print(f"[insert] меню «Вставить» не сработало: {m_err}")
                             reason = reason or f"меню: {m_err}"
                 else:
-                    # Нечитаемое поле: РОВНО ОДИН удар. Меню первым — оно само
-                    # докладывает об отказе и это не синтетическая клавиша;
-                    # её отказ → один Cmd+V. Никаких добивок — пара слепых
-                    # ударов и есть механизм дубля (живой случай 19.10.26).
+                    # Нечитаемое поле: РОВНО ОДИН слепой удар одним вызовом —
+                    # меню «Вставить», при отказе точечный Cmd+V, во frontmost —
+                    # внутри того же osascript. Без опроса и добивок: пара
+                    # слепых ударов — механизм дубля, а лишние вызовы — это
+                    # жалоба «долго жду вставки» (Егор 19.10.26).
                     if _put_clipboard(text_bytes):
                         clipboard_touched = True
-                        ok_m, m_err = _send_paste_via_menu(app)
-                        if ok_m:
-                            sent, via = True, "menu"
-                            print("[insert] проверка недоступна — вставка через меню")
+                        via, err = _blind_strike(app)
+                        if via:
+                            sent = True
+                            print(f"[insert] проверка недоступна — один удар ({via})")
                         else:
-                            print(f"[insert] меню «Вставить» не сработало: "
-                                  f"{m_err} — Cmd+V")
-                            if _send_paste_keystroke(app):
-                                sent, via = True, "key"
-                            else:
-                                reason = ("ни меню, ни Cmd+V не ушли — проверь права "
-                                          "Accessibility у Терминала")
+                            reason = (f"ни меню, ни Cmd+V не ушли ({err}) — "
+                                      "проверь права Accessibility у Терминала")
                     else:
                         reason = "буфер не записался"
 
