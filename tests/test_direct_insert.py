@@ -42,7 +42,6 @@ ns = {
     "time": time, "print": print, "kb": Kb(), "re": re,
     "_JS_BROWSERS": ("brave", "chrome", "chromium", "edge",
                      "vivaldi", "opera", "arc"),
-    "_focus_app_at_start": "",
     "RESTORE_CLIPBOARD": True,
     "_ax_unlock_failed": set(),
     "_ax_smart_insert": lambda t, try_unlock=True: SC["ax"](t),
@@ -229,21 +228,15 @@ run("option-held", dict(
     ["[insert sent]", "type"],
     [("put", 0), ("blind", 0), ("type", 1)])
 
-# 13. Фокус ушёл за время ASR → возврат в исходное приложение, повтор ступени
-ax_calls = {"n": 0}
-def _ax_drift(t):
-    ax_calls["n"] += 1
-    if ax_calls["n"] == 1:
-        return ("Safari", "NOFOCUS", "", "")
-    return ("TextEdit", "WROTE", "AXTextArea", "x Проверка записи раз ")
+# 13. Фокус ушёл за время ASR → вставка идёт в текущее приложение,
+#     не возвращаемся к приложению начала записи.
 run("focus-drift", dict(
-    ax=_ax_drift, js=JS_SKIP,
+    ax=lambda t: calls.__setitem__("ax", calls["ax"] + 1) or ("Safari", "NOFOCUS", "", ""), js=JS_SKIP,
     option=OPT_OK, put=PUT_OK, paste=PASTE_OK,
-    blind=BLIND_ERR, poll=lambda t, b: None, menu=MENU_ERR,
-    activate=lambda n: calls.__setitem__("activate", calls["activate"] + 1) or True,
-    focus_start="TextEdit"),
-    ["фокус за время распознавания", "[insert success]"],
-    [("activate", 1)])
+    blind=BLIND_MENU, poll=lambda t, b: None, menu=MENU_ERR,
+    activate=NOACT),
+    ["[insert sent]"],
+    [("activate", 0), ("ax", 1), ("blind", 1)])
 
 # 14. Всё отказало → FAILED + звук + notify, текст остаётся в буфере
 run("all-fail", dict(
