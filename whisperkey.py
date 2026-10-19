@@ -1153,9 +1153,13 @@ def direct_insert(text: str):
         reason = ""
 
         # Сначала — прямая запись в поле через AX: ни буфер, ни клавиши,
-        # ни зажатый Option не играют роли. Куда она не доходит (веб-поля),
-        # там включается буферный путь ниже.
-        ax_app2, ax_set_ok, ax_set_err = _ax_insert_direct(text)
+        # ни зажатый Option не играют роли. Пробуем только когда поле
+        # ЧИТАЕМО (before не None): прямая запись сама читает AXValue, и если
+        # читать нечего — она гарантированно откажет, а вызов стоит ~0.1-0.15с
+        # на каждой вставке в Brave (жалоба «стало дольше»).
+        ax_app2, ax_set_ok, ax_set_err = "", False, ""
+        if before is not None:
+            ax_app2, ax_set_ok, ax_set_err = _ax_insert_direct(text)
         if ax_set_ok:
             v_ax = _poll_insert(text, before)
             if v_ax is not False:
@@ -1220,6 +1224,7 @@ def direct_insert(text: str):
                     verdict = True
                     print("[insert] вставка набором текста")
                 elif v2 is False:
+                    verdict = False   # подтверждённый отказ — не «sent»
                     reason = "поле не приняло ни вставку, ни посимвольный ввод"
             except Exception as e:
                 reason = f"посимвольный ввод не прошёл ({type(e).__name__})"
