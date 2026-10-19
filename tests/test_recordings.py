@@ -92,8 +92,8 @@ def test_save_and_env_override():
     # По умолчанию — папка в ~/Library/Application Support
     check(
         "default path",
-        wk.RECORDINGS_ROOT.endswith("WhisperKey/Recordings"),
-        f"got {wk.RECORDINGS_ROOT}",
+        wk["RECORDINGS_ROOT"].endswith("WhisperKey/Recordings"),
+        f"got {wk['RECORDINGS_ROOT']}",
     )
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -101,15 +101,15 @@ def test_save_and_env_override():
         wk2 = build_module()
         check(
             "env override",
-            os.path.abspath(wk2.RECORDINGS_ROOT).rstrip("/") == os.path.abspath(tmp).rstrip("/"),
-            f"got {wk2.RECORDINGS_ROOT}",
+            os.path.abspath(wk2["RECORDINGS_ROOT"]).rstrip("/") == os.path.abspath(tmp).rstrip("/"),
+            f"got {wk2['RECORDINGS_ROOT']}",
         )
 
         # Сохраняем тестовую запись длительностью 1.0 с
-        sample_rate = wk.SAMPLE_RATE
+        sample_rate = wk2["SAMPLE_RATE"]
         samples = int(sample_rate * 1.0)
         audio = np.random.uniform(-0.1, 0.1, size=samples).astype(np.float32)
-        wk2._recording_collect_worker(audio, 1.0, session_id=42)
+        wk2["_recording_collect_worker"](audio, 1.0, session_id=42)
 
         files = [f for f in os.listdir(tmp) if f.endswith(".wav")]
         check("saved one file", len(files) == 1, f"found {files}")
@@ -123,7 +123,7 @@ def test_save_and_env_override():
 
         # Короткая запись не сохраняется
         before = len(os.listdir(tmp))
-        wk2._recording_collect_worker(audio[: int(sample_rate * 0.1)], 0.1, session_id=43)
+        wk2["_recording_collect_worker"](audio[: int(sample_rate * 0.1)], 0.1, session_id=43)
         check("short recording skipped", len(os.listdir(tmp)) == before, "unexpected file appeared")
 
 
