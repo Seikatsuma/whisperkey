@@ -1209,9 +1209,14 @@ def direct_insert(text: str):
                     # команда меню «Вставить» приложения. pynput-добивку убрал
                     # (Егор 19.10.26: лишняя сотня-две мс не нужна, а дубли он
                     # терпит, только когда редко).
-                    if _send_paste_via_menu(ax_app or app_now):
+                    ok_menu, menu_err = _send_paste_via_menu(ax_app or app_now)
+                    if ok_menu:
                         print("[insert] проверка недоступна — добивка через меню")
                         time.sleep(0.15)
+                    else:
+                        print(f"[insert] меню «Вставить» не сработало: {menu_err} — "
+                              f"повторяю Cmd+V")
+                        continue
                 break
 
         # Откат на посимвольный ввод: подтверждённый отказ поля или неотправленная
