@@ -1174,8 +1174,11 @@ def _poll_insert(text: str, before, timeout: float = INSERT_VERIFY_SEC):
     deadline = time.time() + timeout
     unreadable_deadline = time.time() + 0.35
     saw_readable = False
+    first = True
     while time.time() < deadline:
-        time.sleep(0.12)
+        # Вставка обычно видна через ~30-80 мс — первый опрос пораньше.
+        time.sleep(0.06 if first else 0.12)
+        first = False
         after, _app, _role = _ax_focused_value()
         if after is None:
             if not saw_readable and time.time() > unreadable_deadline:
@@ -1706,7 +1709,11 @@ def process_audio(audio_snapshot: list, session_id: int):
             with state_lock:
                 if active_session_id == session_id:
                     pill.set_state("idle")
-            direct_insert(text + " ")
+            ins_sec = direct_insert(text + " ")
+            # Раздельный замер: «стало дольше» почти всегда жило на стороне
+            # вставки, а не ASR — путать их нельзя.
+            print(f"[timing] asr={asr_sec:.2f}с insert={ins_sec:.2f}с "
+                  f"всего={time.time() - t_start:.2f}с")
             finalize_eval_sample_meta(
                 session_id, dur, full_raw_text, text,
                 stages={
