@@ -931,6 +931,70 @@ def _insert_verified(inserted: str, before, after) -> bool | None:
         return True
     return False
 
+# Прямая запись текста в фокусное поле через Accessibility — буфер обмена
+# не трогается ВООБЩЕ. Жалоба 19.10.26: после диктовки Cmd+V Егора вставлял
+# диктовку вместо его собственного текста из буфера. Нативные поля (TextEdit,
+# заметки, нативные мессенджеры) принимают запись; веб-поля (Brave) — нет,
+# для них остаётся буферный путь. Вставляем по AXSelectedTextRange — в
+# позицию курсора, с заменой выделения, как настоящий ввод.
+_AX_INSERT_SCRIPT = '''on run argv
+    set ins to item 1 of argv
+    tell application "System Events"
+        set fp to first application process whose frontmost is true
+        set appName to name of fp
+        try
+            set el to value of attribute "AXFocusedUIElement" of fp
+        on error
+            return appName & linefeed & "ERR:NOFOCUS"
+        end try
+        try
+            set cur to value of attribute "AXValue" of el
+        on error
+            return appName & linefeed & "ERR:NOVALUE"
+        end try
+        if cur is missing value then set cur to ""
+        set curLen to count of cur
+        set loc to curLen
+        set selLen to 0
+        try
+            set sel to value of attribute "AXSelectedTextRange" of el
+            set loc to location of sel
+            set selLen to length of sel
+        end try
+        if loc < 0 then set loc to 0
+        if loc > curLen then set loc to curLen
+        set leftPart to ""
+        if loc > 0 then set leftPart to text 1 thru loc of cur
+        set rightPart to ""
+        if (curLen - loc - selLen) > 0 then set rightPart to text (loc + selLen + 1) thru curLen of cur
+        try
+            set value of attribute "AXValue" of el to leftPart & ins & rightPart
+        on error
+            return appName & linefeed & "ERR:SET"
+        end try
+        try
+            set value of attribute "AXSelectedTextRange" of el to {loc + (count of ins), 0}
+        end try
+        return appName & linefeed & "OK"
+    end tell
+end run'''
+
+def _ax_insert_direct(text: str) -> tuple:
+    """Прямая запись в фокусное поле через AX — без буфера и клавиш.
+    (app, ok, err) — ok=True: поле приняло новое значение."""
+    if not _IS_MAC:
+        return "", False, "not mac"
+    try:
+        r = subprocess.run(["/usr/bin/osascript", "-e", _AX_INSERT_SCRIPT, text],
+                           capture_output=True, timeout=3, text=True)
+        out = (r.stdout or "").rstrip("\n")
+    except Exception:
+        return "", False, "spawn"
+    lines = out.split("\n", 1)
+    app = lines[0].strip()
+    tail = lines[1].strip() if len(lines) > 1 else ""
+    return app, tail == "OK", tail
+
 def _send_paste_keystroke_pynput() -> bool:
     """Cmd+V через pynput — другой транспорт, на случай если System Events не дошёл."""
     try:
@@ -1042,7 +1106,18 @@ def direct_insert(text: str):
         sent = False
         reason = ""
 
-        if _wait_option_release():
+        # Сначала — прямая запись в поле через AX: ни буфер, ни клавиши,
+        # ни зажатый Option не играют роли. Куда она не доходит (веб-поля),
+        # там включается буферный путь ниже.
+        ax_app2, ax_set_ok, ax_set_err = _ax_insert_direct(text)
+        if ax_set_ok:
+            v_ax = _poll_insert(text, before)
+            if v_ax is not False:
+                verdict = True
+                print("[insert] прямая запись в поле (AX), буфер не трогали")
+            else:
+                reason = f"поле отклонило прямую запись ({ax_app2 or '?'})"
+        if verdict is not True and _wait_option_release():
             for attempt in (1, 2):
                 if not _put_clipboard(text_bytes):
                     reason = "буфер не записался"
