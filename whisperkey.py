@@ -212,6 +212,18 @@ EVAL_BUCKETS = {
 }
 eval_collection_finished = False  # выставляется при старте, читается баннером
 
+# ─── Постоянное локальное хранилище записей ──────────────────────────────────
+# Каждая диктовка дублируется сюда рядом с корпусом оценки качества. Это место
+# НЕ синхронизируется с iCloud (~/Library/Application Support), чтобы записи
+# оставались только на этом Mac. Срок жизни — 24 часа; очистка включается
+# отдельным скриптом и LaunchAgent (см. tools/whisperkey-recording-cleanup.sh).
+# Папку можно переопределить переменной окружения WHISPERKEY_RECORDINGS_DIR.
+RECORDINGS_ENABLED = True
+RECORDINGS_ROOT = os.path.expanduser(
+    os.environ.get("WHISPERKEY_RECORDINGS_DIR", "~/Library/Application Support/WhisperKey/Recordings")
+)
+RECORDINGS_MIN_DURATION = 0.5          # короче — случайный шум, не сохраняем
+
 # API Настройки (Groq Cloud)
 # Путь абсолютный от самого файла: с относительным ключ не находился при запуске
 # из другого каталога, и вся диктовка молча уходила на слабую локальную модель.
