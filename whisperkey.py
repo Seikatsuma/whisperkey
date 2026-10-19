@@ -17,7 +17,7 @@ import fcntl
 import json
 import difflib
 import warnings
-from collections import deque
+from collections import Counter, deque
 
 # Системный питон macOS собран с LibreSSL, и urllib3 при каждом старте печатает
 # об этом предупреждение на три строки. На работу оно не влияет — запросы к Groq
@@ -779,6 +779,12 @@ def apply_smart_sentence_ending(text: str) -> str:
 
 CLIPBOARD_WAIT_SEC = 1.5      # сколько ждём, пока система реально обновит буфер
 CLIPBOARD_RESTORE_SEC = 2.5   # через сколько возвращаем прежний буфер
+INSERT_VERIFY_SEC = 1.2       # окно опроса AX-поля после Cmd+V
+OPTION_WAIT_SEC = 1.5         # сколько ждём отпускания Option перед вставкой
+
+_IS_MAC = (sys.platform == "darwin")
+_opt_down = False             # Option физически зажат — по событиям listener'а
+_focus_app_at_start = ""      # frontmost-приложение на момент начала записи
 
 def _clipboard_now() -> bytes:
     try:
@@ -827,66 +833,241 @@ def _restore_clipboard_async(old_clipboard: bytes, ours: bytes) -> None:
 
     threading.Thread(target=run_restore, daemon=True).start()
 
-def direct_insert(text: str):
-    """Вставка через буфер обмена с подтверждением на каждом шаге.
+# ─── Проверка ФАКТА вставки ───────────────────────────────────────────────────
+# До 19.10.26 «[insert success]» печатался по returncode osascript — то есть по
+# факту «клавиша ушла», а не «текст появился». Жалоба Егора: курсор стоит в поле,
+# текста нет, соседние диктовки вставляются. Все ветки, где событие уходит, а
+# текст не встаёт, теперь ловятся чтением AXValue фокусного поля до/после:
+#   • фокус ушёл в другое приложение за время распознавания — возвращаем его и
+#     повторяем вставку один раз;
+#   • Option ещё зажат — Cmd+Opt+V это «вставить и согласовать стиль», в части
+#     приложений вообще без вставки; ждём отпускания, иначе набираем посимвольно;
+#   • поле отказало вставке (проспало событие, нестандартный контрол) — повтор,
+#     затем посимвольный ввод kb.type (Unicode-события, буфер не нужен);
+#   • всё отказало — слышимый сигнал + [insert FAILED] + текст остаётся в буфере
+#     для ручного Cmd+V.
+# Поле, не отвечающее на AX (часть Electron/веб-контролов, секретные поля),
+# проверить нельзя — там честная строка [insert sent], а не «success».
 
-    Порядок важен: сначала убеждаемся, что в буфере лежит наш текст, и только
-    потом жмём Cmd+V. Если подтверждения нет — НЕ вставляем вовсе: вставка
-    в этот момент означала бы, что человеку в документ приедет его старый
-    буфер вместо продиктованного.
-    """
+def _osa(script: str, timeout: float = 3.0) -> tuple[bool, str]:
+    """Один вызов osascript: (returncode==0, stdout)."""
     try:
+        r = subprocess.run(["/usr/bin/osascript", "-e", script],
+                           capture_output=True, timeout=timeout, text=True)
+        return r.returncode == 0, (r.stdout or "").rstrip("\n")
+    except Exception:
+        return False, ""
+
+def _fail_sound() -> None:
+    """Слышимый сигнал провала — диктующий не смотрит в терминал."""
+    if not _IS_MAC:
+        return
+    def _play():
+        try:
+            subprocess.run(["afplay", "/System/Library/Sounds/Basso.aiff"],
+                           capture_output=True, timeout=5)
+        except Exception:
+            pass
+    threading.Thread(target=_play, daemon=True).start()
+
+def _frontmost_app() -> str:
+    if not _IS_MAC:
+        return ""
+    ok, out = _osa('tell application "System Events" to get name of '
+                   'first application process whose frontmost is true')
+    return out.strip() if ok else ""
+
+# Текст фокусного поля через Accessibility API. Формат ответа:
+# «<приложение>\n<роль>\n<значение>»; «<<NOFOCUS>>»/«<<NOVALUE>>» — нечитаемо.
+_AX_FOCUS_SCRIPT = '''tell application "System Events"
+    set fp to first application process whose frontmost is true
+    set appName to name of fp
+    try
+        set el to value of attribute "AXFocusedUIElement" of fp
+    on error
+        return appName & linefeed & "<<NOFOCUS>>"
+    end try
+    set r to ""
+    try
+        set r to role of el
+    end try
+    try
+        set v to value of attribute "AXValue" of el
+        if v is missing value then return appName & linefeed & r & linefeed & "<<NOVALUE>>"
+        return appName & linefeed & r & linefeed & (v as text)
+    on error
+        return appName & linefeed & r & linefeed & "<<NOVALUE>>"
+    end try
+end tell'''
+
+def _ax_focused_value() -> tuple:
+    """(текст поля | None, приложение, роль). None — поле через AX не читается."""
+    if not _IS_MAC:
+        return None, "", ""
+    ok, out = _osa(_AX_FOCUS_SCRIPT, timeout=3.0)
+    if not ok or not out:
+        return None, "", ""
+    parts = out.split("\n", 2)
+    app = parts[0].strip()
+    role = parts[1].strip() if len(parts) > 1 else ""
+    if len(parts) < 3 or parts[2] in ("<<NOFOCUS>>", "<<NOVALUE>>"):
+        return None, app, role
+    return parts[2], app, role
+
+def _norm_for_cmp(s: str) -> str:
+    """Сравнительная норма: только буквы/цифры, строчные — автозамена кавычек
+    и умная пунктуация приложения не должны ломать сверку."""
+    return re.sub(r'[^\w]+', '', s.lower())
+
+def _insert_verified(inserted: str, before, after) -> bool | None:
+    """Факт вставки по AX-снимку поля. True — наш текст виден в поле; False —
+    поле читается, а текста в нём нет; None — поле нечитаемо (ни успех, ни провал)."""
+    if after is None:
+        return None
+    tail = _norm_for_cmp(inserted)[-24:]
+    if tail and tail in _norm_for_cmp(after):
+        return True
+    if before is not None and len(after) - len(before) >= len(inserted) * 0.9:
+        return True
+    return False
+
+def _poll_insert(text: str, before, timeout: float = INSERT_VERIFY_SEC):
+    """Опрашивает AX-значение фокусного поля после отправки вставки."""
+    deadline = time.time() + timeout
+    saw_readable = False
+    while time.time() < deadline:
+        time.sleep(0.12)
+        after, _app, _role = _ax_focused_value()
+        if after is None:
+            continue
+        saw_readable = True
+        if _insert_verified(text, before, after):
+            return True
+    return False if saw_readable else None
+
+def _send_paste_keystroke() -> bool:
+    """Cmd+V: сначала System Events (права Accessibility), затем pynput
+    (права Input Monitoring). True — транспорт принял событие; это НЕ
+    доказательство вставки — факт проверяет _poll_insert."""
+    ok, _ = _osa('tell application "System Events" to key code 9 using command down',
+                 timeout=5)
+    if ok:
+        return True
+    try:
+        kb.press(KeyboardKey.cmd)
+        kb.press('v')
+        kb.release('v')
+        kb.release(KeyboardKey.cmd)
+        return True
+    except Exception:
+        return False
+
+def _activate_app(name: str) -> bool:
+    if not name:
+        return False
+    safe = name.replace("\\", "\\\\").replace('"', '\\"')
+    ok, _ = _osa(f'tell application "{safe}" to activate', timeout=3)
+    return ok
+
+def _wait_option_release() -> bool:
+    """Ждёт отпускания Option перед вставкой (до OPTION_WAIT_SEC).
+
+    Зажатый Option превращает Cmd+V в Cmd+Opt+V — «вставить и согласовать
+    стиль», а в части приложений — в ничего. При залипшей записи или быстром
+    следующем тапе клавиша легко ещё зажата к моменту вставки — живой класс
+    «курсор стоит, текста нет»."""
+    if not _opt_down:
+        return True
+    deadline = time.time() + OPTION_WAIT_SEC
+    while _opt_down and time.time() < deadline:
+        time.sleep(0.05)
+    return not _opt_down
+
+def direct_insert(text: str):
+    """Вставка через буфер обмена с проверкой ФАКТА вставки на каждом шаге."""
+    global _focus_app_at_start
+    try:
+        app_now = _frontmost_app()
+        if _focus_app_at_start and app_now and app_now != _focus_app_at_start:
+            print(f"[insert] фокус за время распознавания: "
+                  f"{_focus_app_at_start} → {app_now}")
+
         old_clipboard = _clipboard_now()
         text_bytes = text.encode('utf-8')
+        verdict = None   # None — проверка недоступна; True — текст подтверждён
+        sent = False
+        reason = ""
 
-        inserted = False
-        for attempt in range(1, 4):
-            if not _put_clipboard(text_bytes):
-                time.sleep(0.15)
-                continue
+        if _wait_option_release():
+            for attempt in (1, 2):
+                if not _put_clipboard(text_bytes):
+                    reason = "буфер не записался"
+                    time.sleep(0.15)
+                    continue
+                before, ax_app, ax_role = _ax_focused_value()
+                if not _send_paste_keystroke():
+                    reason = ("клавиша Cmd+V не отправлена — проверь права "
+                              "Accessibility/Input Monitoring у Терминала")
+                    continue
+                sent = True
+                verdict = _poll_insert(text, before)
+                if verdict is True:
+                    break
+                if verdict is False:
+                    reason = (f"поле не приняло вставку "
+                              f"({ax_app or app_now or '?'}, роль {ax_role or '?'})")
+                    if attempt == 1 and _focus_app_at_start and app_now and \
+                            app_now != _focus_app_at_start and \
+                            _activate_app(_focus_app_at_start):
+                        print(f"[insert] возвращаю фокус в {_focus_app_at_start} "
+                              f"и повторяю")
+                        time.sleep(0.35)
+                    continue    # вторая попытка — приложение могло проспать событие
+                break           # verdict None — повторять небезопасно (двойной текст)
+        else:
+            reason = "Option остался зажат — Cmd+V вставил бы «со стилем» или ничего"
 
-            # Проверка А: AppleScript — самый надёжный путь на macOS.
-            script = 'tell application "System Events" to key code 9 using command down'
-            result = subprocess.run(["/usr/bin/osascript", "-e", script],
-                                    capture_output=True, timeout=10)
-            if result.returncode == 0:
-                inserted = True
-                break
-
-            # Проверка Б: pynput, если System Events недоступен.
-            try:
-                kb.press(KeyboardKey.cmd); kb.press('v')
-                kb.release('v'); kb.release(KeyboardKey.cmd)
-                inserted = True
-                break
-            except Exception:
-                pass
-            time.sleep(0.2)
-
-        if not inserted:
-            # Набор посимвольно: медленно, зато не зависит ни от буфера, ни от
-            # Cmd+V. Буфер при этом уже содержит текст — вставить можно и руками.
+        # Откат на посимвольный ввод: подтверждённый отказ поля или неотправленная
+        # клавиша. Unicode-событиям не мешают ни буфер, ни зажатый модификатор,
+        # и секретные поля (куда Cmd+V заблокирован) набор проходит.
+        # При verdict=None (проверить нечем) НЕ набираем — риск двойного текста.
+        if verdict is not True and (verdict is False or not sent):
             try:
                 kb.type(text)
-                inserted = True
-                print("[insert] вставка набором текста")
-            except Exception:
-                pass
+                sent = True
+                v2 = _poll_insert(text, None)
+                if v2 is True:
+                    verdict = True
+                    print("[insert] вставка набором текста")
+                elif v2 is False:
+                    reason = "поле не приняло ни вставку, ни посимвольный ввод"
+            except Exception as e:
+                reason = f"посимвольный ввод не прошёл ({type(e).__name__})"
 
-        if inserted:
+        if verdict is True:
             print(f"[insert success] '{text[:30]}...'")
             if RESTORE_CLIPBOARD:
                 _restore_clipboard_async(old_clipboard, text_bytes)
-        else:
-            # Буфер СОЗНАТЕЛЬНО не восстанавливаем: текст остаётся в нём и его
-            # можно вставить руками. Раньше буфер затирался прежним содержимым,
-            # и результат диктовки пропадал совсем.
-            print("[insert fail] Текст остался в буфере обмена — нажми Cmd+V")
-            notify("WhisperKey — вставка не удалась", "Текст в буфере, нажми Cmd+V")
+            return
+
+        if verdict is None and sent:
+            # Событие ушло, но поле не отвечает на AX — честно, без «success».
+            print(f"[insert sent] '{text[:30]}...' — проверка вставки недоступна "
+                  f"({app_now or '?'})")
+            if RESTORE_CLIPBOARD:
+                _restore_clipboard_async(old_clipboard, text_bytes)
+            return
+
+        # Провал подтверждён или отправить не удалось. Буфер НЕ восстанавливаем:
+        # текст остаётся в нём как последний шанс (ручной Cmd+V).
+        _put_clipboard(text_bytes)
+        print(f"[insert FAILED] {reason or 'поле не подтвердило вставку'} — "
+              f"текст в буфере, нажми Cmd+V")
+        _fail_sound()
+        notify("WhisperKey — вставка не удалась",
+               f"{reason or 'поле не подтвердило вставку'}. Текст в буфере — нажми Cmd+V")
 
     except Exception as e:
-        # Текст к этому моменту уже в буфере — сообщаем, а не молчим: молчание
-        # здесь означало бы потерянную диктовку без всякого следа.
         print(f"[insert error] {e}")
         notify("WhisperKey — вставка не удалась", "Текст в буфере, нажми Cmd+V")
 
@@ -907,6 +1088,46 @@ def clean_noise(text: str) -> str:
     text, removed = speech_engine.watermarks.clean_noise(text)
     artifacts_removed.extend(removed)
     return text
+
+# ─── Страховка постобработки от потери слов (жалоба 19.10.26) ─────────────────
+# «Шаг исправления» не должен терять смысловые слова: законны только чистка
+# пробелов, водяные знаки и оформление. Считаем потерянные токены между сырой
+# расшифровкой и финалом; необъяснённая потеря сверх порога — откат на сырую
+# версию: грязный текст лучше обрезанного.
+
+CLEANUP_LOSS_ABS = 3        # откат, если потеряно больше N смысловых слов…
+CLEANUP_LOSS_RATIO = 0.10   # …и больше этой доли от сырого текста
+
+def _word_tokens(s: str) -> list:
+    return re.findall(r'\w+', s.lower())
+
+def _diff_removed_text(before: str, after: str) -> str:
+    """Слова, пропавшие при переходе before→after (по пословному diff)."""
+    if not before or not after:
+        return before or ""
+    a, b = before.split(), after.split()
+    na = [_norm_for_cmp(x) for x in a]
+    nb = [_norm_for_cmp(x) for x in b]
+    removed = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, na, nb, autojunk=False).get_opcodes():
+        if tag in ("delete", "replace"):
+            removed.extend(a[i1:i2])
+    return " ".join(removed)
+
+def _verify_cleanup(raw_text: str, final_text: str, legal_removed: str = ""):
+    """Потеряно ли сверх порога смысловых слов между raw и финалом.
+    legal_removed — текст, который чистка обязана была вырезать (водяные
+    знаки): он потерей не считается. Возвращает (текст_к_вставке, n_lost)."""
+    if not raw_text:
+        return final_text, 0
+    lost = Counter(_word_tokens(raw_text)) - Counter(_word_tokens(final_text))
+    if legal_removed:
+        lost -= Counter(_word_tokens(legal_removed))
+    n_lost = sum(lost.values())
+    n_raw = len(_word_tokens(raw_text))
+    if n_lost > CLEANUP_LOSS_ABS and n_lost > n_raw * CLEANUP_LOSS_RATIO:
+        return raw_text, n_lost
+    return final_text, n_lost
 
 def compress_silence(audio_data, threshold=0.01, min_pause=1.5, keep_pause=0.5):
     """CEO Method: Сжатие длинных пауз до фиксированной длины (векторизовано)."""
@@ -1010,6 +1231,9 @@ def process_audio(audio_snapshot: list, session_id: int):
             print(f"[raw deepgram] '{full_raw_text}'")
         elif full_raw_text:
             print(f"[engine] {engine_name} (запасной путь)")
+        # Каждый переход на запасную ступень — видимой строкой, не молчанием.
+        for fb in (result.meta.get("fallbacks") or []):
+            print(f"[engine fallback] {fb}")
 
         if not full_raw_text:
             finalize_eval_sample_meta(session_id, dur, "", "")
@@ -1039,6 +1263,9 @@ def process_audio(audio_snapshot: list, session_id: int):
         
         artifacts_removed.clear()
         text = clean_noise(text)
+        # Что именно вырезала чистка (водяные знаки) — легальные потери,
+        # верификатор их не считает.
+        legal_removed = _diff_removed_text(full_raw_text, text)
         text = smart_grammar_fix(text)
 
         # Весь результат — субтитровая заглушка Whisper («Продолжение следует…»)
@@ -1049,6 +1276,14 @@ def process_audio(audio_snapshot: list, session_id: int):
             finalize_eval_sample_meta(session_id, dur, full_raw_text, "")
             print(f"[skip] только заглушка ASR: '{text[:60]}' — молча")
             return
+
+        # Страховка от «чистка съела фразу»: необъяснённая потеря смысловых
+        # слов сверх порога → откат на распознанный текст.
+        checked_text, n_lost = _verify_cleanup(full_raw_text, text, legal_removed)
+        if n_lost:
+            print(f"[cleanup] dropped {n_lost} tokens"
+                  + (" — откат на исходный текст" if checked_text is not text else ""))
+        text = checked_text
 
         if text and len(text) > 1:
             text = apply_smart_sentence_ending(text)
