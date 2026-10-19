@@ -1341,8 +1341,10 @@ def direct_insert(text: str) -> float:
                 readable = True
                 before = val
                 reason = f"поле переписало вставку ({app or '?'})"
+                print(f"[insert] {reason} — буферный путь")
         elif st == "WRITEFAIL":
             reason = f"поле отклонило прямую запись ({app or '?'})"
+            print(f"[insert] {reason} — буферный путь")
 
         # ── Ступень 2: нечитаемое поле — детерминированные пути без буфера ───
         if verdict is not True and st in ("UNREADABLE", "NOFOCUS"):
@@ -1389,11 +1391,11 @@ def direct_insert(text: str) -> float:
                                       "Accessibility/Input Monitoring у Терминала")
                             continue
                         sent = True
-                        v = _poll_insert(text, before)
-                        if v is True:
-                            verdict, via = True, "paste"
+                        verdict = _poll_insert(text, before)
+                        if verdict is True:
+                            via = "paste"
                             break
-                        if v is False:
+                        if verdict is False:
                             reason = (f"поле не приняло вставку "
                                       f"({app or '?'}, роль {role or '?'})")
                             continue  # приложение могло проспать событие
@@ -1459,8 +1461,9 @@ def direct_insert(text: str) -> float:
                 _restore_clipboard_async(old_clipboard, text_bytes)
             return dt
 
-        if sent:
+        if verdict is None and sent:
             # Удар ушёл, проверить нечем — честно, без «success».
+            # verdict=False при sent=True — это ДОКАЗАННЫЙ отказ → FAILED ниже.
             print(f"[insert sent] '{text[:30]}...' ({via}, {dt:.2f}с) — "
                   f"проверка недоступна ({app or '?'})")
             if RESTORE_CLIPBOARD and clipboard_touched:
