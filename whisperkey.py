@@ -1030,18 +1030,14 @@ _AX_SMART_SCRIPT = '''on run argv
     end tell
 end run'''
 
-# Приложения, где разблокировку AXEnhancedUserInterface уже пробовали в этой
-# сессии — повторять выставку на каждой диктовке не нужно.
-_ax_unlock_tried: set = set()
-
 def _ax_smart_insert(text: str) -> tuple:
     """Запись в фокусное поле одним вызовом: (app, status, role, value).
-    status: WROTE | WRITEFAIL | UNREADABLE | NOFOCUS | ERROR | NOMAC."""
+    status: WROTE | WRITEFAIL | UNREADABLE | NOFOCUS | ERROR | NOMAC.
+    Имя приложения до вызова неизвестно — разблокировку скрипт делает сам
+    внутри того же процесса (set AXEnhancedUserInterface идемпотентен и
+    дешёв: повторная выставка на следующей диктовке — миллисекунды)."""
     if not _IS_MAC:
         return "", "NOMAC", "", ""
-    # Приложение ещё неизвестно до вызова — разблокировку разрешаем всегда,
-    # флаг in-process уже отсекает повторные выставки только при повторном
-    # вызове того же приложения (кэш ведём по имени ниже).
     try:
         r = subprocess.run(["/usr/bin/osascript", "-e", _AX_SMART_SCRIPT, text,
                             "1"], capture_output=True, timeout=4, text=True)
@@ -1053,8 +1049,6 @@ def _ax_smart_insert(text: str) -> tuple:
     status = parts[1].strip() if len(parts) > 1 else "ERROR"
     role = parts[2].strip() if len(parts) > 2 else ""
     value = parts[3] if len(parts) > 3 else ""
-    if app and status in ("UNREADABLE", "NOFOCUS"):
-        _ax_unlock_tried.add(app)   # разблокировку уже делали внутри вызова
     return app, status, role, value
 
 # Запись в AXSelectedText: часть полей принимает её, даже когда AXValue — на
