@@ -1141,6 +1141,7 @@ def direct_insert(text: str):
         # отдельный _frontmost_app был бы лишним процессом osascript
         # (сотни мс на каждую вставку, жалоба «стало дольше» 19.10.26).
         before, app_now, ax_role = _ax_focused_value()
+        ax_app = app_now
         if _focus_app_at_start and app_now and app_now != _focus_app_at_start:
             print(f"[insert] фокус за время распознавания: "
                   f"{_focus_app_at_start} → {app_now}")
