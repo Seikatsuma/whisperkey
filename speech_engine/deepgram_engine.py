@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -36,6 +37,7 @@ class DeepgramState:
     # снимать пробой — см. maybe_probe_deepgram_if_blocked. Блок по 401/402/403
     # пробой не лечится: ключ не починится за минуту.
     blocked_by_network: bool = False
+    check_in_progress: bool = False   # фоновая проба уже летит — не плодить потоки
 
 
 # Сетевой блок держим коротким: домашний VPN мог включиться в любой момент,
@@ -53,18 +55,32 @@ def maybe_probe_deepgram_if_blocked(*, state: DeepgramState,
     пробуем ТОЛЬКО сетевые блоки — блок по 401/402/403 живёт свой таймер целиком
     (проба ключ не лечит, а запросы жгут). Проба — просто HEAD на хост: достаточно
     факта, что TCP+TLS поднимаются; ответ любой (даже 404) = сеть есть.
+
+    Проба ФОНОВАЯ (как у groq): синхронная версия клала до 3с внутрь
+    recognize() на каждой диктовке раз в ~30с, пока сеть не вернётся —
+    жалоба Егора 19.10.26 «транскрибация стала длиннее». Диктовка пробу
+    не ждёт: ступень разблокируется к следующей записи.
     """
     if not state.blocked_by_network or time.time() < state.blocked_until:
         return
-    try:
-        (session or requests).head(_DEEPGRAM_PROBE_URL, timeout=3.0)
-        state.blocked_until = 0.0
-        state.blocked_by_network = False
-        state.last_reason = ""
-        logger.info("deepgram: связь вернулась, ступень разблокирована")
-    except Exception:
-        # Тихо ждём следующего срока — запись состояния уже стоит.
-        state.blocked_until = time.time() + 30.0
+    if state.check_in_progress:
+        return
+    state.check_in_progress = True
+
+    def _probe():
+        try:
+            (session or requests).head(_DEEPGRAM_PROBE_URL, timeout=3.0)
+            state.blocked_until = 0.0
+            state.blocked_by_network = False
+            state.last_reason = ""
+            logger.info("deepgram: связь вернулась, ступень разблокирована")
+        except Exception:
+            # Тихо ждём следующего срока — запись состояния уже стоит.
+            state.blocked_until = time.time() + 30.0
+        finally:
+            state.check_in_progress = False
+
+    threading.Thread(target=_probe, daemon=True).start()
 
 
 def transcribe_deepgram(audio_data, *, api_key: str, profile: Profile, sample_rate: int,
