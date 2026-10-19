@@ -1374,6 +1374,14 @@ def direct_insert(text: str) -> float:
                 try:
                     kb.type(text)
                     sent, via = True, "type"
+                    if readable:
+                        v2 = _poll_insert(text, before)
+                        if v2 is True:
+                            verdict = True
+                            print("[insert] вставка набором текста")
+                        elif v2 is False:
+                            verdict = False
+                            reason = "поле не приняло посимвольный ввод"
                 except Exception as e:
                     reason = f"посимвольный ввод не прошёл ({type(e).__name__})"
             else:
@@ -1438,8 +1446,9 @@ def direct_insert(text: str) -> float:
         # ── Ступень 4: доказанный отказ/неотправка → посимвольный ввод ───────
         # Unicode-событиям не мешают ни буфер, ни зажатый модификатор.
         # При sent=True по слепому удару НЕ набираем — тот уже мог встать,
-        # набор был бы вторым текстом (дубль).
-        if verdict is not True and (verdict is False or not sent):
+        # набор был бы вторым текстом (дубль). via=="type" — набор уже был
+        # (ветка «Option зажат»), повторный дал бы второй текст.
+        if verdict is not True and (verdict is False or not sent) and via != "type":
             try:
                 kb.type(text)
                 sent, via = True, "type"

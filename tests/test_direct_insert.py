@@ -265,7 +265,17 @@ run("exception", dict(
     menu=MENU_ERR, activate=NOACT),
     ["[insert error]"], [("notify", 1)])
 
-# 16. Буфер не записался в нечитаемом поле → набор
+# 16. Option зажат + поле отвергло набор → набор РОВНО один раз
+#     (не второй текст поверх — тот же класс дубля, что и пара ударов)
+run("option-held-no-double-type", dict(
+    ax=lambda t: ("TextEdit", "WRITEFAIL", "AXTextArea", "старый"),
+    axsel=AXSEL_NO, js=lambda a, t: ("SKIP", ""),
+    option=lambda: False, put=PUT_OK, paste=PASTE_OK,
+    poll=lambda t, b: False, menu=MENU_ERR, activate=NOACT),
+    ["[insert FAILED]"], [("type", 1), ("put", 1), ("paste", 0),
+                          ("notify", 1), ("sound", 1)])
+
+# 17. Буфер не записался в нечитаемом поле → набор
 run("blind-put-fail", dict(
     ax=lambda t: ("Brave Browser", "UNREADABLE", "", ""),
     axsel=AXSEL_NO, js=lambda a, t: ("FAIL", "noel"),
