@@ -28,6 +28,7 @@ from .terms import fix_known_terms
 from .transfer import transfer_endings, transfer_punctuation
 from .terms import transfer_terms
 from .types import RecognitionResult
+from .vote import has_loop
 from .watermarks import strip_asr_artifacts
 
 logger = logging.getLogger("speech_engine.dictation")
@@ -209,6 +210,7 @@ def recognize(audio: np.ndarray, dur: float, ctx: Context) -> RecognitionResult:
     chunk_quality: list[str] = []
     degenerate: list = []
     remote_tried = False
+    deepgram_reasked = False
 
     def _try_remote() -> None:
         nonlocal full_raw_text, engine, assembled_text, lost_marks, chunk_quality, degenerate
@@ -244,16 +246,31 @@ def recognize(audio: np.ndarray, dur: float, ctx: Context) -> RecognitionResult:
                 assembled_text = full_raw_text
                 chunk_quality = ['deepgram']
                 if dur > 8.0:
-                    # ВИДИМОСТЬ — расследование живого случая 16.08.26 (независимо
-                    # подтверждено SaluteSpeech+Nexara на 4 записях: Deepgram молча
-                    # теряет куски речи, не искажает слова, а целиком не возвращает).
-                    # У Deepgram нет recovery — берём ответ как есть. Порог грубый,
-                    # только для диагностики в логе (~1.5-2 слов/с — темп Егора).
-                    wps = len(full_raw_text.split()) / dur
+                    # Deepgram изредка отдаёт «редкий» ответ: целые куски речи
+                    # выпадают, остаток сглажен (живой случай 20.10.26: 18 слов
+                    # на 22 с). Повтор ТОГО ЖЕ звука вернул все 42 слова дословно —
+                    # сбой разовый, не в звуке. Порог ~1 слово/с при темпе Егора
+                    # ~1.5-2. Повтор берём, только если слов больше и нет петли
+                    # (рост слов сам по себе не критерий — has_loop).
+                    n_words = len(full_raw_text.split())
+                    wps = n_words / dur
                     if wps < 1.0:
                         logger.warning("deepgram: подозрительно мало текста на длину записи "
-                                       "(%.2f слов/с за %.1fс, %d слов) — возможна потеря куска речи",
-                                       wps, dur, len(full_raw_text.split()))
+                                       "(%.2f слов/с за %.1fс, %d слов) — переспрашиваю",
+                                       wps, dur, n_words)
+                        deepgram_reasked = True
+                        retry = transcribe_deepgram(
+                            audio, api_key=ctx.deepgram_api_key, profile=p,
+                            sample_rate=ctx.sample_rate, state=ctx.deepgram_state,
+                            session=ctx.session)
+                        n_retry = len(retry.split()) if retry else 0
+                        if retry and n_retry > n_words and not has_loop(retry):
+                            full_raw_text = assembled_text = retry
+                            logger.warning("deepgram: повтор дал %d слов вместо %d — беру повтор",
+                                           n_retry, n_words)
+                        else:
+                            logger.warning("deepgram: повтор не лучше (%d слов) — оставляю первый",
+                                           n_retry)
             else:
                 fallbacks.append(f"deepgram: {ctx.deepgram_state.last_reason or 'нет ответа'}")
 
@@ -317,5 +334,6 @@ def recognize(audio: np.ndarray, dur: float, ctx: Context) -> RecognitionResult:
             "deepgram_seconds": ctx.deepgram_state.last_seconds,
             "api_text": ctx.cloud_state.last_api_text,
             "fallbacks": fallbacks,
+            "deepgram_reasked": deepgram_reasked,
         },
     )
