@@ -2609,7 +2609,7 @@ def main():
         threading.Thread(target=_bridge_watchdog, daemon=True).start()
 
     if _engine.ctx.engine_mode != "auto":
-        print(f"Режим движков: {_engine.ctx.engine_mode} (ASR_ENGINE в .env)")
+        print(f"Режим движков: {_engine.ctx.engine_mode} (с учётом настроек и платформы)")
     if _engine.ctx.yandex_api_key:
         print("Резерв без VPN: Yandex SpeechKit подключён")
 
