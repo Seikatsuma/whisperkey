@@ -38,6 +38,10 @@ class DeepgramState:
     # пробой не лечится: ключ не починится за минуту.
     blocked_by_network: bool = False
     check_in_progress: bool = False   # фоновая проба уже летит — не плодить потоки
+    # Конец последнего слова последнего ответа, уже в секундах исходной записи
+    # (темп 1.03 развёрнут обратно). 0 — слов не было / запроса не было. Нужно
+    # детектору «речь в хвосте записи не распознана» в dictation.
+    last_word_end: float = 0.0
 
 
 # Сетевой блок держим коротким: домашний VPN мог включиться в любой момент,
@@ -133,6 +137,10 @@ def transcribe_deepgram(audio_data, *, api_key: str, profile: Profile, sample_ra
                     return None
                 text = (alt.get("transcript") or "").strip()
                 state.last_seconds = time.time() - t0
+                words = alt.get("words") or []
+                # Словам уходит ускоренный звук (tempo) — их метки в шкале
+                # загруженного файла; умножаем обратно на реальную шкалу записи.
+                state.last_word_end = (words[-1].get("end") or 0.0) * profile.asr_tempo if words else 0.0
                 if not text:
                     state.last_reason = "пустой ответ"
                     logger.info("deepgram: пусто — ухожу дальше по каскаду")

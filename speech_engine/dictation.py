@@ -29,7 +29,7 @@ from .transfer import transfer_endings, transfer_punctuation
 from .terms import transfer_terms
 from .types import RecognitionResult
 from .vote import has_loop
-from .watermarks import strip_asr_artifacts
+from .watermarks import strip_asr_artifacts, boilerplate_only
 
 logger = logging.getLogger("speech_engine.dictation")
 
@@ -245,19 +245,41 @@ def recognize(audio: np.ndarray, dur: float, ctx: Context) -> RecognitionResult:
                 engine = "deepgram"
                 assembled_text = full_raw_text
                 chunk_quality = ['deepgram']
-                if dur > 8.0:
+                # Заглушка («Продолжение следует…» и т.п.) — не ответ, а галлюцинация
+                # на не-речевом звуке. Считаем отказом ступени: дальше Groq, у которого
+                # своя проверка заглушек по кускам. Реальная фраза «продолжение следует»
+                # посреди текста сюда не попадает — проверка только целиком.
+                if boilerplate_only(full_raw_text):
+                    logger.info("deepgram: только заглушка ASR — ухожу на следующую ступень")
+                    fallbacks.append("deepgram: заглушка ASR")
+                    full_raw_text = assembled_text = ""
+                elif dur > 8.0:
                     # Deepgram изредка отдаёт «редкий» ответ: целые куски речи
                     # выпадают, остаток сглажен (живой случай 20.10.26: 18 слов
                     # на 22 с). Повтор ТОГО ЖЕ звука вернул все 42 слова дословно —
-                    # сбой разовый, не в звуке. Порог ~1 слово/с при темпе Егора
-                    # ~1.5-2. Повтор берём, только если слов больше и нет петли
-                    # (рост слов сам по себе не критерий — has_loop).
+                    # сбой разовый, не в звуке. Два триггера повтора:
+                    #   а) < 1 слово/с при темпе Егора ~1.5-2;
+                    #   б) после последнего распознанного слова остаётся >3с записи
+                    #      с громкостью речи (энергия считается по самому звуку,
+                    #      тишина в хвосте не срабатывает — проверено на корпусе:
+                    #      хвосты с паузой тихие, хвосты с потерей громкие).
+                    # Повтор берём, только если слов больше и нет петли (has_loop).
                     n_words = len(full_raw_text.split())
                     wps = n_words / dur
-                    if wps < 1.0:
-                        logger.warning("deepgram: подозрительно мало текста на длину записи "
-                                       "(%.2f слов/с за %.1fс, %d слов) — переспрашиваю",
-                                       wps, dur, n_words)
+                    tail_gap = dur - ctx.deepgram_state.last_word_end
+                    tail_speech = False
+                    # Без меток слов (last_word_end=0) хвост не проверяем —
+                    # иначе весь файл считался бы непокрытым.
+                    if ctx.deepgram_state.last_word_end and tail_gap > 3.0:
+                        tail = audio[int(ctx.sample_rate * ctx.deepgram_state.last_word_end):]
+                        if len(tail):
+                            tail_speech = float(
+                                np.sqrt((tail.astype(np.float64) ** 2).mean())) > 0.01
+                    if wps < 1.0 or tail_speech:
+                        reason = (f"мало текста ({wps:.2f} слов/с, {n_words} слов)"
+                                  if wps < 1.0 else
+                                  f"после последнего слова ещё {tail_gap:.1f}с речи")
+                        logger.warning("deepgram: %s за %.1fс — переспрашиваю", reason, dur)
                         deepgram_reasked = True
                         retry = transcribe_deepgram(
                             audio, api_key=ctx.deepgram_api_key, profile=p,
