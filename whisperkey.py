@@ -329,6 +329,8 @@ audio_stream = None # CEO Fix: Инициализируем при нажати�
 _engine = speech_engine.Engine(
     profile=DICTATION, groq_api_key=GROQ_API_KEY, deepgram_api_key=DEEPGRAM_API_KEY,
     sample_rate=SAMPLE_RATE, session=http_session,
+    engine_mode=("remote" if sys.platform == "darwin" and os.environ.get("ASR_ENGINE", "auto").strip().lower() == "auto"
+                 else os.environ.get("ASR_ENGINE", "auto")),
 )
 kb = KeyboardController()
 _instance_lock_handle = None
