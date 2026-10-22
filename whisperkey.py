@@ -2689,7 +2689,10 @@ def main():
     print(f"   промпт: {'выключен' if not DICTATION.groq_context_prompt else 'включён'}")
     try:
         print("Загрузка локальной модели (запасной вариант, если облако недоступно)...")
-        model = WhisperModel(MODEL_PATH, device="cpu", compute_type="int8", cpu_threads=2, local_files_only=False)
+        # cpu_threads 2→4: на Mac ядер больше, потоки на качество не влияют,
+        # только на скорость резервного пути. beam_size не трогаем — beam=1
+        # измерено хуже: +4 п.п. ошибок на эталоне Salute (22.10.26).
+        model = WhisperModel(MODEL_PATH, device="cpu", compute_type="int8", cpu_threads=4, local_files_only=False)
         _warm_local_model(model)
         # Модель грузится тут (дорого, после баннера сбора корпуса) — отдаём её
         # в Engine как третью ступень каскада (используется, только когда и
