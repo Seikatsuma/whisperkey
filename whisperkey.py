@@ -319,6 +319,15 @@ session_phase = "idle"   # idle -> recording -> processing
 active_session_id = 0
 audio_stream = None # CEO Fix: Инициализируем при нажатии
 
+# Поток звука на мост ВО ВРЕМЯ записи (22.10.26). Пока Option зажат, блоки
+# микрофона уходят по туннелю в /audio/stream моста, мост держит сокет Deepgram
+# — после отпускания остаётся хвост ~0.2–0.4 с, а не отправка всего файла и
+# распознавание с нуля (1–3 с). Любой отказ потока → прежний путь
+# _engine.recognize по той же записи. Отключить: WHISPERKEY_NO_STREAM=1.
+STREAM_ENABLED = not os.environ.get("WHISPERKEY_NO_STREAM")
+_live_stream = None          # поток текущей записи — его кормит audio_callback
+_live_streams: dict = {}     # session_id -> RemoteStream, забирает process_audio
+
 # Состояние облачных ступеней (было: модульные словари cloud_status/deepgram_status)
 # теперь живёт внутри _engine.ctx (speech_engine.Context) — тот же смысл, тот же
 # набор полей (is_blocked/last_degenerate/blocked_until/last_seconds/...), просто
@@ -618,6 +627,9 @@ def audio_callback(indata, frames, time_info, status):
     block = indata.copy()
     if is_recording:
         recording_data.append(block)
+        ls = _live_stream
+        if ls is not None:
+            ls.feed(block)
         if pill.active:
             pill.set_level_rms(float(np.sqrt(np.mean(block * block))))
     elif PREROLL_ENABLED:
@@ -1881,14 +1893,62 @@ def compress_silence(audio_data, threshold=0.01, min_pause=1.5, keep_pause=0.5):
 # _engine.recognize(audio, dur), см. process_audio ниже. Устройство каскада,
 # все замеры и красные зоны — ~/speech-engine/agent.md.
 
+def _start_live_stream(session_id: int, initial_blocks: list) -> None:
+    """Открывает поток на мост вместе с записью. Без моста/в режиме local —
+    ничего не делает: тогда работает прежний путь целиком."""
+    global _live_stream
+    _live_stream = None
+    url = _engine.ctx.remote_asr_url
+    if not (STREAM_ENABLED and url) or _engine.ctx.engine_mode == "local":
+        return
+    try:
+        # Своя сессия: сторож/reviver закрывают http_session при обрыве туннеля,
+        # поток не должен падать от чужого close().
+        ls = speech_engine.remote_engine.RemoteStream(
+            url, session=requests.Session(), sample_rate=SAMPLE_RATE,
+            token=_engine.ctx.remote_asr_token).start()
+    except Exception as e:
+        print(f"[stream] не стартовал: {type(e).__name__} — прежний путь")
+        return
+    for b in initial_blocks:      # предзапись, если включена
+        ls.feed(b)
+    _live_streams[session_id] = ls
+    _live_stream = ls
+
+
+def _end_live_stream(session_id: int, abort: bool = False) -> None:
+    """Конец записи: коллбэк больше не кормит, тело запроса закрывается."""
+    global _live_stream
+    _live_stream = None
+    ls = _live_streams.get(session_id)
+    if ls is None:
+        return
+    if abort:
+        _live_streams.pop(session_id, None)
+        ls.abort()
+    else:
+        ls.close()
+
+
+def _take_live_stream(session_id: int, abort: bool = False):
+    ls = _live_streams.pop(session_id, None)
+    if ls is not None and abort:
+        ls.abort()
+    return ls
+
+
 def process_audio(audio_snapshot: list, session_id: int):
     global processing, last_text_context, session_phase
     pill_error = False
     try:
-        if not audio_snapshot: return
+        if not audio_snapshot:
+            _take_live_stream(session_id, abort=True)
+            return
         audio = np.concatenate(audio_snapshot, axis=0).flatten().astype(np.float32)
         dur = len(audio) / SAMPLE_RATE
-        if dur < 0.5: return
+        if dur < 0.5:
+            _take_live_stream(session_id, abort=True)
+            return
 
         # Тишина/чистый шум до ASR: случайное нажатие не едет на распознавание
         # и не оставляет ни текста, ни уведомления. Пик по фреймам, не среднее:
@@ -1901,6 +1961,7 @@ def process_audio(audio_snapshot: list, session_id: int):
             if peak_rms < 10.0 ** (SILENCE_GATE_DB / 20.0):
                 peak_db = 20.0 * np.log10(peak_rms + 1e-9)
                 print(f"[skip] тишина {dur:.1f}s, пик {peak_db:.0f} дБ — молча")
+                _take_live_stream(session_id, abort=True)
                 return
 
         schedule_eval_sample_collect(audio, dur, session_id)
@@ -1914,7 +1975,21 @@ def process_audio(audio_snapshot: list, session_id: int):
         # перенос знаков/терминов/форм) → локальная модель, по очереди. Устройство
         # каскада — ~/speech-engine/agent.md, не здесь.
         t_asr_start = time.time()
-        result = _engine.recognize(audio, dur)
+        result = None
+        live = _take_live_stream(session_id)
+        if live is not None:
+            stext = live.result(timeout=max(30.0, dur * 0.2))
+            if stext:
+                result = speech_engine.RecognitionResult(
+                    text=stext, engine="stream", assembled_text=stext,
+                    meta={"fallbacks": [f"мост: {fb}" for fb in live.fallbacks],
+                          "stream_engine": live.engine})
+                print(f"[stream] ответ моста через {time.time() - t_asr_start:.2f}с "
+                      f"после конца записи (сервер: {live.engine})")
+            else:
+                print(f"[engine fallback] поток: {live.error or 'нет ответа'} — прежний путь")
+        if result is None:
+            result = _engine.recognize(audio, dur)
         engine_name = result.engine
         full_raw_text = result.text
         assembled_text = result.assembled_text
@@ -1926,6 +2001,8 @@ def process_audio(audio_snapshot: list, session_id: int):
             print(f"[engine] Deepgram {DEEPGRAM_MODEL}, "
                   f"{result.meta.get('deepgram_seconds', 0.0):.1f}с")
             print(f"[raw deepgram] '{full_raw_text}'")
+        elif engine_name == "stream":
+            print(f"[raw stream] '{full_raw_text}'")
         elif full_raw_text:
             print(f"[engine] {engine_name} (запасной путь)")
         # Каждый переход на запасную ступень — видимой строкой, не молчанием.
@@ -2100,6 +2177,7 @@ def _cancel_recording():
             return
         session_phase = "idle"
     is_recording = False
+    _end_live_stream(active_session_id, abort=True)
     recording_data.clear()
     pill.set_state("idle")
     print("[rec] Отменено быстрым третьим касанием")
@@ -2131,6 +2209,7 @@ def _begin_stop():
         global is_recording, processing, session_phase
         time.sleep(TAIL_CAPTURE_SECONDS)
         is_recording = False
+        _end_live_stream(current_session_id)
         # При включённой предзаписи поток остаётся открытым — иначе следующее
         # нажатие снова начнётся с холодного старта и срежет первое слово.
         if not PREROLL_ENABLED:
@@ -2142,6 +2221,7 @@ def _begin_stop():
             # 1-9 фреймов — случайное касание: глушим молча, как у Wispr —
             # пустая диктовка не оставляет ни текста, ни уведомления.
             print(f"[skip] Слишком коротко ({len(audio_snapshot)} фреймов)")
+            _take_live_stream(current_session_id, abort=True)
             if not audio_snapshot:
                 notify("WhisperKey", "⚠️ Слишком короткая запись")
             processing = False
@@ -2291,6 +2371,7 @@ def on_press(key):
                     recording_data = []
 
                 audio_dropouts.clear()
+                _start_live_stream(active_session_id, recording_data)
                 is_recording = True
                 # Уведомление ПОСЛЕ фактического начала захвата: раньше «говори»
                 # выдавалось до того, как микрофон отдавал первый сэмпл.
@@ -2319,6 +2400,7 @@ def on_press(key):
                 print(f"[audio error] {e}")
                 notify("WhisperKey — микрофон недоступен", str(e)[:120])
                 is_recording = False
+                _end_live_stream(active_session_id, abort=True)
                 session_phase = "idle"
                 pill.set_state("error")
 

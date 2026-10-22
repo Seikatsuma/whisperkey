@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -179,8 +180,70 @@ def _recognize_with_groq_cascade(audio: np.ndarray, dur: float, ctx: Context):
     return text, assembled, lost_marks, chunk_quality
 
 
-def recognize(audio: np.ndarray, dur: float, ctx: Context) -> RecognitionResult:
+def _tail_has_speech(audio: np.ndarray, dur: float, last_word_end: float, sample_rate: int) -> tuple[bool, float]:
+    """После последнего распознанного слова >3с записи с громкостью речи?
+    Без меток слов (0) хвост не проверяем — иначе весь файл считался бы непокрытым."""
+    tail_gap = dur - last_word_end
+    if not last_word_end or tail_gap <= 3.0:
+        return False, tail_gap
+    tail = audio[int(sample_rate * last_word_end):]
+    return bool(len(tail)) and float(np.sqrt((tail.astype(np.float64) ** 2).mean())) > 0.01, tail_gap
+
+
+def recognize_streamed(stream_text: str, last_word_end: float, stream_ok: bool,
+                       audio: np.ndarray, dur: float, ctx: Context,
+                       stream_error: str = "") -> RecognitionResult:
+    """Текст потоковой ступени (deepgram_stream) → тот же результат, что у каскада.
+
+    Те же проверки, что у первой ступени в `recognize`: заглушка ASR, «редкий»
+    ответ (<1 слова/с) и громкий хвост после последнего слова, плюс петля. Любое
+    сомнение или отказ сокета → обычный каскад по накопленному звуку: потоковая
+    ступень может только ускорить, но не ухудшить диктовку.
+    """
+    text = (stream_text or "").strip()
+    reason = ""
+    if not stream_ok:
+        reason = f"поток: {stream_error or 'оборвался'}"
+    elif not text:
+        reason = "поток: пустой ответ"
+    elif boilerplate_only(text):
+        reason = "поток: только заглушка ASR"
+    elif has_loop(text):
+        reason = "поток: петля повтора"
+    if reason:
+        logger.info("%s — обычный каскад по всей записи", reason)
+        res = recognize(audio, dur, ctx)
+        res.meta["fallbacks"] = [reason] + list(res.meta.get("fallbacks") or [])
+        return res
+
+    if dur > 8.0:
+        n_words = len(text.split())
+        wps = n_words / dur
+        tail_speech, tail_gap = _tail_has_speech(audio, dur, last_word_end, ctx.sample_rate)
+        if wps < 1.0 or tail_speech:
+            why = (f"мало текста ({wps:.2f} слов/с)" if wps < 1.0
+                   else f"после последнего слова ещё {tail_gap:.1f}с речи")
+            logger.warning("поток: %s — сверяю с обычным каскадом", why)
+            res = recognize(audio, dur, ctx)
+            if res.text and len(res.text.split()) > n_words and not has_loop(res.text):
+                res.meta["fallbacks"] = [f"поток: {why} → каскад"] + list(res.meta.get("fallbacks") or [])
+                return res
+
+    text, n_fix = fix_known_terms(text)
+    return RecognitionResult(text=text, engine="deepgram_stream", assembled_text=text,
+                             lost_marks=[], chunk_quality=["deepgram"], degenerate=[],
+                             terms_fixed=n_fix, meta={"fallbacks": []})
+
+
+def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
+              deepgram_upload: tuple[bytes, str] | None = None,
+              audio_future=None) -> RecognitionResult:
     """Полный каскад dictation: Deepgram → Groq → мост/Yandex → локальная модель.
+
+    Мост (`http_bridge`) передаёт исходный файл: `deepgram_upload=(байты, mime)` уходит
+    в Deepgram как есть, а декодирование ffmpeg идёт параллельно в `audio_future`
+    (Future → (audio, dur)) и ждётся только после ответа Deepgram. Deepgram не
+    принял файл (не сеть и не ключ) — повтор обычным WAV из декодированного звука.
 
     fix_known_terms применяется всегда, вне зависимости от того, какая ступень
     дала текст (это поведение перенесено из process_audio дословно).
@@ -198,6 +261,16 @@ def recognize(audio: np.ndarray, dur: float, ctx: Context) -> RecognitionResult:
     p = ctx.profile
     mode = (ctx.engine_mode or "auto").strip().lower()
     fallbacks: list[str] = []
+
+    def _resolve_audio() -> None:
+        nonlocal audio, dur, audio_future
+        if audio_future is not None:
+            audio, dur = audio_future.result()
+            audio_future = None
+
+    if mode != "auto" or not (p.deepgram_enabled and ctx.deepgram_api_key):
+        _resolve_audio()
+        deepgram_upload = None
 
     # Сетевой блок первой ступени лечится пробой (VPN мог включиться в любой
     # момент); блоки ключа (401/402/403) проба не трогает — см. функцию.
@@ -246,7 +319,18 @@ def recognize(audio: np.ndarray, dur: float, ctx: Context) -> RecognitionResult:
         if not full_raw_text and p.deepgram_enabled and ctx.deepgram_api_key:
             full_raw_text = transcribe_deepgram(
                 audio, api_key=ctx.deepgram_api_key, profile=p, sample_rate=ctx.sample_rate,
-                state=ctx.deepgram_state, session=ctx.session)
+                state=ctx.deepgram_state, session=ctx.session, upload=deepgram_upload)
+            _resolve_audio()
+            if deepgram_upload is not None and not full_raw_text \
+                    and time.time() >= ctx.deepgram_state.blocked_until:
+                # Контейнер не принят/пусто — тот же звук прежним путём (WAV + темп),
+                # чтобы новый путь не мог дать хуже старого.
+                logger.info("deepgram: исходный файл не дал текста (%s) — повтор WAV",
+                            ctx.deepgram_state.last_reason or "?")
+                deepgram_upload = None
+                full_raw_text = transcribe_deepgram(
+                    audio, api_key=ctx.deepgram_api_key, profile=p, sample_rate=ctx.sample_rate,
+                    state=ctx.deepgram_state, session=ctx.session)
             if full_raw_text:
                 engine = "deepgram"
                 assembled_text = full_raw_text

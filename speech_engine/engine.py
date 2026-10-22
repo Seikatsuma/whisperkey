@@ -44,9 +44,19 @@ class Engine:
             session=session or requests.Session(),
         )
 
-    def recognize(self, audio: np.ndarray, dur: float) -> RecognitionResult:
+    def _check_profile(self) -> None:
         if self.ctx.profile.name != "dictation":
             raise ValueError(
                 f"Engine.recognize реализован для профиля dictation, получен {self.ctx.profile.name!r}. "
                 "Профиль calls встраивается как библиотека в существующий конвейер — см. calls.py.")
-        return dictation.recognize(audio, dur, self.ctx)
+
+    def recognize(self, audio: np.ndarray | None, dur: float | None, **kw) -> RecognitionResult:
+        """kw — `deepgram_upload`/`audio_future` (мост с исходным файлом), см. dictation.recognize."""
+        self._check_profile()
+        return dictation.recognize(audio, dur, self.ctx, **kw)
+
+    def recognize_streamed(self, text: str, last_word_end: float, ok: bool,
+                           audio: np.ndarray, dur: float, error: str = "") -> RecognitionResult:
+        """Итог потоковой ступени → проверки качества / запасной каскад."""
+        self._check_profile()
+        return dictation.recognize_streamed(text, last_word_end, ok, audio, dur, self.ctx, error)

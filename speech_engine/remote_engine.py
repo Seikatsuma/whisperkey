@@ -23,6 +23,8 @@ from __future__ import annotations
 import io
 import logging
 import os
+import queue
+import threading
 
 import numpy as np
 
@@ -113,3 +115,109 @@ def transcribe_remote(audio: np.ndarray, dur: float, ctx: Context) -> str:
         ctx.remote_last_error = f"исключение {type(e).__name__}"
         logger.warning("remote: повтор после поднятия туннеля — %s", type(e).__name__)
         return ""
+
+
+class RemoteStream:
+    """Потоковая отправка звука на мост ВО ВРЕМЯ записи (22.10.26).
+
+    Один POST на `/audio/stream` с телом chunked: PCM s16le моно `sample_rate`
+    кусками по мере записи. Мост держит сокет Deepgram и после конца тела
+    отдаёт `{"text": ...}` — уже прошедший проверки и, если надо, обычный
+    каскад по тому же звуку. После отпускания кнопки остаётся только хвост
+    (~0.1–0.3 с) вместо отправки целого файла и распознавания с нуля.
+
+    Любой отказ (старый мост без маршрута, обрыв туннеля, пустой ответ) —
+    `result()` вернёт "" и вызывающий идёт прежним путём `Engine.recognize`
+    по уже записанному звуку: поток может только ускорить диктовку.
+    `feed` зовётся из аудио-коллбэка — только неблокирующая очередь.
+    """
+
+    def __init__(self, url: str, *, session, sample_rate: int = 16000, token: str = "",
+                 timeout: tuple[float, float] = REMOTE_TIMEOUT):
+        self.url = url.rsplit("/audio/transcriptions", 1)[0].rstrip("/") + "/audio/stream"
+        self.session = session
+        self.sample_rate = sample_rate
+        self.token = token
+        self.timeout = timeout
+        self._q: queue.Queue = queue.Queue()
+        self._aborted = False
+        self._text = ""
+        self.error = ""
+        self.engine = ""
+        self.fallbacks: list = []
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> "RemoteStream":
+        self._thread.start()
+        return self
+
+    def feed(self, block: np.ndarray) -> None:
+        if self._aborted:
+            return
+        pcm = np.clip(np.asarray(block, dtype=np.float32).reshape(-1), -1.0, 1.0)
+        buf = np.empty(pcm.shape, dtype=np.int16)
+        np.multiply(pcm, 32767, out=buf, casting="unsafe")
+        self._q.put_nowait(buf.tobytes())
+
+    def close(self) -> None:
+        """Конец записи: тело запроса закрывается, мост финализирует."""
+        self._q.put_nowait(None)
+
+    def abort(self) -> None:
+        """Отмена диктовки: соединение рвётся, мост ничего не распознаёт."""
+        self._aborted = True
+        self._q.put_nowait(None)
+
+    def _body(self):
+        while True:
+            item = self._q.get()
+            parts = []
+            end = item is None
+            if not end:
+                parts.append(item)
+                # Всё, что накопилось, — одним куском (меньше накладных на туннель).
+                while True:
+                    try:
+                        nxt = self._q.get_nowait()
+                    except queue.Empty:
+                        break
+                    if nxt is None:
+                        end = True
+                        break
+                    parts.append(nxt)
+            if self._aborted:
+                raise RuntimeError("отменено")
+            if parts:
+                yield b"".join(parts)
+            if end:
+                return
+
+    def _run(self) -> None:
+        headers = {"Content-Type": "application/octet-stream",
+                   "X-Sample-Rate": str(self.sample_rate)}
+        if self.token:
+            headers["X-Bridge-Token"] = self.token
+        try:
+            r = self.session.post(self.url, data=self._body(), headers=headers, timeout=self.timeout)
+            if r.status_code != 200:
+                self.error = f"статус {r.status_code}"
+                return
+            j = r.json()
+            self._text = (j.get("text") or "").strip()
+            self.engine = j.get("engine") or ""
+            self.fallbacks = list(j.get("fallbacks") or [])
+            if not self._text:
+                self.error = "пустой ответ"
+        except Exception as e:
+            self.error = "отменено" if self._aborted else f"исключение {type(e).__name__}"
+        finally:
+            # Отказ посреди записи: дальнейшие feed просто копятся — освободим.
+            self._aborted = True
+
+    def result(self, timeout: float | None = None) -> str:
+        self._thread.join(timeout if timeout is not None else self.timeout[1] + 5)
+        if self._thread.is_alive():
+            self.error = self.error or "нет ответа вовремя"
+            self.abort()
+            return ""
+        return self._text

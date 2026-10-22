@@ -88,11 +88,16 @@ def maybe_probe_deepgram_if_blocked(*, state: DeepgramState,
 
 
 def transcribe_deepgram(audio_data, *, api_key: str, profile: Profile, sample_rate: int,
-                        state: DeepgramState, session: requests.Session | None = None) -> str | None:
+                        state: DeepgramState, session: requests.Session | None = None,
+                        upload: tuple[bytes, str] | None = None) -> str | None:
     """Первая ступень каскада. Возвращает текст либо None — тогда работает следующая ступень.
 
     Возврат None здесь никогда не означает потерю диктовки: вызывающий код должен
     молча уйти на следующую ступень.
+
+    `upload=(байты, mime)` — готовый файл как есть (webm/ogg/mp4 из браузера):
+    Deepgram сам разбирает контейнер, серверный ffmpeg не нужен; `audio_data`
+    тогда не используется, темп не применяется (метки слов — в шкале записи).
     """
     if not api_key:
         return None
@@ -105,10 +110,15 @@ def transcribe_deepgram(audio_data, *, api_key: str, profile: Profile, sample_ra
                    state.last_reason or "?", state.blocked_until - time.time())
         return None
 
-    upload = create_upload_audio(audio_data, sample_rate, tempo=profile.asr_tempo)
-    if not upload:
-        return None
-    payload, _filename, mime = upload
+    if upload is not None:
+        payload, mime = upload
+        tempo = 1.0
+    else:
+        packed = create_upload_audio(audio_data, sample_rate, tempo=profile.asr_tempo)
+        if not packed:
+            return None
+        payload, _filename, mime = packed
+        tempo = profile.asr_tempo
 
     headers = {
         "Authorization": f"Token {api_key}",
@@ -140,7 +150,7 @@ def transcribe_deepgram(audio_data, *, api_key: str, profile: Profile, sample_ra
                 words = alt.get("words") or []
                 # Словам уходит ускоренный звук (tempo) — их метки в шкале
                 # загруженного файла; умножаем обратно на реальную шкалу записи.
-                state.last_word_end = (words[-1].get("end") or 0.0) * profile.asr_tempo if words else 0.0
+                state.last_word_end = (words[-1].get("end") or 0.0) * tempo if words else 0.0
                 if not text:
                     state.last_reason = "пустой ответ"
                     logger.info("deepgram: пусто — ухожу дальше по каскаду")
