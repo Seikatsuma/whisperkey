@@ -74,6 +74,7 @@ from pynput.keyboard import Controller as KeyboardController, Key as KeyboardKey
 # С пакетом внутри репозитория обычный `import speech_engine` находит его сам:
 # Python всегда ищет модули рядом со своим стартовым файлом.
 import speech_engine
+from speech_engine.netcheck import internet_down
 
 # Плашка внизу экрана, как у Wispr Flow (pill.py): полоска — ждёт, капсула с
 # волной — пишет, капсула со спиннером — распознаёт. Пока она работает, баннеры
@@ -2531,6 +2532,12 @@ def _revive_bridge() -> bool:
     диктовки или адрес снят: обрыв домашнего интернета без этого отправлял
     запись в локальную модель на ~50с (живой журнал 22.10.26), хотя туннель
     восстанавливался за секунды."""
+    # Интернета нет совсем — мост на сервере недостижим по определению;
+    # подъём ssh + 5 проверок /health стоили до ~18с перед local (журнал 22.10.26).
+    if internet_down():
+        _last_revive_fail[0] = time.time()
+        print("[bridge] интернета нет — туннель не поднимаю, сразу дальше")
+        return False
     if _bridge_alive():
         if not _engine.ctx.remote_asr_url:
             _engine.ctx.remote_asr_url = BRIDGE_ASR_URL

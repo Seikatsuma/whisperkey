@@ -18,6 +18,7 @@ import requests
 
 from .audio import create_upload_audio, restore_timeline
 from .density_gate import text_from_response
+from .netcheck import internet_down
 from .profiles import Profile
 
 logger = logging.getLogger("speech_engine.groq")
@@ -203,6 +204,11 @@ def transcribe_groq(audio_data, *, api_key: str, profile: Profile, sample_rate: 
         except Exception as e:
             state.last_reason = f"исключение {type(e).__name__}"
             logger.warning("groq: исключение %s", type(e).__name__)
+            # Нет сети совсем — повторы с паузами 1+2+4с только задерживают
+            # переход на локальную модель (живой журнал 22.10.26: 4 попытки).
+            if isinstance(e, requests.ConnectionError) and internet_down():
+                state.last_reason = "интернета нет"
+                return empty
             if allow_retry and attempt < 3:
                 time.sleep(2 ** attempt)
                 files = {'file': (up_name, io.BytesIO(payload), up_mime)}

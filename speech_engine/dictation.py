@@ -23,6 +23,7 @@ from .deepgram_engine import maybe_probe_deepgram_if_blocked, transcribe_deepgra
 from .density_gate import needs_retry
 from .groq_engine import maybe_probe_if_blocked, transcribe_groq
 from .local_engine import transcribe_local
+from .netcheck import internet_down
 from .remote_engine import transcribe_remote
 from .yandex_engine import transcribe_yandex
 from .terms import fix_known_terms
@@ -41,13 +42,14 @@ HALLUCINATION_TRIGGERS = [
 ]
 
 
-def _transcribe_one_chunk(chunk: np.ndarray, chunk_idx: int, n_chunks: int, ctx: Context):
+def _transcribe_one_chunk(chunk: np.ndarray, chunk_idx: int, n_chunks: int, ctx: Context,
+                          allow_cloud: bool = True):
     """Распознаёт один кусок. Возвращает (индекс, текст|None, метка_качества, слова)."""
     chunk_text = None
     chunk_words: list = []
     quality = 'lost'
     chunk_dur = len(chunk) / ctx.sample_rate
-    use_cloud = bool(ctx.groq_api_key) and not ctx.cloud_state.is_blocked
+    use_cloud = allow_cloud and bool(ctx.groq_api_key) and not ctx.cloud_state.is_blocked
 
     if use_cloud:
         # use_prompt=True — как в оригинале (implicit default в transcribe_cloud_turbo).
@@ -100,7 +102,8 @@ def _transcribe_one_chunk(chunk: np.ndarray, chunk_idx: int, n_chunks: int, ctx:
     return chunk_idx, chunk_text, quality, chunk_words
 
 
-def _recognize_with_groq_cascade(audio: np.ndarray, dur: float, ctx: Context):
+def _recognize_with_groq_cascade(audio: np.ndarray, dur: float, ctx: Context,
+                                 allow_cloud: bool = True):
     """Вторая и третья ступени: Groq, а при его отказе — локальная модель.
 
     Возвращает (текст, текст_до_переносов, потерянные_куски, качество_кусков).
@@ -113,7 +116,7 @@ def _recognize_with_groq_cascade(audio: np.ndarray, dur: float, ctx: Context):
     n_chunks = len(audio_chunks)
 
     style_pool = style_future = None
-    if (p.punct_transfer_min_seconds <= dur <= p.punct_transfer_max_seconds
+    if (allow_cloud and p.punct_transfer_min_seconds <= dur <= p.punct_transfer_max_seconds
             and ctx.groq_api_key and not ctx.cloud_state.is_blocked and p.style_prompt):
         style_pool = ThreadPoolExecutor(max_workers=1)
         style_future = style_pool.submit(
@@ -125,13 +128,13 @@ def _recognize_with_groq_cascade(audio: np.ndarray, dur: float, ctx: Context):
     chunk_quality: list[str] = ['lost'] * n_chunks
     chunk_words: list[list] = [[] for _ in range(n_chunks)]
 
-    parallel_ok = (p.parallel_cloud_chunks and n_chunks > 1
+    parallel_ok = (allow_cloud and p.parallel_cloud_chunks and n_chunks > 1
                   and ctx.groq_api_key and not ctx.cloud_state.is_blocked)
 
     if parallel_ok:
         with ThreadPoolExecutor(max_workers=p.max_cloud_workers) as pool:
             futures = {
-                pool.submit(_transcribe_one_chunk, chunk, idx, n_chunks, ctx): idx
+                pool.submit(_transcribe_one_chunk, chunk, idx, n_chunks, ctx, allow_cloud): idx
                 for idx, chunk in enumerate(audio_chunks)
             }
             for fut in as_completed(futures):
@@ -147,7 +150,8 @@ def _recognize_with_groq_cascade(audio: np.ndarray, dur: float, ctx: Context):
     else:
         for idx, chunk in enumerate(audio_chunks):
             try:
-                _, chunk_text, quality, words = _transcribe_one_chunk(chunk, idx, n_chunks, ctx)
+                _, chunk_text, quality, words = _transcribe_one_chunk(
+                    chunk, idx, n_chunks, ctx, allow_cloud)
             except Exception as e:
                 logger.warning("сегмент %d упал: %s", idx + 1, type(e).__name__)
                 chunk_text, quality, words = None, 'lost', []
@@ -229,6 +233,19 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
     degenerate: list = []
     remote_tried = False
     deepgram_reasked = False
+    offline = False
+
+    def _check_offline() -> bool:
+        # Вызывается только ПОСЛЕ отказа ступени: на счастливом пути проба
+        # не тратит ни миллисекунды. Сети нет → облачные ступени и подъём
+        # туннеля пропускаются, запись сразу идёт в локальную модель
+        # (живой журнал 22.10.26: 21.6с лишних попыток до local).
+        nonlocal offline
+        if not offline and internet_down():
+            offline = True
+            fallbacks.append("сеть: интернета нет — сразу локальная модель")
+            logger.warning("сеть: интернета нет — облачные ступени пропускаю, сразу local")
+        return offline
 
     def _remote_available() -> bool:
         # Мост считается живой ступенью, когда есть адрес ИЛИ клиент дал
@@ -260,8 +277,10 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
         if mode == "remote" and _remote_available():
             remote_tried = True
             _try_remote()
+            if not full_raw_text:
+                _check_offline()
 
-        if not full_raw_text and p.deepgram_enabled and ctx.deepgram_api_key:
+        if not full_raw_text and not offline and p.deepgram_enabled and ctx.deepgram_api_key:
             full_raw_text = transcribe_deepgram(
                 audio, api_key=ctx.deepgram_api_key, profile=p, sample_rate=ctx.sample_rate,
                 state=ctx.deepgram_state, session=ctx.session, upload=deepgram_upload)
@@ -330,12 +349,13 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
                                            n_retry)
             else:
                 fallbacks.append(f"deepgram: {ctx.deepgram_state.last_reason or 'нет ответа'}")
+                _check_offline()
 
         if not full_raw_text:
             # Ранний вызов моста: Groq заведомо недоступен (ключа нет или свежий
             # блок — на Mac'е у Егора гео-блок 403 навсегда) → не жечь минуты на
             # локальной модели, спросить каскад на сервере.
-            if _remote_available() and not remote_tried and \
+            if not offline and _remote_available() and not remote_tried and \
                     (not ctx.groq_api_key or ctx.cloud_state.is_blocked):
                 remote_tried = True
                 _try_remote()
@@ -343,7 +363,7 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
         if not full_raw_text:
             # Groq мёртв, а мост не ответил — Yandex дешевле и быстрее, чем
             # прогон локальной модели по кускам (облако, доступное без VPN).
-            if ctx.yandex_api_key and ctx.cloud_state.is_blocked:
+            if not offline and ctx.yandex_api_key and ctx.cloud_state.is_blocked:
                 ytext = transcribe_yandex(audio, dur, ctx)
                 if ytext:
                     full_raw_text = assembled_text = ytext
@@ -353,22 +373,26 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
 
         if not full_raw_text:
             engine = "groq" if ctx.groq_api_key else "local"
+            _resolve_audio()
             full_raw_text, assembled_text, lost_marks, chunk_quality = _recognize_with_groq_cascade(
-                audio, dur, ctx)
+                audio, dur, ctx, allow_cloud=not offline)
             degenerate = list(ctx.cloud_state.last_degenerate or [])
             if 'local' in chunk_quality and 'cloud' not in chunk_quality and 'cloud_retry' not in chunk_quality:
                 engine = "local"
-                if ctx.groq_api_key:
+                if ctx.groq_api_key and not offline:
                     fallbacks.append(f"groq: {ctx.cloud_state.last_reason or 'заблокирован'} → local")
             if not full_raw_text:
                 fallbacks.append("groq/local: пустой результат")
 
             # Спасательные ступени: каскад кончился пустотой или целиком
             # локальной моделью → мост (там Deepgram и Groq живы), затем Yandex.
-            if _remote_available() and not remote_tried and (not full_raw_text or engine == "local"):
+            # После local (десятки секунд) сеть могла вернуться — проба свежая.
+            if offline and (not full_raw_text or engine == "local"):
+                offline = internet_down()
+            if not offline and _remote_available() and not remote_tried and (not full_raw_text or engine == "local"):
                 remote_tried = True
                 _try_remote()
-            if ctx.yandex_api_key and (not full_raw_text or engine == "local"):
+            if not offline and ctx.yandex_api_key and (not full_raw_text or engine == "local"):
                 ytext = transcribe_yandex(audio, dur, ctx)
                 if ytext:
                     full_raw_text = assembled_text = ytext
