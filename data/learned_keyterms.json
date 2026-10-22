@@ -1,0 +1,49 @@
+{
+  "updated": "2026-10-22 23:48:47",
+  "source": "/home/claude/voice-archive/claude-ui × groq whisper-large-v3, последние 80 диктовок",
+  "terms": [
+    "google",
+    "GPT",
+    "CRM",
+    "apple",
+    "prompt",
+    "AmaCRM"
+  ],
+  "missed_counts": {
+    "prompt": 3,
+    "AmaCRM": 2,
+    "CloudUI": 1,
+    "J5": 1,
+    "EGO38": 1,
+    "DeepGram": 1,
+    "SRM": 1,
+    "sop": 1,
+    "talking": 1
+  },
+  "already_fine": {
+    "google": 4,
+    "telegram": 4,
+    "CRM": 3,
+    "GPT": 3,
+    "apple": 3,
+    "GitHub": 3,
+    "Nova": 2,
+    "mac": 2,
+    "CloudUI": 2,
+    "excel": 2,
+    "crm": 2,
+    "id": 2,
+    "LLM": 1,
+    "amazon": 1,
+    "Whisper": 1,
+    "send": 1,
+    "macbook": 1,
+    "api": 1,
+    "transcribe": 1,
+    "windows": 1,
+    "PDF": 1,
+    "Telegram": 1,
+    "UGile": 1,
+    "AI": 1
+  }
+}
