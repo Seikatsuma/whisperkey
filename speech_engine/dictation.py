@@ -282,11 +282,13 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
                 _check_offline()
 
         if not full_raw_text and not offline and p.deepgram_enabled and ctx.deepgram_api_key:
+            deepgram_upload_attempted = time.time() >= ctx.deepgram_state.blocked_until
             full_raw_text = transcribe_deepgram(
                 audio, api_key=ctx.deepgram_api_key, profile=p, sample_rate=ctx.sample_rate,
                 state=ctx.deepgram_state, session=ctx.session, upload=deepgram_upload)
+            deepgram_upload_attempted = deepgram_upload_attempted and time.time() >= ctx.deepgram_state.blocked_until
             _resolve_audio()
-            if deepgram_upload is not None and not full_raw_text \
+            if deepgram_upload is not None and deepgram_upload_attempted and not full_raw_text \
                     and time.time() >= ctx.deepgram_state.blocked_until:
                 # Контейнер не принят/пусто — тот же звук прежним путём (WAV + темп),
                 # чтобы новый путь не мог дать хуже старого.
