@@ -96,6 +96,21 @@ DICTATION = Profile(
         "smart_format": "false",   # переписывает "двадцать пять" в "25" — дословность важнее
         "filler_words": "true",    # "ну", "вот", "значит" — часть речи Егора, не мусор
         "numerals": "false",
+        # keyterm (nova-3): буст английских терминов в русской речи. Без него
+        # nova-3 выбрасывает англ. названия целиком (жалоба Егора 22.10.26:
+        # «пропали все наименования Deepgram»; замер: файл 13 эталона — «Claude
+        # Design/Claude Code» исчезли полностью, с keyterm — вернулись дословно,
+        # WER корпуса без изменений: 9.2% против 9.1%). Повторный параметр:
+        # requests кодирует список как keyterm=a&keyterm=b. Лимит API — 500
+        # токенов на запрос, держимся в районе 20-50 терминов.
+        "keyterm": [
+            "Deepgram", "WhisperKey", "Wispr Flow", "Claude Code",
+            "Claude Design", "Claude UI", "GitHub", "Telegram", "Groq",
+            "API", "CEO", "YouGile", "iPad", "Zoom", "Miro", "Devin",
+            "Termius", "Ideogram", "Sonnet", "Opus", "Haiku", "Camoufox",
+            "Patchright", "Brave", "TextEdit", "SaluteSpeech", "Телемост",
+            "Ozon", "Wildberries", "Яндекс Маркет", "NotebookLM", "SEO",
+        ],
     },
     deepgram_timeout=20.0,
     deepgram_retries=2,
