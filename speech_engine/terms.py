@@ -31,6 +31,7 @@ TERM_CANON = {
     "termius": "Termius", "ideogram": "Ideogram", "devin": "Devin",
     "sonnet": "Sonnet", "opus": "Opus", "haiku": "Haiku",
     "camoufox": "Camoufox", "patchright": "Patchright",
+    "amocrm": "amoCRM",
 }
 
 TERM_FIX = [
@@ -39,6 +40,10 @@ TERM_FIX = [
     (r"\bвиспер\b", "WhisperKey"),
     (r"\bwhisperer[-\s]?k(?:ey)?\b", "WhisperKey"),
     (r"\b(?:jiminy|джимм?и|джемини|гемини)\b", "Gemini"),
+    # «клод юай» → модель слышит CloudUI/code UI; однословная форма однозначна
+    # (архив 20-22.10.26: «CloudUI» в 5+ диктовках). «code UI» раздельно не
+    # трогаем — может быть дословным «код UI».
+    (r"\bcloudui\b", "Claude UI"),
     (r"\bкл[оа]уд\w*\b", "Claude"),
     (r"\bклод\b", "Claude"),
     (r"\bklot\b", "Claude"),

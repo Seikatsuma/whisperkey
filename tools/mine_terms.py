@@ -45,10 +45,49 @@ LATIN_RE = re.compile(r"[A-Za-z][A-Za-z0-9._-]{1,}")
 # Частые служебные англ. слова, которые реально есть в речи как русские по смыслу —
 # не термины, бустить нечего.
 STOP = {"the", "a", "i", "ok", "okay", "to", "in", "on", "is", "it", "and",
-        "or", "of", "for", "so", "no", "yes", "webm", "wav", "http", "https"}
-# Регистр: если весь токен нижний регистр и это не известный бренд — чаще обычное
-# слово или транслит, а не термин. Оставляем только токены с заглавной или
-# CamelCase, либо вхождения, где тот же токен видели с заглавной.
+        "or", "of", "for", "so", "no", "yes", "webm", "wav", "http", "https",
+        "talking", "sop"}
+
+_DIGRAPHS = {"ph": "ф", "sh": "ш", "ch": "ч", "ck": "к", "oo": "у", "ee": "и",
+             "th": "т", "wh": "в", "qu": "кв", "ya": "я", "yu": "ю", "yo": "ё"}
+_LAT2CYR = {"a": "а", "b": "б", "c": "к", "d": "д", "e": "е", "f": "ф",
+            "g": "г", "h": "х", "i": "и", "j": "дж", "k": "к", "l": "л",
+            "m": "м", "n": "н", "o": "о", "p": "п", "q": "к", "r": "р",
+            "s": "с", "t": "т", "u": "у", "v": "в", "w": "в", "x": "кс",
+            "y": "и", "z": "з"}
+
+
+def lat_to_cyr(token: str) -> str:
+    """Грубая транслитерация латиницы — нужна только чтобы отличить
+    «термин потерян» от «термин записан кириллицей» (prompt → промпт:
+    это выбор написания, а не потеря слова)."""
+    t, out, i = token.lower(), [], 0
+    while i < len(t):
+        pair = t[i:i + 2]
+        if pair in _DIGRAPHS:
+            out.append(_DIGRAPHS[pair])
+            i += 2
+        else:
+            out.append(_LAT2CYR.get(t[i], t[i]))
+            i += 1
+    return "".join(out)
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def _dist1(a: str, b: str) -> bool:
+    """Разница ровно в один символ (замена/вставка/удаление) — достаточно
+    для отлова вариантов известного термина вроде CloudUI → Claude UI."""
+    if a == b:
+        return True
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b)) == 1
+    long, short = (a, b) if len(a) > len(b) else (b, a)
+    return any(long[:i] + long[i + 1:] == short for i in range(len(long)))
 
 
 def groq_key() -> str:
@@ -134,8 +173,12 @@ def main() -> int:
     print(f"прогоняю {len(pairs)} свежих диктовок…")
 
     session = requests.Session()
-    missed = Counter()   # термин → сколько диктовок его потеряли
-    seen_ok = Counter()  # термины, которые Deepgram уже пишет латиницей
+    # По каждому нормализованному термину — счётчики по поверхным формам:
+    # «Claude UI», «CloudUI», «claudeui» — один термин, формы голосуют.
+    forms: dict[str, Counter] = {}
+    missed_docs: dict[str, set] = {}   # термин → номера диктовок, где его нет у DG
+    seen_docs: dict[str, set] = {}     # термин → диктовки, где DG написал латиницей
+    absorbed_docs: dict[str, set] = {} # термин → DG написал кириллицей (не потеря)
 
     for i, (audio, txt) in enumerate(pairs, 1):
         dg_text = txt.read_text(encoding="utf-8", errors="replace")
@@ -143,56 +186,105 @@ def main() -> int:
         gq = groq_transcribe(audio, key, session)
         if gq is None:
             continue
-        gq_terms = latin_terms(gq)
-        for tok in gq_terms:
+        for tok in latin_terms(gq):
+            key_n = _norm(tok)
+            forms.setdefault(key_n, Counter())[tok] += 1
             if tok.lower() in dg_low:
-                seen_ok[tok] += 1
+                seen_docs.setdefault(key_n, set()).add(i)
+            elif lat_to_cyr(tok) in dg_low:
+                absorbed_docs.setdefault(key_n, set()).add(i)
             else:
-                missed[tok] += 1
+                missed_docs.setdefault(key_n, set()).add(i)
         time.sleep(0.4)  # бережём rate limit Groq
         if i % 10 == 0:
             print(f"  {i}/{len(pairs)}")
 
-    # Свод. Два источника кандидатов:
-    #  1. missed — термины, которые Groq слышит, а Deepgram в тексте не имеет
-    #     (потеря/коверка) — от min-count диктовок.
-    #  2. seen_ok — частые термины, которые Deepgram пока пишет верно, но при
-    #     высокой частоте стоит подстраховать бустом от эпизодических выпадений
-    #     (исходная жалоба — именно выпадение уже известного «Deepgram»).
-    # Уже стоящие в профильном keyterm не дублируем.
+    # ── Перепроверка кандидатов (защита от записи ОШИБОЧНОЙ формы — вопрос
+    # Егора 23.10.26: «Claude UI записывается неправильно, и оно может
+    # добавиться в словарь в неправильном виде»). Правила отбора:
+    #  1. Форма по большинству: в словарь идёт только доминирующее написание
+    #     (≥60% вхождений); разбросанное написание = недоверенное → кандидат.
+    #  2. Канон: термин из TERM_CANON берётся в канонической форме; близкий
+    #     к канону вариант (±1 символ) — не словарь, а кандидат.
+    #  3. Столкновение с базовым keyterm: вариант в ±1 символ от уже стоящего
+    #     термина («CloudUI» к «Claude UI») отбрасывается — иначе словарь
+    #     закрепил бы ошибку.
+    #  4. Кириллическое поглощение: если Deepgram писал термин кириллицей
+    #     (prompt→промпт), это выбор написания, а не потеря — в словарь не идёт.
     sys.path.insert(0, str(REPO))
+    base_terms: set[str] = set()
+    canon: dict[str, str] = {}
     try:
         from speech_engine.profiles import DICTATION
-        base_terms = {t.lower() for t in DICTATION.deepgram_params.get("keyterm", [])}
+        from speech_engine.terms import TERM_CANON
+        base_terms = {_norm(t) for t in DICTATION.deepgram_params.get("keyterm", [])}
+        canon = {_norm(k): v for k, v in TERM_CANON.items()}
     except Exception:
-        base_terms = set()
+        pass
 
-    learned = sorted(
-        {t for t, c in missed.items() if c >= args.min_count}
-        | {t for t, c in seen_ok.items() if c >= args.min_count + 1},
-        key=lambda t: -(missed.get(t, 0) + seen_ok.get(t, 0)),
-    )
-    learned = [t for t in learned if t.lower() not in base_terms][:args.max_terms]
+    learned_forms: list[str] = []
+    candidates: list[dict] = []
+
+    for key_n, fc in forms.items():
+        total = sum(fc.values())
+        form, form_n = fc.most_common(1)[0]
+        share = form_n / total
+        n_missed = len(missed_docs.get(key_n, ()))
+        n_seen = len(seen_docs.get(key_n, ()))
+        n_abs = len(absorbed_docs.get(key_n, ()))
+        entry = {"form": form, "variants": dict(fc), "missed": n_missed,
+                 "seen": n_seen, "absorbed": n_abs}
+
+        if not (n_missed >= args.min_count or n_seen >= args.min_count + 1):
+            continue
+        if key_n in base_terms or any(_dist1(key_n, b) for b in base_terms):
+            continue  # уже в словаре или искажённый вариант его термина
+        if key_n in canon:
+            form = canon[key_n]
+        elif share < 0.6:
+            entry["reason"] = "разбросанное написание — нет доминирующей формы"
+            candidates.append(entry)
+            continue
+        elif any(_dist1(key_n, c) for c in canon):
+            entry["reason"] = "вариант в ±1 символ от канонического термина"
+            candidates.append(entry)
+            continue
+        if n_missed and n_abs >= n_missed:
+            entry["reason"] = "Deepgram пишет кириллицей — выбор написания, не потеря"
+            candidates.append(entry)
+            continue
+        learned_forms.append(form)
+
+    score = {k: len(missed_docs.get(k, ())) + len(seen_docs.get(k, ()))
+             for k in forms}
+    learned = sorted(set(learned_forms),
+                     key=lambda t: -score.get(_norm(t), 0))[:args.max_terms]
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "source": f"{args.archive} × groq whisper-large-v3, последние {len(pairs)} диктовок",
+        "source": f"{args.archive} × groq whisper-large-v3-turbo, последние {len(pairs)} диктовок",
         "terms": learned,
-        "missed_counts": dict(missed.most_common()),
-        "already_fine": dict(seen_ok.most_common()),
+        "candidates": candidates,
+        "missed_counts": {k: len(v) for k, v in missed_docs.items()},
+        "already_fine": {k: len(v) for k, v in seen_docs.items()},
     }
     out.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
                    encoding="utf-8")
     print(f"\nвыученных терминов: {len(learned)} → {out}")
     for t in learned:
+        k = _norm(t)
         parts = []
-        if missed.get(t):
-            parts.append(f"потерян ×{missed[t]}")
-        if seen_ok.get(t):
-            parts.append(f"частый ×{seen_ok[t]}")
+        if missed_docs.get(k):
+            parts.append(f"потерян ×{len(missed_docs[k])}")
+        if seen_docs.get(k):
+            parts.append(f"частый ×{len(seen_docs[k])}")
         print(f"  + {t} ({', '.join(parts)})")
+    if candidates:
+        print(f"\nкандидаты, не прошедшие перепроверку ({len(candidates)}):")
+        for c in candidates[:10]:
+            print(f"  ? {c['form']} — {c['reason']}")
     return 0
 
 
