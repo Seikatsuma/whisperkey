@@ -10,10 +10,12 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import requests
 
@@ -23,6 +25,45 @@ from .profiles import Profile
 logger = logging.getLogger("speech_engine.deepgram")
 
 DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
+
+# Самообучение словаря (22.10.26): tools/mine_terms.py прогоняет архив диктовок
+# через второй движок, находит термины, которые nova-3 теряет или коверкает, и
+# складывает их в data/learned_keyterms.json. Здесь они добавляются к профильному
+# keyterm на каждый запрос — файл обновляется без правки кода и без перезапуска
+# (кэш по mtime). Безопасность: это только подсказки модели, текст не правится.
+_LEARNED_TERMS_PATH = Path(__file__).resolve().parent.parent / "data" / "learned_keyterms.json"
+_learned_terms_cache: dict = {"mtime": 0.0, "terms": []}
+
+
+def _learned_keyterms() -> list[str]:
+    try:
+        mtime = _LEARNED_TERMS_PATH.stat().st_mtime
+    except OSError:
+        return []
+    if mtime != _learned_terms_cache["mtime"]:
+        try:
+            data = json.loads(_LEARNED_TERMS_PATH.read_text(encoding="utf-8"))
+            terms = [t.strip() for t in data.get("terms", [])
+                     if isinstance(t, str) and t.strip()]
+            _learned_terms_cache.update(mtime=mtime, terms=terms)
+            logger.info("deepgram: выученных терминов подхвачено: %d", len(terms))
+        except (ValueError, OSError):
+            return _learned_terms_cache["terms"]
+    return _learned_terms_cache["terms"]
+
+
+def _merged_params(profile: Profile) -> dict:
+    params = profile.deepgram_params
+    base = params.get("keyterm")
+    if not isinstance(base, list):
+        return params
+    extra = [t for t in _learned_keyterms()
+             if t.lower() not in {b.lower() for b in base}]
+    if not extra:
+        return params
+    merged = dict(params)
+    merged["keyterm"] = base + extra
+    return merged
 
 
 @dataclass
@@ -126,6 +167,8 @@ def transcribe_deepgram(audio_data, *, api_key: str, profile: Profile, sample_ra
     }
     http = session or requests
 
+    params = _merged_params(profile)
+
     t0 = time.time()
     for attempt in range(profile.deepgram_retries):
         try:
@@ -133,7 +176,7 @@ def transcribe_deepgram(audio_data, *, api_key: str, profile: Profile, sample_ra
             # целиком deepgram_timeout до каждого ухода на следующую ступень —
             # на медленной сети это был основной источник «долго думает».
             response = http.post(
-                DEEPGRAM_URL, params=profile.deepgram_params, headers=headers,
+                DEEPGRAM_URL, params=params, headers=headers,
                 data=payload, timeout=(5.0, profile.deepgram_timeout),
             )
 
