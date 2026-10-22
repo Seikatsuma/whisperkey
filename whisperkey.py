@@ -2638,6 +2638,13 @@ def create_desktop_launcher():
     except:
         pass
 
+def _warm_local_model(local_model):
+    segments, _ = local_model.transcribe(
+        np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32), language="ru", beam_size=1)
+    for _ in segments:
+        pass
+
+
 def main():
     global model
     if not acquire_single_instance_lock():
@@ -2678,7 +2685,7 @@ def main():
     try:
         print("Загрузка локальной модели (запасной вариант, если облако недоступно)...")
         model = WhisperModel(MODEL_PATH, device="cpu", compute_type="int8", cpu_threads=2, local_files_only=False)
-        model.transcribe(np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32), language="ru", beam_size=1)
+        _warm_local_model(model)
         # Модель грузится тут (дорого, после баннера сбора корпуса) — отдаём её
         # в Engine как третью ступень каскада (используется, только когда и
         # Deepgram, и Groq недоступны или ничего не вернули).
