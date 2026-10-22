@@ -233,6 +233,7 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
     chunk_quality: list[str] = []
     degenerate: list = []
     remote_tried = False
+    remote_attempts = 0
     deepgram_reasked = False
     offline = False
 
@@ -256,6 +257,8 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
 
     def _try_remote() -> None:
         nonlocal full_raw_text, engine, assembled_text, lost_marks, chunk_quality, degenerate
+        nonlocal remote_attempts
+        remote_attempts += 1
         remote_tried_inner = transcribe_remote(audio, dur, ctx)
         if remote_tried_inner:
             full_raw_text = assembled_text = remote_tried_inner
@@ -410,7 +413,14 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
             if offline and (not full_raw_text or engine == "local"):
                 _reset_net_cache()
                 offline = internet_down()
-            if not offline and _remote_available() and not remote_tried and (not full_raw_text or engine == "local"):
+            # Здесь remote_tried НЕ проверяем: первая попытка могла не дойти до
+            # моста вовсе (флап сети, отказ reviver), а спустя десятки секунд
+            # local туннель уже жив — иначе запись остаётся в локальной модели
+            # при живом мосте (живой журнал 22.10.26: 22.5с диктовка ушла в
+            # local на 34с, туннель поднялся на ~20-й секунде декода, а
+            # спасательный блок молчал именно из-за remote_tried). Потолок 2
+            # попыток, чтобы не молотить действительно мёртвый мост.
+            if not offline and _remote_available() and remote_attempts < 2 and (not full_raw_text or engine == "local"):
                 remote_tried = True
                 _try_remote()
             if not offline and ctx.yandex_api_key and (not full_raw_text or engine == "local"):

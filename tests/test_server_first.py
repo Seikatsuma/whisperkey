@@ -105,6 +105,26 @@ class ServerFirstTests(unittest.TestCase):
         self.assertEqual(result.engine, 'remote')
         remote.assert_called_once()
 
+    def test_rescue_remote_retries_after_local(self):
+        # Живой сценарий 22.10.26: флап сети → мост молчит → запись уходит в
+        # local; за время декода туннель поднялся — спасательный блок обязан
+        # переспросить мост и заменить локальный ответ, а не молчать из-за
+        # remote_tried, выставленного до первой попытки.
+        engine = build_engine(True, 'auto')
+        engine.ctx.remote_asr_url = 'http://127.0.0.1:8092/audio/transcriptions'
+        with patch.object(dictation, 'transcribe_remote',
+                          side_effect=['', 'Сервер вернулся.']) as remote, \
+             patch.object(dictation, 'internet_down', side_effect=[True, False]), \
+             patch.object(dictation, '_recognize_with_groq_cascade',
+                          return_value=('', '', [], ['local'])), \
+             patch.object(dictation, 'transcribe_deepgram',
+                          side_effect=AssertionError('офлайн — прямой вызов недопустим')), \
+             patch.object(dictation, 'transcribe_yandex', return_value=''):
+            result = engine.recognize(np.zeros(16000, dtype=np.float32), 1.0)
+        self.assertEqual(result.engine, 'remote')
+        self.assertEqual(result.text, 'Сервер вернулся.')
+        self.assertEqual(remote.call_count, 2)
+
     def test_failed_bridge_preserves_fallback(self):
         engine = build_engine(True, 'auto')
         engine.ctx.remote_asr_url = 'http://127.0.0.1:8092/audio/transcriptions'

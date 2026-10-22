@@ -2532,6 +2532,13 @@ def _revive_bridge() -> bool:
     диктовки или адрес снят: обрыв домашнего интернета без этого отправлял
     запись в локальную модель на ~50с (живой журнал 22.10.26), хотя туннель
     восстанавливался за секунды."""
+    # Живой туннель — само по себе доказательство сети: установленный ssh
+    # переживает краткий флап лучше, чем свежий TCP-connect общей пробы,
+    # и ждать её здесь не нужно.
+    if _bridge_alive():
+        if not _engine.ctx.remote_asr_url:
+            _engine.ctx.remote_asr_url = BRIDGE_ASR_URL
+        return True
     # Интернета нет совсем — мост на сервере недостижим по определению;
     # подъём ssh + 5 проверок /health стоили до ~18с перед local (журнал 22.10.26).
     if internet_down():
@@ -2539,10 +2546,6 @@ def _revive_bridge() -> bool:
         # reviver отказывал бы по таймеру отдыха; частоту держит кэш пробы.
         print("[bridge] интернета нет — туннель не поднимаю, сразу дальше")
         return False
-    if _bridge_alive():
-        if not _engine.ctx.remote_asr_url:
-            _engine.ctx.remote_asr_url = BRIDGE_ASR_URL
-        return True
     if time.time() - _last_revive_fail[0] < BRIDGE_REVIVE_REST_SEC:
         return False
     print("[bridge] запрос упал в обрыв — поднимаю туннель сразу")
