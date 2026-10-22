@@ -2639,10 +2639,15 @@ def create_desktop_launcher():
         pass
 
 def _warm_local_model(local_model):
-    segments, _ = local_model.transcribe(
-        np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32), language="ru", beam_size=1)
-    for _ in segments:
-        pass
+    try:
+        segments, _ = local_model.transcribe(
+            np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32), language="ru", beam_size=1)
+        for _ in segments:
+            pass
+    except Exception as e:
+        print(f"[local] прогрев не выполнен ({type(e).__name__}); запуск продолжается")
+        return False
+    return True
 
 
 def main():

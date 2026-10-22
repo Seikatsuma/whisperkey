@@ -49,10 +49,31 @@ class LocalWarmupTests(unittest.TestCase):
                 return segments(), None
 
         model = Model()
-        namespace['_warm_local_model'](model)
+        self.assertTrue(namespace['_warm_local_model'](model))
         self.assertEqual(consumed, [True, True])
         self.assertEqual(model.audio.shape, (8000,))
         self.assertEqual(model.kwargs, {'language': 'ru', 'beam_size': 1})
+
+    def test_warmup_failure_does_not_stop_startup(self):
+        tree = ast.parse((ROOT / 'whisperkey.py').read_text())
+        warmup = next(node for node in tree.body
+                      if isinstance(node, ast.FunctionDef) and node.name == '_warm_local_model')
+        namespace = {'np': np, 'SAMPLE_RATE': 16000}
+        exec(compile(ast.Module(body=[warmup], type_ignores=[]), '<warmup>', 'exec'), namespace)
+
+        def transcribe(*args, **kwargs):
+            def segments():
+                raise RuntimeError('decoder failure')
+                yield
+            return segments(), None
+
+        with patch('builtins.print') as output:
+            self.assertFalse(namespace['_warm_local_model'](SimpleNamespace(transcribe=transcribe)))
+        output.assert_called_once()
+        main = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef) and node.name == 'main')
+        self.assertTrue(any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                            and node.func.id == '_warm_local_model' for node in ast.walk(main)))
 
 
 class ServerFirstTests(unittest.TestCase):
