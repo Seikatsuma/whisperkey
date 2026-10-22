@@ -10,20 +10,31 @@ injection), а не создаваемый пакетом: загрузка мо
 """
 from __future__ import annotations
 
+import logging
+import time
+
 import numpy as np
+
+logger = logging.getLogger("speech_engine.local")
 
 
 def transcribe_local(chunk: np.ndarray, model, *, language: str = "ru",
                      context_prompt: str = "") -> str:
     """model — объект с методом .transcribe() в духе faster_whisper.WhisperModel."""
-    max_val = np.max(np.abs(chunk))
-    if max_val > 0.0001:
-        chunk = chunk / max_val * 0.99
-    segments, _ = model.transcribe(
-        chunk, language=language,
-        beam_size=5, patience=1.0, repetition_penalty=1.2,
-        vad_filter=False, suppress_blank=True, without_timestamps=True,
-        condition_on_previous_text=False,
-        initial_prompt=context_prompt or None,
-    )
-    return " ".join(seg.text.strip() for seg in segments).strip()
+    started = time.monotonic()
+    logger.warning("local: начало резервного распознавания")
+    try:
+        max_val = np.max(np.abs(chunk))
+        if max_val > 0.0001:
+            chunk = chunk / max_val * 0.99
+        segments, _ = model.transcribe(
+            chunk, language=language,
+            beam_size=5, patience=1.0, repetition_penalty=1.2,
+            vad_filter=False, suppress_blank=True, without_timestamps=True,
+            condition_on_previous_text=False,
+            initial_prompt=context_prompt or None,
+        )
+        return " ".join(seg.text.strip() for seg in segments).strip()
+    finally:
+        logger.warning("local: выход из резервного распознавания через %.2fс",
+                       time.monotonic() - started)
