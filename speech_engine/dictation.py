@@ -287,7 +287,11 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
                 audio, api_key=ctx.deepgram_api_key, profile=p, sample_rate=ctx.sample_rate,
                 state=ctx.deepgram_state, session=ctx.session, upload=deepgram_upload)
             deepgram_upload_attempted = deepgram_upload_attempted and time.time() >= ctx.deepgram_state.blocked_until
-            _resolve_audio()
+            if not full_raw_text:
+                # Звук нужен только неуспешному пути: повтор WAV и запасные
+                # ступени. На счастливом пути декод не ждём — ответ уходит по
+                # времени Deepgram (замер 22.10.26: 3-19с лишних на webm).
+                _resolve_audio()
             if deepgram_upload is not None and deepgram_upload_attempted and not full_raw_text \
                     and time.time() >= ctx.deepgram_state.blocked_until:
                 # Контейнер не принят/пусто — тот же звук прежним путём (WAV + темп),
@@ -310,7 +314,7 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
                     logger.info("deepgram: только заглушка ASR — ухожу на следующую ступень")
                     fallbacks.append("deepgram: заглушка ASR")
                     full_raw_text = assembled_text = ""
-                elif dur > 8.0:
+                elif dur is not None and dur > 8.0:
                     # Deepgram изредка отдаёт «редкий» ответ: целые куски речи
                     # выпадают, остаток сглажен (живой случай 20.10.26: 18 слов
                     # на 22 с). Повтор ТОГО ЖЕ звука вернул все 42 слова дословно —
@@ -328,7 +332,10 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
                     # Без меток слов (last_word_end=0) хвост не проверяем —
                     # иначе весь файл считался бы непокрытым.
                     if ctx.deepgram_state.last_word_end and tail_gap > 3.0:
-                        tail = audio[int(ctx.sample_rate * ctx.deepgram_state.last_word_end):]
+                        # Звук для энергии хвоста достаём только когда триггер
+                        # сработал: на пути deepgram_upload декод ещё не ждали.
+                        _resolve_audio()
+                        tail = audio[int(ctx.sample_rate * ctx.deepgram_state.last_word_end):] if audio is not None else []
                         if len(tail):
                             tail_speech = float(
                                 np.sqrt((tail.astype(np.float64) ** 2).mean())) > 0.01
