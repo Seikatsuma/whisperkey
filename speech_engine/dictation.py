@@ -23,7 +23,7 @@ from .deepgram_engine import maybe_probe_deepgram_if_blocked, transcribe_deepgra
 from .density_gate import needs_retry
 from .groq_engine import maybe_probe_if_blocked, transcribe_groq
 from .local_engine import transcribe_local
-from .netcheck import internet_down
+from .netcheck import internet_down, reset_cache as _reset_net_cache
 from .remote_engine import transcribe_remote
 from .yandex_engine import transcribe_yandex
 from .terms import fix_known_terms
@@ -109,7 +109,8 @@ def _recognize_with_groq_cascade(audio: np.ndarray, dur: float, ctx: Context,
     Возвращает (текст, текст_до_переносов, потерянные_куски, качество_кусков).
     """
     p = ctx.profile
-    maybe_probe_if_blocked(api_key=ctx.groq_api_key, state=ctx.cloud_state, session=ctx.session)
+    if allow_cloud:
+        maybe_probe_if_blocked(api_key=ctx.groq_api_key, state=ctx.cloud_state, session=ctx.session)
     audio_chunks, chunk_offsets = chunking.split_audio(
         audio, dur, ctx.sample_rate, p.chunk_threshold_seconds, p.chunk_size_seconds,
         p.chunk_overlap_seconds)
@@ -388,6 +389,7 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
             # локальной моделью → мост (там Deepgram и Groq живы), затем Yandex.
             # После local (десятки секунд) сеть могла вернуться — проба свежая.
             if offline and (not full_raw_text or engine == "local"):
+                _reset_net_cache()
                 offline = internet_down()
             if not offline and _remote_available() and not remote_tried and (not full_raw_text or engine == "local"):
                 remote_tried = True

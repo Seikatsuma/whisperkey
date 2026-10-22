@@ -13,6 +13,7 @@ from __future__ import annotations
 import socket
 import threading
 import time
+import urllib.request
 
 PROBE_HOSTS = (("1.1.1.1", 443), ("8.8.8.8", 443), ("77.88.8.8", 443))
 CACHE_SEC = 5.0
@@ -29,8 +30,22 @@ def _reachable(host: str, port: int, timeout: float, hit: threading.Event) -> No
         pass
 
 
+def _proxy_configured() -> bool:
+    # requests ходит через системный/переменный прокси сам, а голый сокет — нет:
+    # в сети «только через прокси» проба дала бы ложный офлайн и отрезала облако.
+    # Прокси есть — офлайн никогда не объявляем, каскад работает как раньше.
+    try:
+        proxies = urllib.request.getproxies()
+    except Exception:
+        return False
+    return any(proxies.get(k) for k in ("https", "http", "all"))
+
+
 def internet_down(timeout: float = 1.0) -> bool:
-    """True — ни один из PROBE_HOSTS не принял соединение за timeout."""
+    """True — ни один из PROBE_HOSTS не принял соединение за timeout
+    (и прокси не настроен)."""
+    if _proxy_configured():
+        return False
     with _lock:
         if time.monotonic() - _cache["t"] < CACHE_SEC:
             return _cache["down"]
