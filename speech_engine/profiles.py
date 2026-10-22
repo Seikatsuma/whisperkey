@@ -85,9 +85,9 @@ class Profile:
 DICTATION = Profile(
     name="dictation",
     deepgram_enabled=True,
-    deepgram_model="nova-2",
+    deepgram_model="nova-3",
     deepgram_params={
-        "model": "nova-2",
+        "model": "nova-3",
         "language": "ru",
         "punctuate": "true",
         "smart_format": "false",   # переписывает "двадцать пять" в "25" — дословность важнее
