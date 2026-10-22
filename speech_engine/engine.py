@@ -54,9 +54,3 @@ class Engine:
         """kw — `deepgram_upload`/`audio_future` (мост с исходным файлом), см. dictation.recognize."""
         self._check_profile()
         return dictation.recognize(audio, dur, self.ctx, **kw)
-
-    def recognize_streamed(self, text: str, last_word_end: float, ok: bool,
-                           audio: np.ndarray, dur: float, error: str = "") -> RecognitionResult:
-        """Итог потоковой ступени → проверки качества / запасной каскад."""
-        self._check_profile()
-        return dictation.recognize_streamed(text, last_word_end, ok, audio, dur, self.ctx, error)

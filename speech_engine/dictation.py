@@ -180,61 +180,6 @@ def _recognize_with_groq_cascade(audio: np.ndarray, dur: float, ctx: Context):
     return text, assembled, lost_marks, chunk_quality
 
 
-def _tail_has_speech(audio: np.ndarray, dur: float, last_word_end: float, sample_rate: int) -> tuple[bool, float]:
-    """После последнего распознанного слова >3с записи с громкостью речи?
-    Без меток слов (0) хвост не проверяем — иначе весь файл считался бы непокрытым."""
-    tail_gap = dur - last_word_end
-    if not last_word_end or tail_gap <= 3.0:
-        return False, tail_gap
-    tail = audio[int(sample_rate * last_word_end):]
-    return bool(len(tail)) and float(np.sqrt((tail.astype(np.float64) ** 2).mean())) > 0.01, tail_gap
-
-
-def recognize_streamed(stream_text: str, last_word_end: float, stream_ok: bool,
-                       audio: np.ndarray, dur: float, ctx: Context,
-                       stream_error: str = "") -> RecognitionResult:
-    """Текст потоковой ступени (deepgram_stream) → тот же результат, что у каскада.
-
-    Те же проверки, что у первой ступени в `recognize`: заглушка ASR, «редкий»
-    ответ (<1 слова/с) и громкий хвост после последнего слова, плюс петля. Любое
-    сомнение или отказ сокета → обычный каскад по накопленному звуку: потоковая
-    ступень может только ускорить, но не ухудшить диктовку.
-    """
-    text = (stream_text or "").strip()
-    reason = ""
-    if not stream_ok:
-        reason = f"поток: {stream_error or 'оборвался'}"
-    elif not text:
-        reason = "поток: пустой ответ"
-    elif boilerplate_only(text):
-        reason = "поток: только заглушка ASR"
-    elif has_loop(text):
-        reason = "поток: петля повтора"
-    if reason:
-        logger.info("%s — обычный каскад по всей записи", reason)
-        res = recognize(audio, dur, ctx)
-        res.meta["fallbacks"] = [reason] + list(res.meta.get("fallbacks") or [])
-        return res
-
-    if dur > 8.0:
-        n_words = len(text.split())
-        wps = n_words / dur
-        tail_speech, tail_gap = _tail_has_speech(audio, dur, last_word_end, ctx.sample_rate)
-        if wps < 1.0 or tail_speech:
-            why = (f"мало текста ({wps:.2f} слов/с)" if wps < 1.0
-                   else f"после последнего слова ещё {tail_gap:.1f}с речи")
-            logger.warning("поток: %s — сверяю с обычным каскадом", why)
-            res = recognize(audio, dur, ctx)
-            if res.text and len(res.text.split()) > n_words and not has_loop(res.text):
-                res.meta["fallbacks"] = [f"поток: {why} → каскад"] + list(res.meta.get("fallbacks") or [])
-                return res
-
-    text, n_fix = fix_known_terms(text)
-    return RecognitionResult(text=text, engine="deepgram_stream", assembled_text=text,
-                             lost_marks=[], chunk_quality=["deepgram"], degenerate=[],
-                             terms_fixed=n_fix, meta={"fallbacks": []})
-
-
 def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
               deepgram_upload: tuple[bytes, str] | None = None,
               audio_future=None) -> RecognitionResult:
