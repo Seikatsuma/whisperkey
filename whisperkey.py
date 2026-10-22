@@ -1979,7 +1979,7 @@ def process_audio(audio_snapshot: list, session_id: int):
         result = None
         live = _take_live_stream(session_id)
         if live is not None:
-            stext = live.result(timeout=max(30.0, dur * 0.2))
+            stext = live.result()   # потолок = read-таймаут моста, как у прежнего пути
             if stext:
                 result = speech_engine.RecognitionResult(
                     text=stext, engine="stream", assembled_text=stext,
@@ -2124,6 +2124,8 @@ def process_audio(audio_snapshot: list, session_id: int):
         notify("WhisperKey — сбой", f"{type(e).__name__}. Текст не вставлен.")
         pill_error = True
     finally:
+        # Нештатный выход до чтения потока — не оставлять его висеть.
+        _take_live_stream(session_id, abort=True)
         processing = False
         with state_lock:
             if active_session_id == session_id:
