@@ -314,6 +314,13 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
                     logger.info("deepgram: только заглушка ASR — ухожу на следующую ступень")
                     fallbacks.append("deepgram: заглушка ASR")
                     full_raw_text = assembled_text = ""
+                    # Текст обнулился ПОСЛЕ точки декода выше — без звука
+                    # remote/yandex молча пропустятся (audio=None).
+                    _resolve_audio()
+                elif dur is None and deepgram_upload is not None:
+                    # ffprobe не дал длительности — проверку «редкого ответа»
+                    # делать нечем; отмечаем, иначе деградация невидима.
+                    fallbacks.append("deepgram: dur неизвестна — проверка редкого ответа пропущена")
                 elif dur is not None and dur > 8.0:
                     # Deepgram изредка отдаёт «редкий» ответ: целые куски речи
                     # выпадают, остаток сглажен (живой случай 20.10.26: 18 слов
@@ -345,6 +352,9 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
                                   f"после последнего слова ещё {tail_gap:.1f}с речи")
                         logger.warning("deepgram: %s за %.1fс — переспрашиваю", reason, dur)
                         deepgram_reasked = True
+                        # Повтор идёт по декодированному звуку: на пути upload
+                        # его ещё могли не ждать (сработал только wps-триггер).
+                        _resolve_audio()
                         retry = transcribe_deepgram(
                             audio, api_key=ctx.deepgram_api_key, profile=p,
                             sample_rate=ctx.sample_rate, state=ctx.deepgram_state,
