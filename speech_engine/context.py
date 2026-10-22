@@ -32,6 +32,9 @@ class Context:
     remote_asr_url: str = ""     # мост на серверный каскад (http_bridge), пусто = ступени нет
     remote_asr_token: str = ""   # X-Bridge-Token, если мост выставлен наружу
     remote_last_error: str = ""  # причина последнего отказа моста — для [engine fallback]
+    remote_reviver: object = None  # callable()->bool: переподнять мост СРАЗУ после обрыва
+                                   # (ставит клиент, напр. сторож туннеля WhisperKey на Mac).
+                                   # На сервере мост локальный — reviver не нужен.
     yandex_api_key: str = ""     # резервная облачная ступень без VPN (Yandex SpeechKit)
     yandex_folder_id: str = ""   # folderId — нужен только для IAM-аккаунтов, не для Api-Key
     yandex_last_error: str = ""

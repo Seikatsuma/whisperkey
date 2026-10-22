@@ -2399,8 +2399,18 @@ def _kill_stale_tunnel() -> None:
     except Exception:
         pass
 
+_tunnel_lock = threading.Lock()
+
+
 def _spawn_tunnel() -> bool:
-    """Поднимает ssh-туннель и ждёт /health. True — мост доступен."""
+    """Поднимает ssh-туннель и ждёт /health. True — мост доступен.
+    Под lock: одновременный вызов из сторожа и из _revive_bridge (упавший
+    запрос посреди диктовки) не должен плодить два ssh-процесса."""
+    with _tunnel_lock:
+        return _spawn_tunnel_locked()
+
+
+def _spawn_tunnel_locked() -> bool:
     _kill_stale_tunnel()
     try:
         p = subprocess.Popen(
@@ -2422,6 +2432,36 @@ def _spawn_tunnel() -> bool:
         time.sleep(0.7)
         if _bridge_alive():
             return True
+    return False
+
+# При реальном длительном обрыве сети reviver не должен плодить ssh на каждую
+# диктовку: после неудачного подъёма отдыхаем BRIDGE_REVIVE_REST_SEC — туннелем
+# в это время занимается сторож.
+BRIDGE_REVIVE_REST_SEC = 15
+_last_revive_fail = [0.0]
+
+def _revive_bridge() -> bool:
+    """Переподнимает туннель СРАЗУ, не дожидаясь тика сторожа (30с).
+    Вызывается каскадом (ctx.remote_reviver), когда remote-запрос упал посреди
+    диктовки или адрес снят: обрыв домашнего интернета без этого отправлял
+    запись в локальную модель на ~50с (живой журнал 22.10.26), хотя туннель
+    восстанавливался за секунды."""
+    if _bridge_alive():
+        if not _engine.ctx.remote_asr_url:
+            _engine.ctx.remote_asr_url = BRIDGE_ASR_URL
+        return True
+    if time.time() - _last_revive_fail[0] < BRIDGE_REVIVE_REST_SEC:
+        return False
+    print("[bridge] запрос упал в обрыв — поднимаю туннель сразу")
+    if _spawn_tunnel():
+        _engine.ctx.remote_asr_url = BRIDGE_ASR_URL
+        try:
+            http_session.close()   # в пуле лежит мёртвый сокет старого туннеля
+        except Exception:
+            pass
+        print("[bridge] туннель поднят — повторяю запрос")
+        return True
+    _last_revive_fail[0] = time.time()
     return False
 
 def _bridge_watchdog() -> None:
@@ -2606,6 +2646,7 @@ def main():
     # Проба доступности облачных ступеней + сторож туннеля моста (см. выше).
     threading.Thread(target=_probe_asr_paths, daemon=True).start()
     if _IS_MAC and not os.environ.get("WHISPERKEY_NO_TUNNEL"):
+        _engine.ctx.remote_reviver = _revive_bridge
         threading.Thread(target=_bridge_watchdog, daemon=True).start()
 
     if _engine.ctx.engine_mode != "auto":

@@ -212,6 +212,12 @@ def recognize(audio: np.ndarray, dur: float, ctx: Context) -> RecognitionResult:
     remote_tried = False
     deepgram_reasked = False
 
+    def _remote_available() -> bool:
+        # Мост считается живой ступенью, когда есть адрес ИЛИ клиент дал
+        # reviver (сторож туннеля на Mac): тогда remote-ступень может поднять
+        # туннель сама, даже если адрес снят после последней упавшей пробы.
+        return bool(ctx.remote_asr_url) or getattr(ctx, "remote_reviver", None) is not None
+
     def _try_remote() -> None:
         nonlocal full_raw_text, engine, assembled_text, lost_marks, chunk_quality, degenerate
         remote_tried_inner = transcribe_remote(audio, dur, ctx)
@@ -233,7 +239,7 @@ def recognize(audio: np.ndarray, dur: float, ctx: Context) -> RecognitionResult:
     else:
         # Режим "remote": мост первым — для сети без VPN, где обе облачные
         # ступени заведомо мертвы и каждая попытка стоит таймаут.
-        if mode == "remote" and ctx.remote_asr_url:
+        if mode == "remote" and _remote_available():
             remote_tried = True
             _try_remote()
 
@@ -300,7 +306,7 @@ def recognize(audio: np.ndarray, dur: float, ctx: Context) -> RecognitionResult:
             # Ранний вызов моста: Groq заведомо недоступен (ключа нет или свежий
             # блок — на Mac'е у Егора гео-блок 403 навсегда) → не жечь минуты на
             # локальной модели, спросить каскад на сервере.
-            if ctx.remote_asr_url and not remote_tried and \
+            if _remote_available() and not remote_tried and \
                     (not ctx.groq_api_key or ctx.cloud_state.is_blocked):
                 remote_tried = True
                 _try_remote()
@@ -330,7 +336,7 @@ def recognize(audio: np.ndarray, dur: float, ctx: Context) -> RecognitionResult:
 
             # Спасательные ступени: каскад кончился пустотой или целиком
             # локальной моделью → мост (там Deepgram и Groq живы), затем Yandex.
-            if ctx.remote_asr_url and not remote_tried and (not full_raw_text or engine == "local"):
+            if _remote_available() and not remote_tried and (not full_raw_text or engine == "local"):
                 remote_tried = True
                 _try_remote()
             if ctx.yandex_api_key and (not full_raw_text or engine == "local"):

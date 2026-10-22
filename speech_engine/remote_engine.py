@@ -36,11 +36,25 @@ REMOTE_TIMEOUT = (5.0, 120.0)   # connect, read: каскад на длинно�
 
 def transcribe_remote(audio: np.ndarray, dur: float, ctx: Context) -> str:
     """Один запрос к мосту на ВСЮ запись (он сам дробит, если надо).
-    Любой отказ → "", ступень просто пропускается — без ретраев, дальше и так
-    есть локальная модель."""
+    Любой отказ → "", ступень просто пропускается, дальше и так есть локальная
+    модель. Единственный повтор — после исключения соединения, когда клиентский
+    `remote_reviver` (сторож туннеля на Mac) уже успел поднять мост обратно."""
     url = ctx.remote_asr_url
     if not url:
-        return ""
+        # Сторож уже мог снять адрес после упавшей пробы, а туннель к моменту
+        # записи восстановиться. Если клиент дал reviver — спрашиваем мост прямо
+        # сейчас, не дожидаясь следующего тика сторожа.
+        reviver = getattr(ctx, "remote_reviver", None)
+        if reviver is None:
+            return ""
+        try:
+            if not reviver():
+                return ""
+        except Exception:
+            return ""
+        url = ctx.remote_asr_url
+        if not url:
+            return ""
     upload = create_upload_audio(audio, ctx.sample_rate, tempo=1.0)
     if not upload:
         return ""
@@ -48,21 +62,54 @@ def transcribe_remote(audio: np.ndarray, dur: float, ctx: Context) -> str:
     headers = {}
     if ctx.remote_asr_token:
         headers["X-Bridge-Token"] = ctx.remote_asr_token
-    files = {"file": (name, io.BytesIO(payload), mime)}
-    try:
-        r = ctx.session.post(url, files=files, headers=headers, timeout=REMOTE_TIMEOUT)
+
+    def _post() -> str:
+        files = {"file": (name, io.BytesIO(payload), mime)}
+        r = ctx.session.post(ctx.remote_asr_url, files=files, headers=headers,
+                             timeout=REMOTE_TIMEOUT)
         if r.status_code != 200:
             ctx.remote_last_error = f"статус {r.status_code}"
-            logger.warning("remote: статус %s, отказ", r.status_code)
             return ""
         text = (r.json().get("text") or "").strip()
+        ctx.remote_last_error = "" if text else "пустой ответ"
+        return text
+
+    try:
+        text = _post()
         if not text:
-            ctx.remote_last_error = "пустой ответ"
-            logger.info("remote: пустой ответ")
-        else:
-            ctx.remote_last_error = ""
+            logger.warning("remote: %s, отказ", ctx.remote_last_error)
         return text
     except Exception as e:
         ctx.remote_last_error = f"исключение {type(e).__name__}"
         logger.warning("remote: исключение %s", type(e).__name__)
+
+    # Туннель мог умереть посреди запроса: сторож переподнимает его за секунды,
+    # но без повтора запись уезжала в локальную модель на ~50с (живой журнал
+    # 22.10.26: обрыв домашнего интернета на Mac → 3 записи подряд по 48-61с
+    # через local, хотя туннель каждый раз поднимался обратно). Даём
+    # поднявшемуся мосту ОДИН повтор — дёшево против цены локальной модели.
+    reviver = getattr(ctx, "remote_reviver", None)
+    if reviver is None:
+        return ""
+    try:
+        revived = bool(reviver())
+    except Exception:
+        revived = False
+    if not revived or not ctx.remote_asr_url:
+        return ""
+    try:
+        ctx.session.close()   # в пуле лежит мёртвый сокет старого туннеля
+    except Exception:
+        pass
+    try:
+        text = _post()
+        if text:
+            logger.warning("remote: повтор после поднятия туннеля — успех")
+        else:
+            logger.warning("remote: повтор после поднятия туннеля — %s",
+                           ctx.remote_last_error)
+        return text
+    except Exception as e:
+        ctx.remote_last_error = f"исключение {type(e).__name__}"
+        logger.warning("remote: повтор после поднятия туннеля — %s", type(e).__name__)
         return ""
