@@ -90,6 +90,17 @@ def _dist1(a: str, b: str) -> bool:
     return any(long[:i] + long[i + 1:] == short for i in range(len(long)))
 
 
+def _similar(a: str, b: str) -> bool:
+    """Похоже на известный термин сильнее опечатки: dist1 + ratio≥0.75
+    при len≥5 (cloudui→claudeui — 2 символа, dist1 не ловит)."""
+    if _dist1(a, b):
+        return True
+    if min(len(a), len(b)) < 5:
+        return False
+    import difflib
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.75
+
+
 def groq_key() -> str:
     key = os.environ.get("GROQ_API_KEY", "")
     if key:
@@ -249,7 +260,7 @@ def main() -> int:
 
         if not (n_missed >= args.min_count or n_seen >= args.min_count + 1):
             continue
-        if key_n in base_terms or any(_dist1(key_n, b) for b in base_terms):
+        if key_n in base_terms or any(_similar(key_n, b) for b in base_terms):
             continue  # уже в словаре или искажённый вариант его термина
         if key_n in canon:
             form = canon[key_n]
@@ -259,8 +270,8 @@ def main() -> int:
             entry["reason"] = "разбросанное написание — нет доминирующей формы"
             candidates.append(entry)
             continue
-        elif any(_dist1(key_n, c) for c in canon) or any(_dist1(key_n, r) for r in ref):
-            entry["reason"] = "вариант в ±1 символ от реального термина — искажение, не слово"
+        elif any(_similar(key_n, c) for c in canon) or any(_similar(key_n, r) for r in ref):
+            entry["reason"] = "похоже на реальный термин — искажение, не слово"
             candidates.append(entry)
             continue
         else:
@@ -278,11 +289,20 @@ def main() -> int:
     # реальной базы с частотой ≥5 идут в keyterm сами — Deepgram их тогда
     # не теряет вовсе. Канон и базовый словарь уже учтены выше/в запросе.
     for key_n, r in ref.items():
-        if r.get("count", 0) < 5 or len(key_n) < 4:
+        # Только термины, которые Егор реально пишет с заглавной (брендовое
+        # написание: Google, Playwright, amoCRM — cap_share≥0.6 по всем его
+        # формам). Капитализированные англ. слова (Adding, Requesting — в его
+        # текстах есть и строчные формы как обычные слова) и идентификаторы
+        # с _ отсекаются — в keyterm общий английский может перетянуть
+        # русское слово в английское.
+        form = r["form"]
+        if r.get("user_count", 0) < 5 or len(key_n) < 4 or "_" in form:
+            continue
+        if r.get("cap_share", 0) < 0.6 or not any(ch.isupper() for ch in form):
             continue
         if key_n in base_terms or key_n in canon or key_n in {_norm(t) for t in learned_forms}:
             continue
-        learned_forms.append(r["form"])
+        learned_forms.append(form)
 
     score = {k: len(missed_docs.get(k, ())) + len(seen_docs.get(k, ()))
              for k in forms}

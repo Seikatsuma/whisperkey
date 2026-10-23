@@ -88,6 +88,24 @@ def _dist1(a: str, b: str) -> bool:
     return any(long[:i] + long[i + 1:] == short for i in range(len(long)))
 
 
+def _similar(a: str, b: str) -> bool:
+    """Слишком похоже на известный термин → искажение, не новое слово.
+    dist1 ловит ±1 символ (amacrm→amocrm); для 2-символьных искажений
+    (cloudui→claudeui, codeui→claudeui) — порог похожести 0.75 при len≥5."""
+    if _dist1(a, b):
+        return True
+    if min(len(a), len(b)) < 5:
+        return False
+    import difflib
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.75
+
+
+FILE_LIKE = re.compile(
+    r"\.(?:py|sh|js|ts|tsx|php|db|md|mdx|json|txt|log|env|service|yml|yaml|"
+    r"lock|pem|pub|html|css|gz|zip|session|sqlite)\b|^[0-9a-f-]{8,}$|\d{4,}",
+    re.IGNORECASE)
+
+
 def latin_terms(text: str) -> list[str]:
     out = []
     for m in LATIN_RE.finditer(text):
@@ -99,19 +117,27 @@ def latin_terms(text: str) -> list[str]:
 
 
 def collect_texts() -> tuple[list[str], list[str]]:
-    """(тексты пользователя, курируемые документы)."""
+    """(продиктованные тексты Егора, документы для голосования за написание).
+
+    Частота «использует» считается ТОЛЬКО по voice_transcripts — это тексты
+    его диктовок, ровно тот домен, что слышит ASR. Тела чатов (chat_docs)
+    содержат ответы ассистента (англ. статусы, SQL, код) и идут только в
+    счётчик форм для правильного написания — не в частоту."""
     user_texts: list[str] = []
-    for db, query in (
-        (AUTH_DB, "select text from voice_transcripts where text is not null"),
-        (SEARCH_DB, "select body from chat_docs"),
-    ):
-        try:
-            c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-            user_texts += [r[0] for r in c.execute(query) if r[0]]
-            c.close()
-        except sqlite3.Error as e:
-            print(f"  ! {db}: {e}", file=sys.stderr)
     docs: list[str] = []
+    try:
+        c = sqlite3.connect(f"file:{AUTH_DB}?mode=ro", uri=True)
+        user_texts = [r[0] for r in c.execute(
+            "select text from voice_transcripts where text is not null") if r[0]]
+        c.close()
+    except sqlite3.Error as e:
+        print(f"  ! {AUTH_DB}: {e}", file=sys.stderr)
+    try:
+        c = sqlite3.connect(f"file:{SEARCH_DB}?mode=ro", uri=True)
+        docs += [r[0] for r in c.execute("select body from chat_docs") if r[0]]
+        c.close()
+    except sqlite3.Error as e:
+        print(f"  ! {SEARCH_DB}: {e}", file=sys.stderr)
     import glob as _g
     paths = set(CURATED_DOCS)
     for pat in CURATED_GLOBS:
@@ -126,13 +152,12 @@ def collect_texts() -> tuple[list[str], list[str]]:
 
 def main() -> int:
     sys.path.insert(0, str(REPO))
-    base_terms: set[str] = set()
-    canon: dict[str, str] = {}
+    targets: dict[str, str] = {}   # норм → каноническая поверхностная форма
     try:
         from speech_engine.profiles import DICTATION
         from speech_engine.terms import TERM_CANON
-        base_terms = {_norm(t) for t in DICTATION.deepgram_params.get("keyterm", [])}
-        canon = {_norm(k): v for k, v in TERM_CANON.items()}
+        targets = {_norm(t): t for t in DICTATION.deepgram_params.get("keyterm", [])}
+        targets.update({_norm(k): v for k, v in TERM_CANON.items()})
     except Exception as e:
         print(f"  ! canon/base не поднялись: {e}", file=sys.stderr)
 
@@ -151,7 +176,6 @@ def main() -> int:
 
     ref: dict[str, dict] = {}
     fixes: dict[str, dict] = {}
-    canon_norms = set(canon) | base_terms
 
     for key_n in set(forms) | set(curated):
         total = sum(forms.get(key_n, {}).values())
@@ -166,23 +190,32 @@ def main() -> int:
         else:
             continue
 
-        if key_n in canon:
-            form = canon[key_n]
+        if key_n in targets:
+            form = targets[key_n]
         else:
             # Наблюдаемое искажение известного термина → авто-правка, не термин.
-            hit = next((c for c in canon_norms if _dist1(key_n, c)), None)
-            if hit and hit in canon:
+            # Отбраковка — по fuzzy-сходству (ловит cloudui к claudeui), но
+            # авто-правка генерируется ТОЛЬКО для ±1 символа: fuzzy ловит и
+            # составные имена (yougilepy = файл, redesign = слово, designsync =
+            # продукт), переписывать их в тексте нельзя. Многосимвольные
+            # искажения правятся курируемыми TERM_FIX — там человек подтвердил.
+            hit = next((c for c in targets if _similar(key_n, c)), None)
+            if hit:
                 cnt = total + sum(cc.values())
-                if MIN_FIX_COUNT <= cnt <= MAX_FIX_COUNT \
+                if _dist1(key_n, hit) and MIN_FIX_COUNT <= cnt <= MAX_FIX_COUNT \
                         and len(key_n) >= 5 and key_n not in FIX_DENY:
-                    fixes[key_n] = {"fix": canon[hit], "count": cnt}
+                    fixes[key_n] = {"fix": targets[hit], "count": cnt}
                 continue
-            elif hit:
-                continue  # вариант базового термина — не новое слово
 
+        if FILE_LIKE.search(form):
+            continue  # имя файла/UUID/идентификатор — не термин речи
+        all_f = fc + cc
+        cap = sum(v for f, v in all_f.items() if f[:1].isupper())
         ref[key_n] = {
             "form": form,
             "count": total + sum(cc.values()),
+            "user_count": total,
+            "cap_share": round(cap / sum(all_f.values()), 2),
             "sources": (["docs"] if cc else []) + (["user"] if total else []),
         }
 

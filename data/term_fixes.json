@@ -1,0 +1,37 @@
+{
+  "updated": "2026-10-23 12:29:50",
+  "fixes": {
+    "yougil": {
+      "fix": "YouGile",
+      "count": 2
+    },
+    "delvin": {
+      "fix": "Devin",
+      "count": 3
+    },
+    "clause": {
+      "fix": "Claude",
+      "count": 2
+    },
+    "amacrm": {
+      "fix": "amoCRM",
+      "count": 12
+    },
+    "fcode": {
+      "fix": "Code",
+      "count": 3
+    },
+    "codes": {
+      "fix": "Code",
+      "count": 2
+    },
+    "ideogram4": {
+      "fix": "Ideogram",
+      "count": 2
+    },
+    "claudeai": {
+      "fix": "Claude UI",
+      "count": 52
+    }
+  }
+}
