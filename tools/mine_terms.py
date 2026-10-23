@@ -222,6 +222,18 @@ def main() -> int:
     except Exception:
         pass
 
+    # Эталонная база реальных терминов (Егор 23.10: «намного эффективнее
+    # сравнивать с реальной базой и реальными названиями», а не с мнением
+    # второго ASR). Собирается tools/build_reference.py из его текстов и
+    # курируемых документов. Кандидат принимается ТОЛЬКО если его форма
+    # подтверждена базой/каноном — Groq остаётся лишь детектором пропусков.
+    ref_path = REPO / "data" / "reference_terms.json"
+    ref: dict[str, dict] = {}
+    try:
+        ref = json.loads(ref_path.read_text(encoding="utf-8")).get("terms", {})
+    except (OSError, json.JSONDecodeError):
+        print(f"  ! нет {ref_path} — решение только по канону", file=sys.stderr)
+
     learned_forms: list[str] = []
     candidates: list[dict] = []
 
@@ -241,12 +253,18 @@ def main() -> int:
             continue  # уже в словаре или искажённый вариант его термина
         if key_n in canon:
             form = canon[key_n]
+        elif key_n in ref:
+            form = ref[key_n]["form"]  # реальное написание из базы Егора
         elif share < 0.6:
             entry["reason"] = "разбросанное написание — нет доминирующей формы"
             candidates.append(entry)
             continue
-        elif any(_dist1(key_n, c) for c in canon):
-            entry["reason"] = "вариант в ±1 символ от канонического термина"
+        elif any(_dist1(key_n, c) for c in canon) or any(_dist1(key_n, r) for r in ref):
+            entry["reason"] = "вариант в ±1 символ от реального термина — искажение, не слово"
+            candidates.append(entry)
+            continue
+        else:
+            entry["reason"] = "нет подтверждения в реальной базе терминов"
             candidates.append(entry)
             continue
         if n_missed and n_abs >= n_missed:
@@ -254,6 +272,17 @@ def main() -> int:
             candidates.append(entry)
             continue
         learned_forms.append(form)
+
+    # Проактивная подгрузка (Егор 23.10: «все названия, которые я часто
+    # использую, пусть постоянно подгружаются из общей базы»): термины из
+    # реальной базы с частотой ≥5 идут в keyterm сами — Deepgram их тогда
+    # не теряет вовсе. Канон и базовый словарь уже учтены выше/в запросе.
+    for key_n, r in ref.items():
+        if r.get("count", 0) < 5 or len(key_n) < 4:
+            continue
+        if key_n in base_terms or key_n in canon or key_n in {_norm(t) for t in learned_forms}:
+            continue
+        learned_forms.append(r["form"])
 
     score = {k: len(missed_docs.get(k, ())) + len(seen_docs.get(k, ()))
              for k in forms}

@@ -40,10 +40,12 @@ TERM_FIX = [
     (r"\bвиспер\b", "WhisperKey"),
     (r"\bwhisperer[-\s]?k(?:ey)?\b", "WhisperKey"),
     (r"\b(?:jiminy|джимм?и|джемини|гемини)\b", "Gemini"),
-    # «клод юай» → модель слышит CloudUI/code UI; однословная форма однозначна
-    # (архив 20-22.10.26: «CloudUI» в 5+ диктовках). «code UI» раздельно не
-    # трогаем — может быть дословным «код UI».
+    # «клод юай» → модель слышит CloudUI/code UI (архив 20-23.10: обе формы
+    # в диктовках Егора). Латинское «code UI» правим — в его контуре это всегда
+    # продукт; кириллическое «код UI» остаётся дословным.
     (r"\bcloudui\b", "Claude UI"),
+    (r"\bcode\s*ui\b", "Claude UI"),  # латинское слышание «Claude UI» (архив 22-23.10);
+                                    # кириллическое «код UI» не трогаем — может быть дословным
     (r"\bкл[оа]уд\w*\b", "Claude"),
     (r"\bклод\b", "Claude"),
     (r"\bklot\b", "Claude"),
@@ -87,6 +89,30 @@ TERM_FIX = [
 ]
 
 _TERM_FIX_RX: list = []   # компилируется при первом вызове
+_LEARNED_FIX = {"mtime": 0.0, "rx": []}  # data/term_fixes.json, кэш по mtime
+
+
+def _learned_fixes():
+    """Авто-правки наблюдаемых искажений из tools/build_reference.py —
+    cloudui→Claude UI, amacrm→amoCRM. Файл обновляется ночным сборщиком;
+    читаем по mtime, без перезапуска. Правится только целое слово ≥5 симв."""
+    import json as _json
+    from pathlib import Path as _P
+    path = _P(__file__).resolve().parent.parent / "data" / "term_fixes.json"
+    try:
+        mt = path.stat().st_mtime
+    except OSError:
+        return _LEARNED_FIX["rx"]
+    if mt != _LEARNED_FIX["mtime"]:
+        rx = []
+        try:
+            for k, v in _json.loads(path.read_text(encoding="utf-8"))["fixes"].items():
+                if len(k) >= 5:
+                    rx.append((re.compile(r"\b" + re.escape(k) + r"\b", re.IGNORECASE), v["fix"]))
+        except (OSError, _json.JSONDecodeError, KeyError):
+            pass
+        _LEARNED_FIX.update(mtime=mt, rx=rx)
+    return _LEARNED_FIX["rx"]
 
 
 def _transfer_norm(w: str) -> str:
@@ -100,7 +126,7 @@ def fix_known_terms(text: str) -> tuple[str, int]:
     if not _TERM_FIX_RX:
         _TERM_FIX_RX.extend((re.compile(p, re.IGNORECASE), r) for p, r in TERM_FIX)
     n = 0
-    for rx, rep in _TERM_FIX_RX:
+    for rx, rep in _TERM_FIX_RX + _learned_fixes():
         text, k = rx.subn(rep, text)
         n += k
     return text, n
