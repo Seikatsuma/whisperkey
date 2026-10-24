@@ -296,9 +296,9 @@ def main() -> int:
         # с _ отсекаются — в keyterm общий английский может перетянуть
         # русское слово в английское.
         form = r["form"]
-        if r.get("user_count", 0) < 5 or len(key_n) < 4 or "_" in form:
+        if r.get("user_count", 0) < 3 or len(key_n) < 4 or "_" in form:
             continue
-        if r.get("cap_share", 0) < 0.6 or not any(ch.isupper() for ch in form):
+        if r.get("cap_share", 0) < 0.5 or not any(ch.isupper() for ch in form):
             continue
         if key_n in base_terms or key_n in canon or key_n in {_norm(t) for t in learned_forms}:
             continue
