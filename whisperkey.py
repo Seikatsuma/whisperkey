@@ -1435,6 +1435,27 @@ def _is_browser(app: str) -> bool:
     a = (app or "").lower()
     return any(b in a for b in _JS_BROWSERS)
 
+# Терминалы: фокусный элемент — экран вывода, не поле ввода. AX-запись в него
+# отчитывается успехом, но текст уходит в никуда; а синтетические клавиши при
+# Secure Keyboard Entry (залипает после sudo/ssh-паролей) macOS роняет молча.
+# Рабочий транспорт для них один — пункт меню «Вставить» (не клавиша).
+_TERMINALS = ("terminal", "iterm", "warp", "alacritty", "kitty", "wezterm",
+              "hyper", "tabby", "rio")
+
+def _is_terminal(app: str) -> bool:
+    a = (app or "").lower()
+    return any(t in a for t in _TERMINALS)
+
+def _secure_input_active() -> bool:
+    """Secure Keyboard Entry активен → синтетические клавиши теряются молча."""
+    if _Quartz is None or not _IS_MAC:
+        return False
+    try:
+        d = _Quartz.CGSessionCopyCurrentDictionary()
+        return bool(d and d.get("kCGSSessionSecureInputPID"))
+    except Exception:
+        return False
+
 _JS_INSERT_TEMPLATE = '''(function(){var t=decodeURIComponent(escape(window.atob("__B64__")));var el=document.activeElement;if(!el||el===document.body)return "NOFOCUS";var ce=el.isContentEditable===true;var fld=(el.tagName==="INPUT"||el.tagName==="TEXTAREA")&&typeof el.value==="string";if(!ce&&!fld)return "NOEL";var ok=false;try{ok=document.execCommand("insertText",false,t);}catch(e){}if(!ok&&typeof el.setRangeText==="function"){try{var s=el.selectionStart==null?0:el.selectionStart;var d=el.selectionEnd==null?s:el.selectionEnd;el.setRangeText(t,s,d,"end");el.dispatchEvent(new Event("input",{bubbles:true}));ok=true;}catch(e){}}var a=ce?(el.textContent||""):(el.value||"");var tail=t.replace(/\\s+$/,"").slice(-24);var seen=tail&&a.indexOf(tail)>=0;if(!ok)return seen?"OKVER":"FAIL";return seen?"OKVER":"OK";})()'''
 
 def _js_insert(app: str, text: str) -> tuple:
