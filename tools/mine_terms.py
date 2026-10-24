@@ -160,7 +160,7 @@ def main() -> int:
                     help="сколько свежих записей прогнать")
     ap.add_argument("--min-count", type=int, default=2,
                     help="термин попадает в словарь от стольких диктовок")
-    ap.add_argument("--max-terms", type=int, default=60,
+    ap.add_argument("--max-terms", type=int, default=46,
                     help="потолок выученного словаря (бюджет keyterm 500)")
     ap.add_argument("--out", default=str(OUT_PATH))
     args = ap.parse_args()
@@ -306,8 +306,14 @@ def main() -> int:
 
     score = {k: len(missed_docs.get(k, ())) + len(seen_docs.get(k, ()))
              for k in forms}
+    # Вытеснение редких (Егор 24.10): список ограничен (~80 терминов суммарно
+    # с базовым — дальше растёт риск force-match), поэтому при переполнении
+    # самые редко используемые им термины уступают место более активным.
+    # Мера «используемости» — user_count из реальной базы, при равенстве —
+    # наблюдения минера.
     learned = sorted(set(learned_forms),
-                     key=lambda t: -score.get(_norm(t), 0))[:args.max_terms]
+                     key=lambda t: (-ref.get(_norm(t), {}).get("user_count", 0),
+                                    -score.get(_norm(t), 0)))[:args.max_terms]
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

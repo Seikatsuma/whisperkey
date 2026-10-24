@@ -57,8 +57,20 @@ def _merged_params(profile: Profile) -> dict:
     base = params.get("keyterm")
     if not isinstance(base, list):
         return params
-    extra = [t for t in _learned_keyterms()
-             if t.lower() not in {b.lower() for b in base}]
+    # Страховка от жёсткого лимита Deepgram: суммарно ≤500 токенов на все
+    # keyterm, при превышении запрос падает с ошибкой, а не обрезается.
+    # Держим бюджет ~400 и обрезаем хвост выученных — лишние просто не
+    # подсказываются, диктовка не ломается.
+    budget = 400 - sum(len(b) // 4 + 2 for b in base)
+    extra = []
+    for t in _learned_keyterms():
+        if t.lower() in {b.lower() for b in base}:
+            continue
+        cost = len(t) // 4 + 2
+        if cost > budget:
+            break
+        budget -= cost
+        extra.append(t)
     if not extra:
         return params
     merged = dict(params)
