@@ -1663,6 +1663,14 @@ def direct_insert(text: str) -> float:
             if _insert_verified(text, None, val):
                 verdict = True
                 print("[insert] прямая запись в поле (AX) — проверено")
+            elif _is_terminal(app):
+                # Терминал: «запись» прошла в экран вывода, не в поле ввода —
+                # текст ушёл в никуда. Это отказ транспорта, не «поле
+                # изменилось»: идём дальше по лестнице к меню «Вставить»
+                # (жалоба Егора 24.10: «в терминале не вставляется»).
+                sent, via = False, ""
+                reason = "AX-запись прошла в экран терминала — не в поле ввода"
+                print(f"[insert] {reason} — меню «Вставить»")
             else:
                 print("[insert] прямая запись в поле (AX) отправлена; "
                       "поле уже изменилось — без повторной вставки")
@@ -1712,7 +1720,22 @@ def direct_insert(text: str) -> float:
                         reason = "буфер не записался"
                     else:
                         clipboard_touched = True
-                        if _send_paste_keystroke(app):
+                        if (_is_terminal(app) or _secure_input_active()):
+                            # Терминал и Secure Keyboard Entry: синтетические
+                            # клавиши теряются молча — идём сразу в меню
+                            # «Вставить», это не клавиша и не блокируется.
+                            ok_m, m_err = _send_paste_via_menu(app)
+                            if ok_m:
+                                sent, via = True, "menu"
+                                verdict = _poll_insert(text, before)
+                                if verdict is True:
+                                    print("[insert] меню «Вставить» — проверено")
+                                else:
+                                    verdict = None
+                            else:
+                                reason = f"меню «Вставить» не сработало: {m_err}"
+                                print(f"[insert] {reason}")
+                        elif _send_paste_keystroke(app):
                             sent, via = True, "paste"
                             verdict = _poll_insert(text, before)
                             if verdict is True:
