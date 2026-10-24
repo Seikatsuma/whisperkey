@@ -110,6 +110,7 @@ DICTATION = Profile(
             "Termius", "Ideogram", "Sonnet", "Opus", "Haiku", "Camoufox",
             "Patchright", "Brave", "TextEdit", "SaluteSpeech", "Телемост",
             "Ozon", "Wildberries", "Яндекс Маркет", "NotebookLM", "SEO",
+            "Domate",
             "amoCRM",
         ],
     },
