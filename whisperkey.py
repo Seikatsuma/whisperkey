@@ -1575,6 +1575,12 @@ end run'''
 def _send_paste_via_menu(target_app: str) -> tuple[bool, str]:
     if not target_app or not _IS_MAC:
         return False, "нет целевого приложения"
+    # Сначала прямой AXPress через Accessibility (не зависит от имени процесса
+    # и от права «управлять System Events» — osascript-путь мог молча не найти
+    # процесс по имени и уронить всю вставку в терминал).
+    pid = _pid_of_app(target_app)
+    if pid and _menu_paste_press(pid):
+        return True, ""
     try:
         r = subprocess.run(["/usr/bin/osascript", "-e", _AX_MENU_PASTE_SCRIPT,
                             target_app], capture_output=True, timeout=3, text=True)
@@ -1731,6 +1737,14 @@ def direct_insert(text: str) -> float:
                                 if verdict is True:
                                     print("[insert] меню «Вставить» — проверено")
                                 else:
+                                    verdict = None
+                            elif _send_paste_keystroke(app):
+                                # Меню не нашлось/не кликнулось — всё равно
+                                # бьём клавишей: если Secure Input неактивен,
+                                # это рабочий транспорт.
+                                sent, via = True, "paste"
+                                verdict = _poll_insert(text, before)
+                                if verdict is not True:
                                     verdict = None
                             else:
                                 reason = f"меню «Вставить» не сработало: {m_err}"
