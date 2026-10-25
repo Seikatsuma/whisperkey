@@ -992,6 +992,10 @@ AXPress на ЖИВОМ пункте «Paste/Вставить», AXEnabled=False
 далее `_cgevent_paste` — Cmd+V синтезированным событием Quartz в pid или
 во frontmost); `_clipboard_now`/`_put_clipboard` — NSPasteboard вместо
 pbcopy/pbpaste. Импорты pyobjc под try — нет пакета → старый путь целиком.
+`_send_paste_via_menu` (терминал/Secure Input в читаемой ветке) — сначала
+тот же `_menu_paste_press(pid)` (не зависит от имени процесса и от права
+«управлять System Events»), osascript — запасной; при отказе меню — ещё
+один `_send_paste_keystroke` прежде чем сдаться на посимвольный ввод.
 
 1. `_ax_smart_insert` — быстрый pyobjc-вызов или ОДИН osascript на всё:
    frontmost + фокусный элемент + при надобности выставка
