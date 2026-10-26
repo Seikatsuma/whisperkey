@@ -298,6 +298,14 @@ def main() -> int:
         form = r["form"]
         if r.get("user_count", 0) < 3 or len(key_n) < 4 or "_" in form:
             continue
+        # Общие слова, которые nova-3 и так знает нативно, в keyterm вредны:
+        # перекос модели корёжит соседние слова и окончания (жалоба Егора
+        # 26.10 «окончания стали хуже» после набухания списка). keyterm —
+        # только для терминов, с которыми модель реально спотыкается.
+        if key_n in {"google", "apple", "cloud", "nova", "excel", "macbook",
+                     "wifi", "github", "telegram", "zoom", "miro", "brave",
+                     "ipad", "ceo", "seo", "api", "textedit"}:
+            continue
         if r.get("cap_share", 0) < 0.5 or not any(ch.isupper() for ch in form):
             continue
         if key_n in base_terms or key_n in canon or key_n in {_norm(t) for t in learned_forms}:
