@@ -1439,8 +1439,11 @@ def _is_browser(app: str) -> bool:
 # отчитывается успехом, но текст уходит в никуда; а синтетические клавиши при
 # Secure Keyboard Entry (залипает после sudo/ssh-паролей) macOS роняет молча.
 # Рабочий транспорт для них один — пункт меню «Вставить» (не клавиша).
-_TERMINALS = ("terminal", "iterm", "warp", "alacritty", "kitty", "wezterm",
-              "hyper", "tabby", "rio")
+# «терминал» кириллицей обязателен: на русской macOS Terminal.app отдаёт
+# себя локализованным именем, и латинский список его не ловил — ветка
+# «WROTE в экран вывода» не включалась, текст улетал в никуда (27.10.26).
+_TERMINALS = ("terminal", "терминал", "iterm", "warp", "alacritty", "kitty",
+              "wezterm", "hyper", "tabby", "rio")
 
 def _is_terminal(app: str) -> bool:
     a = (app or "").lower()
