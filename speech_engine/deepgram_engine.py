@@ -32,23 +32,36 @@ DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
 # keyterm на каждый запрос — файл обновляется без правки кода и без перезапуска
 # (кэш по mtime). Безопасность: это только подсказки модели, текст не правится.
 _LEARNED_TERMS_PATH = Path(__file__).resolve().parent.parent / "data" / "learned_keyterms.json"
-_learned_terms_cache: dict = {"mtime": 0.0, "terms": []}
+# Живое обучение слиянием (28.10.26): dictation._learn_from_merge пишет термины,
+# которые nova-3 роняла, а вторая модель вернула, — в отдельный файл
+# (learned_keyterms синкается с моста целиком и затирал бы локальное обучение).
+_MERGE_LEARNED_PATH = Path(__file__).resolve().parent.parent / "data" / "merge_learned.json"
+_learned_terms_cache: dict = {"mtime": 0.0, "mtime2": 0.0, "terms": []}
+
+
+def _read_terms(path) -> list[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return []
+    return [t.strip() for t in data.get("terms", [])
+            if isinstance(t, str) and t.strip()]
 
 
 def _learned_keyterms() -> list[str]:
-    try:
-        mtime = _LEARNED_TERMS_PATH.stat().st_mtime
-    except OSError:
-        return []
-    if mtime != _learned_terms_cache["mtime"]:
+    def _mt(p):
         try:
-            data = json.loads(_LEARNED_TERMS_PATH.read_text(encoding="utf-8"))
-            terms = [t.strip() for t in data.get("terms", [])
-                     if isinstance(t, str) and t.strip()]
-            _learned_terms_cache.update(mtime=mtime, terms=terms)
-            logger.info("deepgram: выученных терминов подхвачено: %d", len(terms))
-        except (ValueError, OSError):
-            return _learned_terms_cache["terms"]
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+    m1, m2 = _mt(_LEARNED_TERMS_PATH), _mt(_MERGE_LEARNED_PATH)
+    if (m1, m2) != (_learned_terms_cache["mtime"], _learned_terms_cache["mtime2"]):
+        terms = _read_terms(_LEARNED_TERMS_PATH)
+        for t in _read_terms(_MERGE_LEARNED_PATH):
+            if t.lower() not in {x.lower() for x in terms}:
+                terms.append(t)
+        _learned_terms_cache.update(mtime=m1, mtime2=m2, terms=terms)
+        logger.info("deepgram: выученных терминов подхвачено: %d", len(terms))
     return _learned_terms_cache["terms"]
 
 

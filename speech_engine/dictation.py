@@ -11,9 +11,13 @@
 """
 from __future__ import annotations
 
+import json
 import logging
+import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import numpy as np
 
@@ -214,8 +218,11 @@ def _norm_word(w: str) -> str:
     return w.strip().strip('.,!?;:—-…()[]«»"\'').lower()
 
 
-def _merge_word_streams(dg_words: list, g_words: list) -> list | None:
-    """Возвращает объединённый список слов по времени или None (сливать нечего)."""
+def _merge_word_streams(dg_words: list, g_words: list,
+                        out_inserts: list | None = None) -> list | None:
+    """Возвращает объединённый список слов по времени или None (сливать нечего).
+    out_inserts, если передан, получает вставленные из второй модели слова —
+    для самообучения словаря (см. _learn_from_merge)."""
     if not dg_words:
         return None
     norm = []
@@ -257,10 +264,58 @@ def _merge_word_streams(dg_words: list, g_words: list) -> list | None:
             continue
         kept.append((gw["start"], gw["word"]))
         n_ins += 1
+        if out_inserts is not None:
+            out_inserts.append(gw["word"])
     if not n_ins:
         return None
     kept.sort(key=lambda t: t[0])
     return [w for _, w in kept]
+
+
+# Живое самообучение словаря (28.10.26): слово, которое nova-3 потеряла, а
+# вторая модель услышала и слияние вставило, — точный сигнал «термин вне
+# словаря». Пишем в data/merge_learned.json — ОТДЕЛЬНО от learned_keyterms.json:
+# тот синкается с моста целиком и выученное локально затирался бы.
+# deepgram_engine читает оба файла (кэш по mtime — без перезапуска).
+# Латиница — с первого раза (в русской речи англ. слово = термин почти всегда),
+# кириллица — со второго (страховка от разового шума whisper). Жалоба Егора:
+# «playbook ушёл в пробел, второй раз то же самое» — теперь второй раз слово
+# уже в подсказках.
+_LEARN_PATH = Path(__file__).resolve().parent.parent / "data" / "merge_learned.json"
+_LEARN_LOCK = threading.Lock()
+_LEARN_LATIN = re.compile(r"[A-Za-z]")
+
+
+def _learn_from_merge(inserted: list) -> None:
+    words = [_norm_word(w) for w in inserted]
+    words = [w for w in words
+             if len(w) >= 3 and w.isalpha() and w not in _EDGE_NOISE]
+    if not words:
+        return
+    with _LEARN_LOCK:
+        try:
+            data = json.loads(_LEARN_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {"terms": [], "counts": {}}
+        terms = data.setdefault("terms", [])
+        known = {_norm_word(t) for t in terms}
+        counts = data.setdefault("counts", {})
+        changed = False
+        for w in words:
+            if w in known:
+                continue
+            counts[w] = counts.get(w, 0) + 1
+            need = 1 if _LEARN_LATIN.search(w) else 2
+            if counts[w] >= need:
+                terms.append(w)
+                known.add(w)
+            changed = True
+        if changed:
+            data["updated"] = time.strftime("%Y-%m-%d %H:%M")
+            tmp = _LEARN_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            tmp.replace(_LEARN_PATH)
 
 
 def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
@@ -476,11 +531,17 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
                         logger.warning("bimodel: второй проход не дождался (%s)",
                                        type(e).__name__)
                         g_words = []
-                    merged = _merge_word_streams(ctx.deepgram_state.last_words, g_words)
+                    ins: list = []
+                    merged = _merge_word_streams(ctx.deepgram_state.last_words,
+                                                 g_words, out_inserts=ins)
                     if merged:
                         full_raw_text = assembled_text = " ".join(merged)
                         logger.warning("bimodel: +%d слов от второй модели",
                                        len(merged) - len(ctx.deepgram_state.last_words))
+                        try:
+                            _learn_from_merge(ins)
+                        except Exception:
+                            pass
             else:
                 fallbacks.append(f"deepgram: {ctx.deepgram_state.last_reason or 'нет ответа'}")
                 _check_offline()
