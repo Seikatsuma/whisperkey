@@ -199,6 +199,20 @@ def _recognize_with_groq_cascade(audio: np.ndarray, dur: float, ctx: Context,
 _MERGE_OVERLAP_S = 0.15   # окна, ближе которого слова — «одно и то же место»
 _GROQ_MIN_PROB = 0.4      # ниже — шумовая вставка whisper, пропускаем
 
+# Одиночные краевые галлюцинации whisper: в тишине до/после речи он пишет
+# «Спасибо.», «До свидания.», «(музыка)» — живой пример 28.10.26. Реальное
+# «спасибо» посреди фразы не трогаем: фильтр только для вставок на краях.
+_EDGE_NOISE = {
+    "спасибо", "до свидания", "подписывайтесь", "подпишитесь", "подпишись",
+    "продолжение следует", "спасибо за просмотр", "спасибо за внимание",
+    "подписывайтесь на канал", "музыка", "аплодисменты", "смех", "тишина",
+    "the end", "bye", "thanks", "thank you",
+}
+
+
+def _norm_word(w: str) -> str:
+    return w.strip().strip('.,!?;:—-…()[]«»"\'').lower()
+
 
 def _merge_word_streams(dg_words: list, g_words: list) -> list | None:
     """Возвращает объединённый список слов по времени или None (сливать нечего)."""
@@ -220,9 +234,15 @@ def _merge_word_streams(dg_words: list, g_words: list) -> list | None:
     def overlaps(a, b):
         return a["start"] < b["end"] + _MERGE_OVERLAP_S and                a["end"] > b["start"] - _MERGE_OVERLAP_S
 
+    dg_first = dg_words[0]["start"]
+    dg_last = dg_words[-1]["end"]
     inserts = []
     for gw in norm:
         if any(overlaps(gw, dw) for dw in dg_words):
+            continue
+        # краевая болванка whisper — не слово, а шум в тишине
+        if (gw["start"] < dg_first or gw["start"] >= dg_last) \
+                and _norm_word(gw["word"]) in _EDGE_NOISE:
             continue
         inserts.append(gw)
     if not inserts:
@@ -232,7 +252,7 @@ def _merge_word_streams(dg_words: list, g_words: list) -> list | None:
     kept = [(w["start"], w["word"]) for w in dg_words]
     n_ins = 0
     for gw in inserts:
-        if any(gw["word"].lower() == k[1].strip(".,!?;:—-").lower()
+        if any(_norm_word(gw["word"]) == _norm_word(k[1])
                for k in kept if abs(k[0] - gw["start"]) < 1.5):
             continue
         kept.append((gw["start"], gw["word"]))
