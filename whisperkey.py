@@ -2518,7 +2518,7 @@ def on_release(key):
 BRIDGE_HOST = "claude@45.39.60.20"
 BRIDGE_PID_FILE = "/tmp/whisperkey_tunnel.pid"
 BRIDGE_ASR_URL = "http://127.0.0.1:8092/audio/transcriptions"
-BRIDGE_CHECK_SEC = 30
+BRIDGE_CHECK_SEC = 15
 
 def _bridge_health_url() -> str:
     url = _engine.ctx.remote_asr_url or BRIDGE_ASR_URL
@@ -2564,7 +2564,7 @@ def _spawn_tunnel_locked() -> bool:
             ["ssh", "-N", "-L", "8092:127.0.0.1:8092",
              "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
              "-o", "ExitOnForwardFailure=yes",
-             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2",
+             "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=1",
              BRIDGE_HOST],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
@@ -2588,7 +2588,7 @@ BRIDGE_REVIVE_REST_SEC = 15
 _last_revive_fail = [0.0]
 
 def _revive_bridge() -> bool:
-    """Переподнимает туннель СРАЗУ, не дожидаясь тика сторожа (30с).
+    """Переподнимает туннель СРАЗУ, не дожидаясь тика сторожа (15с).
     Вызывается каскадом (ctx.remote_reviver), когда remote-запрос упал посреди
     диктовки или адрес снят: обрыв домашнего интернета без этого отправлял
     запись в локальную модель на ~50с (живой журнал 22.10.26), хотя туннель

@@ -167,7 +167,7 @@ if [ -z "${WHISPERKEY_NO_TUNNEL:-}" ]; then
   fi
   ssh -N -L 8092:127.0.0.1:8092 \
       -o BatchMode=yes -o ConnectTimeout=5 -o ExitOnForwardFailure=yes \
-      -o ServerAliveInterval=15 -o ServerAliveCountMax=2 \
+      -o ServerAliveInterval=10 -o ServerAliveCountMax=1 \
       claude@45.39.60.20 >/tmp/whisperkey_tunnel.log 2>&1 &
   TUNNEL_PID=$!
   echo "$TUNNEL_PID" > "$TUNNEL_PID_FILE"
