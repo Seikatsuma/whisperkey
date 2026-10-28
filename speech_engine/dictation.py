@@ -467,7 +467,11 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
                 if full_raw_text and merge_future is not None:
                     # Второй проход уже почти наверняка готов — шёл параллельно.
                     try:
-                        _gtext, g_words = merge_future.result(timeout=20) or (None, [])
+                        # Потолок ожидания: вторая модель идёт в тени первой и
+                        # обычно готова к ответу; медленная — пропускаем слияние
+                        # этой диктовки, чем растягиваем её на секунды (замер
+                        # 28.10.26: выбросы до 4.6с на медленном Groq).
+                        _gtext, g_words = merge_future.result(timeout=4) or (None, [])
                     except Exception as e:
                         logger.warning("bimodel: второй проход не дождался (%s)",
                                        type(e).__name__)
