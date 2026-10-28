@@ -415,15 +415,20 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
                     _resolve_audio()
                     if audio is None:
                         return None, []
-                    CH = int(ctx.sample_rate * 30)
-                    if len(audio) <= CH:
+                    # Окно 30с, шаг 28с: нахлёст 2с, чтобы слово на стыке
+                    # целиком попало в следующий кусок (вопрос Егора 28.10.26);
+                    # при сборке слова куска берём только в его неперекрытой
+                    # зоне — дублей на шве нет.
+                    WIN = int(ctx.sample_rate * 30)
+                    STEP = int(ctx.sample_rate * 28)
+                    if len(audio) <= WIN:
                         return transcribe_groq(
                             audio, api_key=ctx.groq_api_key, profile=p,
                             sample_rate=ctx.sample_rate, state=ctx.cloud_state,
                             throttle=ctx.throttle, session=ctx.session,
                             allow_retry=False, use_prompt=False, return_words=True)
-                    parts = [(i0 / ctx.sample_rate, audio[i0:i0 + CH])
-                             for i0 in range(0, len(audio), CH)]
+                    parts = [(i0 / ctx.sample_rate, audio[i0:i0 + WIN])
+                             for i0 in range(0, len(audio), STEP)]
                     def _one(off_sec, part):
                         t, ws = transcribe_groq(
                             part, api_key=ctx.groq_api_key, profile=p,
@@ -437,14 +442,16 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
                     futs = [merge_pool.submit(_one, off, part)
                             for off, part in parts]
                     texts, all_w = [], []
-                    for f in futs:
+                    for i, f in enumerate(futs):
                         try:
                             t, ws = f.result(timeout=8)
                         except Exception:
                             continue
                         if t:
                             texts.append(t)
-                        all_w.extend(ws)
+                        for w in ws:
+                            if i == len(futs) - 1 or w["start"] < i * 28.0 + 28.0:
+                                all_w.append(w)
                     all_w.sort(key=lambda w: w["start"])
                     return " ".join(texts) or None, all_w
                 merge_future = merge_pool.submit(_second_pass)
