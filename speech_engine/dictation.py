@@ -201,19 +201,12 @@ def _recognize_with_groq_cascade(audio: np.ndarray, dur: float, ctx: Context,
 # геометрии пауз: решают две разметки, а не энергия звука — пауза-раздумье
 # даёт пустоту у обеих и ничего не вставляет.
 _MERGE_OVERLAP_S = 0.15   # окна, ближе которого слова — «одно и то же место»
-_GROQ_MIN_PROB = 0.15     # ниже — чистый шум тишины; приказ Егора 28.10.26:
-                         # любой пробел заполнять хоть криво, пропускаем
-                         # только мусор с почти нулевой уверенностью
 
-# Одиночные краевые галлюцинации whisper: в тишине до/после речи он пишет
-# «Спасибо.», «До свидания.», «(музыка)» — живой пример 28.10.26. Реальное
-# «спасибо» посреди фразы не трогаем: фильтр только для вставок на краях.
-_EDGE_NOISE = {
-    "спасибо", "до свидания", "подписывайтесь", "подпишитесь", "подпишись",
-    "продолжение следует", "спасибо за просмотр", "спасибо за внимание",
-    "подписывайтесь на канал", "музыка", "аплодисменты", "смех", "тишина",
-    "the end", "bye", "thanks", "thank you",
-}
+# Приказ Егора 28.10.26: вставлять ВСЁ, что вторая модель услышала в пробеле —
+# без порога уверенности и без фильтра «шумовых» слов («пофиг что музыка что-то
+# вставит, мне вообще все равно — главное, чтобы все, что он слышал, добавлял»).
+# Реальный кейс: nova-3 написала 9 слов за 12с, вторая модель — 13 правильных,
+# а фильтры отсекли всё. Оставлен только дедуп соседей и повторов подряд.
 
 
 def _norm_word(w: str) -> str:
@@ -232,9 +225,6 @@ def _merge_word_streams(dg_words: list, g_words: list,
         word = (w.get("word") or "").strip()
         if not word:
             continue
-        prob = w.get("probability")
-        if prob is not None and prob < _GROQ_MIN_PROB:
-            continue
         norm.append({"start": w.get("start") or 0.0, "end": w.get("end") or 0.0,
                      "word": word})
     if not norm:
@@ -243,15 +233,9 @@ def _merge_word_streams(dg_words: list, g_words: list,
     def overlaps(a, b):
         return a["start"] < b["end"] + _MERGE_OVERLAP_S and                a["end"] > b["start"] - _MERGE_OVERLAP_S
 
-    dg_first = dg_words[0]["start"]
-    dg_last = dg_words[-1]["end"]
     inserts = []
     for gw in norm:
         if any(overlaps(gw, dw) for dw in dg_words):
-            continue
-        # краевая болванка whisper — не слово, а шум в тишине
-        if (gw["start"] < dg_first or gw["start"] >= dg_last) \
-                and _norm_word(gw["word"]) in _EDGE_NOISE:
             continue
         inserts.append(gw)
     if not inserts:
@@ -271,7 +255,15 @@ def _merge_word_streams(dg_words: list, g_words: list,
     if not n_ins:
         return None
     kept.sort(key=lambda t: t[0])
-    return [w for _, w in kept]
+    # повтор подряд («И И тут» — артефакт whisper, жалоба Егора 28.10.26):
+    # два одинаковых слова с зазором меньше 0.8с схлопываем в одно
+    out = [kept[0]]
+    for start, word in kept[1:]:
+        if _norm_word(word) == _norm_word(out[-1][1]) and \
+                start - out[-1][0] < 0.8:
+            continue
+        out.append((start, word))
+    return [w for _, w in out]
 
 
 # Живое самообучение словаря (28.10.26): слово, которое nova-3 потеряла, а
@@ -291,7 +283,7 @@ _LEARN_LATIN = re.compile(r"[A-Za-z]")
 def _learn_from_merge(inserted: list) -> None:
     words = [_norm_word(w) for w in inserted]
     words = [w for w in words
-             if len(w) >= 3 and w.isalpha() and w not in _EDGE_NOISE]
+             if len(w) >= 3 and w.isalpha()]
     if not words:
         return
     with _LEARN_LOCK:
@@ -534,12 +526,20 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
                                        type(e).__name__)
                         g_words = []
                     ins: list = []
-                    merged = _merge_word_streams(ctx.deepgram_state.last_words,
-                                                 g_words, out_inserts=ins)
+                    dg_words = ctx.deepgram_state.last_words
+                    if g_words and dur and dur > 5.0 and dg_words and                             len(dg_words) / dur < 1.0 and                             len(g_words) > len(dg_words):
+                        merged = [w["word"] for w in g_words]
+                        ins = []
+                        logger.warning("bimodel: dg скудный (%d слов за %.1fс) — "
+                                       "беру groq целиком (%d слов)",
+                                       len(dg_words), dur, len(g_words))
+                    else:
+                        merged = _merge_word_streams(dg_words, g_words,
+                                                     out_inserts=ins)
                     if merged:
                         full_raw_text = assembled_text = " ".join(merged)
                         logger.warning("bimodel: +%d слов от второй модели",
-                                       len(merged) - len(ctx.deepgram_state.last_words))
+                                       len(merged) - len(dg_words))
                         try:
                             _learn_from_merge(ins)
                         except Exception:
