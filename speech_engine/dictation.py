@@ -27,7 +27,7 @@ from .netcheck import internet_down, reset_cache as _reset_net_cache
 from .remote_engine import transcribe_remote
 from .yandex_engine import transcribe_yandex
 from .terms import fix_known_terms
-from .transfer import transfer_endings, transfer_punctuation
+from .transfer import transfer_punctuation
 from .terms import transfer_terms
 from .types import RecognitionResult
 from .vote import has_loop
@@ -175,7 +175,11 @@ def _recognize_with_groq_cascade(audio: np.ndarray, dur: float, ctx: Context,
             if styled:
                 text = transfer_punctuation(text, styled)
                 text, _n_terms = transfer_terms(text, styled)
-                text, _n_end = transfer_endings(text, styled)
+                # transfer_endings отключён 28.10.26: подставлял окончания
+                # донорского прохода вместо услышанных. На калибровке 08.08.26
+                # давал +9 исправлений команд против -1 поломки, но Егор
+                # выбрал дословность без подмены словоформ («как услышал,
+                # так и пиши, пусть криво») — приоритет сильнее замера.
         except Exception as e:
             logger.info("punct: второй проход не дошёл (%s) — текст без добавленных знаков",
                        type(e).__name__)

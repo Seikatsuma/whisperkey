@@ -2095,10 +2095,9 @@ def _recognize_with_whisper(audio: np.ndarray, dur: float) -> tuple[str, str, li
                 text, n_terms = transfer_terms(text, styled)
                 if n_terms:
                     print(f"[terms] названий поправлено: {n_terms}")
-                # Формы команд — оттуда же. Слово может сменить только окончание.
-                text, n_end = transfer_endings(text, styled)
-                if n_end:
-                    print(f"[forms] окончаний поправлено: {n_end}")
+                # transfer_endings отключён 28.10.26: подставлял окончания
+                # донорского прохода вместо услышанных — подмена словоформ,
+                # против которой Егор (дословность выше оформления).
         except Exception as e:
             print(f"[punct] второй проход не дошёл ({type(e).__name__}) — "
                   f"текст остаётся без добавленных знаков")
