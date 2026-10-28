@@ -189,6 +189,60 @@ def _recognize_with_groq_cascade(audio: np.ndarray, dur: float, ctx: Context,
     return text, assembled, lost_marks, chunk_quality
 
 
+# --- Слияние двух моделей (bimodel merge, паттерн deepgram-devs/bimodel-
+# transcription): Deepgram иногда проглатывает слово целиком («деплой» →
+# пробел, жалоба 28.10.26). Второй проход Groq на том же звуке идёт
+# ПАРАЛЛЕЛЬНО первому — слияние по меткам слов: пересечение по времени →
+# слово основной модели, покрытие только у Groq → его слово. Никакой
+# геометрии пауз: решают две разметки, а не энергия звука — пауза-раздумье
+# даёт пустоту у обеих и ничего не вставляет.
+_MERGE_OVERLAP_S = 0.15   # окна, ближе которого слова — «одно и то же место»
+_GROQ_MIN_PROB = 0.4      # ниже — шумовая вставка whisper, пропускаем
+
+
+def _merge_word_streams(dg_words: list, g_words: list) -> list | None:
+    """Возвращает объединённый список слов по времени или None (сливать нечего)."""
+    if not dg_words:
+        return None
+    norm = []
+    for w in g_words or []:
+        word = (w.get("word") or "").strip()
+        if not word:
+            continue
+        prob = w.get("probability")
+        if prob is not None and prob < _GROQ_MIN_PROB:
+            continue
+        norm.append({"start": w.get("start") or 0.0, "end": w.get("end") or 0.0,
+                     "word": word})
+    if not norm:
+        return None
+
+    def overlaps(a, b):
+        return a["start"] < b["end"] + _MERGE_OVERLAP_S and                a["end"] > b["start"] - _MERGE_OVERLAP_S
+
+    inserts = []
+    for gw in norm:
+        if any(overlaps(gw, dw) for dw in dg_words):
+            continue
+        inserts.append(gw)
+    if not inserts:
+        return None
+
+    # дедупликация соседей: «деплой» рядом с уже стоящим «деплой» — не дублим
+    kept = [(w["start"], w["word"]) for w in dg_words]
+    n_ins = 0
+    for gw in inserts:
+        if any(gw["word"].lower() == k[1].strip(".,!?;:—-").lower()
+               for k in kept if abs(k[0] - gw["start"]) < 1.5):
+            continue
+        kept.append((gw["start"], gw["word"]))
+        n_ins += 1
+    if not n_ins:
+        return None
+    kept.sort(key=lambda t: t[0])
+    return [w for _, w in kept]
+
+
 def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
               deepgram_upload: tuple[bytes, str] | None = None,
               audio_future=None) -> RecognitionResult:
@@ -289,6 +343,22 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
                 _check_offline()
 
         if not full_raw_text and not offline and p.deepgram_enabled and ctx.deepgram_api_key:
+            merge_pool = merge_future = None
+            if ctx.groq_api_key and not ctx.cloud_state.is_blocked:
+                # Второй проход для слияния — параллельно Deepgram, в его тени.
+                # При отказе Deepgram каскад Groq пойдёт как обычно (вызов здесь
+                # только на слияние, результат второго прохода тогда не ждём).
+                merge_pool = ThreadPoolExecutor(max_workers=1)
+                def _second_pass():
+                    _resolve_audio()
+                    if audio is None:
+                        return None, []
+                    return transcribe_groq(
+                        audio, api_key=ctx.groq_api_key, profile=p,
+                        sample_rate=ctx.sample_rate, state=ctx.cloud_state,
+                        throttle=ctx.throttle, session=ctx.session,
+                        allow_retry=False, use_prompt=False, return_words=True)
+                merge_future = merge_pool.submit(_second_pass)
             deepgram_upload_attempted = time.time() >= ctx.deepgram_state.blocked_until
             full_raw_text = transcribe_deepgram(
                 audio, api_key=ctx.deepgram_api_key, profile=p, sample_rate=ctx.sample_rate,
@@ -374,6 +444,19 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
                         else:
                             logger.warning("deepgram: повтор не лучше (%d слов) — оставляю первый",
                                            n_retry)
+                if full_raw_text and merge_future is not None:
+                    # Второй проход уже почти наверняка готов — шёл параллельно.
+                    try:
+                        _gtext, g_words = merge_future.result(timeout=20) or (None, [])
+                    except Exception as e:
+                        logger.warning("bimodel: второй проход не дождался (%s)",
+                                       type(e).__name__)
+                        g_words = []
+                    merged = _merge_word_streams(ctx.deepgram_state.last_words, g_words)
+                    if merged:
+                        full_raw_text = assembled_text = " ".join(merged)
+                        logger.warning("bimodel: +%d слов от второй модели",
+                                       len(merged) - len(ctx.deepgram_state.last_words))
             else:
                 fallbacks.append(f"deepgram: {ctx.deepgram_state.last_reason or 'нет ответа'}")
                 _check_offline()

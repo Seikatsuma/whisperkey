@@ -95,6 +95,10 @@ class DeepgramState:
     # (темп 1.03 развёрнут обратно). 0 — слов не было / запроса не было. Нужно
     # детектору «речь в хвосте записи не распознана» в dictation.
     last_word_end: float = 0.0
+    # Все слова последнего ответа с метками {start, end, word} в шкале записи
+    # (punctuated_word — с пунктуацией). Нужны слиянию двух моделей:
+    # второй проход Groq дописывает слова, которые Deepgram не записал.
+    last_words: list = field(default_factory=list)
 
 
 # Сетевой блок держим коротким: домашний VPN мог включиться в любой момент,
@@ -206,6 +210,11 @@ def transcribe_deepgram(audio_data, *, api_key: str, profile: Profile, sample_ra
                 # Словам уходит ускоренный звук (tempo) — их метки в шкале
                 # загруженного файла; умножаем обратно на реальную шкалу записи.
                 state.last_word_end = (words[-1].get("end") or 0.0) * tempo if words else 0.0
+                state.last_words = [
+                    {"start": (w.get("start") or 0.0) * tempo,
+                     "end": (w.get("end") or 0.0) * tempo,
+                     "word": w.get("punctuated_word") or w.get("word") or ""}
+                    for w in words]
                 if not text:
                     state.last_reason = "пустой ответ"
                     logger.info("deepgram: пусто — ухожу дальше по каскаду")
