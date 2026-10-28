@@ -1969,7 +1969,7 @@ def _start_live_stream(session_id: int, initial_blocks: list) -> None:
         # поток не должен падать от чужого close().
         ls = speech_engine.remote_engine.RemoteStream(
             url, session=requests.Session(), sample_rate=SAMPLE_RATE,
-            token=_engine.ctx.remote_asr_token).start()
+            token=_engine.ctx.remote_asr_token, ctx=_engine.ctx).start()
     except Exception as e:
         print(f"[stream] не стартовал: {type(e).__name__} — прежний путь")
         return

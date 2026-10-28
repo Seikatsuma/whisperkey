@@ -25,6 +25,7 @@ import logging
 import os
 import queue
 import threading
+import time
 
 import numpy as np
 
@@ -74,6 +75,8 @@ def transcribe_remote(audio: np.ndarray, dur: float, ctx: Context) -> str:
             return ""
         text = (r.json().get("text") or "").strip()
         ctx.remote_last_error = "" if text else "пустой ответ"
+        if text:
+            maybe_sync_terms(ctx)
         return text
 
     try:
@@ -117,6 +120,58 @@ def transcribe_remote(audio: np.ndarray, dur: float, ctx: Context) -> str:
         return ""
 
 
+_TERMS_SYNC_INTERVAL = 30 * 60   # раз в полчаса — словарь ночной, чаще не надо
+_terms_last_sync = 0.0
+
+
+def maybe_sync_terms(ctx) -> None:
+    """Тянет свежий словарь с моста (GET /terms → learned_keyterms +
+    term_fixes). Зачем (28.10.26): когда мост жив, прямой путь почти не
+    используется, но при его падении Mac идёт в Deepgram напрямую — и там
+    работает со словарём на момент последнего git pull. Синк держит прямой
+    путь на тех же терминах, что серверный. Пишет файлы только при изменении;
+    оба читателя (terms/deepgram_engine) перечитывают по mtime сами.
+    Вызывается из точек обращения к мосту; сам — фоновый поток."""
+    global _terms_last_sync
+    if ctx is None or not getattr(ctx, "remote_asr_url", ""):
+        return
+    now = time.time()
+    if now - _terms_last_sync < _TERMS_SYNC_INTERVAL:
+        return
+    _terms_last_sync = now
+
+    def _sync():
+        try:
+            import json as _json
+            from pathlib import Path as _P
+            base = ctx.remote_asr_url.rsplit("/audio/transcriptions", 1)[0].rstrip("/")
+            http = ctx.session or __import__("requests")
+            resp = http.get(f"{base}/terms", timeout=5.0)
+            if resp.status_code != 200:
+                return
+            data = resp.json()
+            data_dir = _P(__file__).resolve().parent.parent / "data"
+            for key, name in (("learned_keyterms", "learned_keyterms.json"),
+                              ("term_fixes", "term_fixes.json")):
+                if key not in data:
+                    continue
+                path = data_dir / name
+                new = _json.dumps(data[key], ensure_ascii=False, indent=1)
+                try:
+                    old = path.read_text(encoding="utf-8")
+                except OSError:
+                    old = ""
+                if old.strip() != new.strip():
+                    tmp = path.with_suffix(".tmp")
+                    tmp.write_text(new + "\n", encoding="utf-8")
+                    tmp.replace(path)
+                    logger.info("remote: словарь обновлён с моста (%s)", name)
+        except Exception as e:
+            logger.info("remote: синк словаря не прошёл (%s)", type(e).__name__)
+
+    threading.Thread(target=_sync, daemon=True).start()
+
+
 class RemoteStream:
     """Потоковая отправка звука на мост ВО ВРЕМЯ записи (22.10.26).
 
@@ -133,7 +188,7 @@ class RemoteStream:
     """
 
     def __init__(self, url: str, *, session, sample_rate: int = 16000, token: str = "",
-                 timeout: tuple[float, float] = REMOTE_TIMEOUT):
+                 timeout: tuple[float, float] = REMOTE_TIMEOUT, ctx=None):
         self.url = url.rsplit("/audio/transcriptions", 1)[0].rstrip("/") + "/audio/stream"
         self.session = session
         self.sample_rate = sample_rate
@@ -146,8 +201,10 @@ class RemoteStream:
         self.engine = ""
         self.fallbacks: list = []
         self._thread = threading.Thread(target=self._run, daemon=True)
+        self.ctx = ctx
 
     def start(self) -> "RemoteStream":
+        maybe_sync_terms(self.ctx)
         self._thread.start()
         return self
 
