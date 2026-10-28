@@ -1134,3 +1134,8 @@ Keyboard Entry (залипает после sudo/ssh) синтетические
 сразу через меню «Вставить» (AXPress, не клавиша — не блокируется).
 Список терминалов _TERMINALS; проверка _secure_input_active через
 CGSessionCopyCurrentDictionary.
+
+## «деплой» — TERM_FIX (28.10.26)
+Жалоба Егора: nova-3 теряет «деплой» или разбивает «де плой». Добавлены
+регэкспы де\s*плой, диплой, deploy -> деплой; на сервере также
+keyterm в learned_keyterms.json.
