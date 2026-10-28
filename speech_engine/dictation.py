@@ -189,77 +189,6 @@ def _recognize_with_groq_cascade(audio: np.ndarray, dur: float, ctx: Context,
     return text, assembled, lost_marks, chunk_quality
 
 
-# --- Детектор пропущенных слов («деплой» → пробел, живой случай 28.10.26) ---
-# Deepgram отдаёт метку каждого записанного слова. Дыра между соседними
-# метками, где в звуке громкость речи, — это слово, которое модель услышала,
-# но не записала. Такие окна доспрашиваем второй моделью без промпта (она
-# пишет звук-в-звук и не молчит на незнакомых словах) и вклеиваем ответ.
-_GAP_MIN_S = 0.45      # короче — обычная междусловная пауза
-_GAP_EDGE_MIN_S = 0.6  # непокрытый текстом край записи
-_GAP_RMS = 0.008       # ниже — тишина, не пропуск (порог хвостового детектора 0.01)
-_GAP_MAX_FILL = 3      # больше дыр за диктовку — проблема звука, не отдельных слов
-
-
-def _find_speech_gaps(words: list, dur: float | None) -> list:
-    """Окна (позиция_вставки, start, end): между словами и по краям записи."""
-    if not words:
-        return []
-    gaps = []
-    prev = 0.0
-    for i, w in enumerate(words):
-        if w["start"] - prev >= _GAP_MIN_S:
-            gaps.append((i, prev, w["start"]))
-        prev = w["end"]
-    if dur is not None and dur - prev >= _GAP_EDGE_MIN_S:
-        gaps.append((len(words), prev, dur))
-    return gaps
-
-
-def _fill_speech_gaps(gaps: list, audio: np.ndarray, ctx: Context) -> dict:
-    """Для окон с громкостью речи — вариант второй модели {позиция: текст}."""
-    filled = {}
-    for pos, s, e in gaps:
-        if len(filled) >= _GAP_MAX_FILL:
-            break
-        seg = audio[int(s * ctx.sample_rate):int(e * ctx.sample_rate)]
-        if len(seg) < int(ctx.sample_rate * 0.3):
-            continue
-        rms = float(np.sqrt((seg.astype(np.float64) ** 2).mean()))
-        if rms < _GAP_RMS:
-            continue
-        try:
-            rec = transcribe_groq(
-                seg, api_key=ctx.groq_api_key, profile=ctx.profile,
-                sample_rate=ctx.sample_rate, state=ctx.cloud_state,
-                throttle=ctx.throttle, session=ctx.session,
-                allow_retry=False, use_prompt=False)
-        except Exception as exc:
-            logger.warning("gap-fill %.1f-%.1fс: %s", s, e, type(exc).__name__)
-            continue
-        if not rec:
-            continue
-        rec, _removed = strip_asr_artifacts(rec)
-        rec = (rec or "").strip()
-        # Потолок галлюцинации: больше ~5 слов/с на этом окне быть не может.
-        if rec and len(rec.split()) <= max(2, int((e - s) * 5)):
-            filled[pos] = rec
-            logger.warning("deepgram: дыра %.1f-%.1fс с речью → +«%s»", s, e, rec)
-    return filled
-
-
-def _splice_gap_words(words: list, filled: dict) -> str:
-    """Пересборка текста из punctuated_word с вставленными находками."""
-    parts = []
-    for i, w in enumerate(words):
-        if i in filled:
-            parts.append(filled[i])
-        if w["word"]:
-            parts.append(w["word"])
-    if len(words) in filled:
-        parts.append(filled[len(words)])
-    return " ".join(parts)
-
-
 def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
               deepgram_upload: tuple[bytes, str] | None = None,
               audio_future=None) -> RecognitionResult:
@@ -445,19 +374,6 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
                         else:
                             logger.warning("deepgram: повтор не лучше (%d слов) — оставляю первый",
                                            n_retry)
-                if full_raw_text and ctx.groq_api_key and not ctx.cloud_state.is_blocked:
-                    # Доклейка слов, которые модель услышала, но не записала.
-                    # Декодируем звук только когда дыры вообще есть — на пути
-                    # upload декод иначе не нужен и стоил бы лишней задержки.
-                    gaps = _find_speech_gaps(ctx.deepgram_state.last_words, dur)
-                    if gaps:
-                        _resolve_audio()
-                        if audio is not None:
-                            filled = _fill_speech_gaps(gaps, audio, ctx)
-                            if filled:
-                                full_raw_text = assembled_text = _splice_gap_words(
-                                    ctx.deepgram_state.last_words, filled)
-                                logger.warning("deepgram: доклеено пропусков: %d", len(filled))
             else:
                 fallbacks.append(f"deepgram: {ctx.deepgram_state.last_reason or 'нет ответа'}")
                 _check_offline()
