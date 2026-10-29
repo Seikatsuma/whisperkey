@@ -2569,8 +2569,6 @@ def _spawn_tunnel() -> bool:
 
 
 def _spawn_tunnel_locked() -> bool:
-    if not BRIDGE_HOST:
-        return False  # адрес сервера не задан — прямой путь через Deepgram
     _kill_stale_tunnel()
     try:
         p = subprocess.Popen(
