@@ -159,7 +159,9 @@ echo "Python: $($PY --version)"
 # не отвечает — проверка /health не пройдёт, переменная не ставится и всё
 # работает ровно как раньше, без единой лишней секунды ожидания.
 TUNNEL_PID_FILE=/tmp/whisperkey_tunnel.pid
-if [ -z "${WHISPERKEY_NO_TUNNEL:-}" ]; then
+BRIDGE_HOST="${WHISPERKEY_BRIDGE_HOST:-}"
+[ -z "$BRIDGE_HOST" ] && [ -f "$HOME/.whisperkey_bridge_host" ] && BRIDGE_HOST="$(cat "$HOME/.whisperkey_bridge_host")"
+if [ -z "${WHISPERKEY_NO_TUNNEL:-}" ] && [ -n "$BRIDGE_HOST" ]; then
   # Старый туннель от прошлого запуска — убиваем строго по сохранённому PID.
   if [ -f "$TUNNEL_PID_FILE" ]; then
     kill "$(cat "$TUNNEL_PID_FILE")" 2>/dev/null
@@ -168,7 +170,7 @@ if [ -z "${WHISPERKEY_NO_TUNNEL:-}" ]; then
   ssh -N -L 8092:127.0.0.1:8092 \
       -o BatchMode=yes -o ConnectTimeout=5 -o ExitOnForwardFailure=yes \
       -o ServerAliveInterval=10 -o ServerAliveCountMax=1 \
-      claude@45.39.60.20 >/tmp/whisperkey_tunnel.log 2>&1 &
+      "$BRIDGE_HOST" >/tmp/whisperkey_tunnel.log 2>&1 &
   TUNNEL_PID=$!
   echo "$TUNNEL_PID" > "$TUNNEL_PID_FILE"
   sleep 2
@@ -184,6 +186,8 @@ if [ -z "${WHISPERKEY_NO_TUNNEL:-}" ]; then
     rm -f "$TUNNEL_PID_FILE"
     echo "Серверный мост: не поднялся — работаю как раньше (причина в /tmp/whisperkey_tunnel.log)"
   fi
+elif [ -z "${WHISPERKEY_NO_TUNNEL:-}" ]; then
+  echo "Серверный мост: адрес сервера не задан (~/.whisperkey_bridge_host) — распознаю напрямую через Deepgram"
 fi
 
 # Старая копия whisperkey.py могла остаться висеть от прошлого запуска (окно
