@@ -2515,18 +2515,7 @@ def on_release(key):
 # Теперь сторож раз в BRIDGE_CHECK_SEC проверяет /health и переподнимает
 # туннель сам. Работает только на macOS: на сервере мост и так локальный.
 
-def _bridge_host() -> str:
-    # Адрес сервера — личный, в репозитории не хранится:
-    # env WHISPERKEY_BRIDGE_HOST или файл ~/.whisperkey_bridge_host
-    h = os.environ.get("WHISPERKEY_BRIDGE_HOST", "").strip()
-    if not h:
-        try:
-            h = open(os.path.expanduser("~/.whisperkey_bridge_host")).read().strip()
-        except OSError:
-            h = ""
-    return h
-
-BRIDGE_HOST = _bridge_host()
+BRIDGE_HOST = "claude@45.39.60.20"
 BRIDGE_PID_FILE = "/tmp/whisperkey_tunnel.pid"
 BRIDGE_ASR_URL = "http://127.0.0.1:8092/audio/transcriptions"
 BRIDGE_CHECK_SEC = 15

@@ -225,10 +225,8 @@ SaluteSpeech: после конца записи медиана 0.87 с прот
   раздел «Ступень remote». Здесь важно: включается ТОЛЬКО переменной
   `REMOTE_ASR_URL`, код `whisperkey.py` не менялся (`Engine` читает env сам).
 - **лаунчер** (`Запустить WhisperKey.command`): поднимает
-  `ssh -N -L 8092:127.0.0.1:8092 "$BRIDGE_HOST"` (BatchMode — без диалогов;
-  адрес сервера личный, в публичном репо не хранится — берётся из
-  `WHISPERKEY_BRIDGE_HOST` или файла `~/.whisperkey_bridge_host`; у Егора
-  на Mac ключ `alexnbox@MacBook-Pro-Alexnbox` уже в authorized_keys), ждёт
+  `ssh -N -L 8092:127.0.0.1:8092 claude@45.39.60.20` (BatchMode — без диалогов;
+  ключ `alexnbox@MacBook-Pro-Alexnbox` уже в authorized_keys на сервере), ждёт
   2с, проверяет `GET /health` и только при 200 экспортирует `REMOTE_ASR_URL`.
   Не поднялся — работаем как раньше, лишних секунд ожидания нет. PID туннеля
   кладётся в `/tmp/whisperkey_tunnel.pid`, при повторном запуске старый
