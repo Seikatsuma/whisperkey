@@ -1118,7 +1118,11 @@ _AX_SMART_SCRIPT = '''on run argv
         end try
         try
             set v2 to value of attribute "AXValue" of el
-            return appName & linefeed & "WROTE" & linefeed & r & linefeed & (v2 as text)
+            set v2t to v2 as text
+            if v2t is equal to curText and v2t does not contain ins then
+                return appName & linefeed & "SWALLOWED" & linefeed & r & linefeed & v2t
+            end if
+            return appName & linefeed & "WROTE" & linefeed & r & linefeed & v2t
         on error
             return appName & linefeed & "WROTE" & linefeed & r & linefeed & ""
         end try
@@ -1199,7 +1203,10 @@ def _ax_smart_insert_fast(text: str, try_unlock: bool = True):
         except Exception:
             pass
         okv2, v2 = _ax_get(el, "AXValue")
-        return app, "WROTE", role, (v2 if okv2 and isinstance(v2, str) else "")
+        v2 = v2 if okv2 and isinstance(v2, str) else ""
+        if okv2 and v2 == cur and text not in v2:
+            return app, "SWALLOWED", role, v2
+        return app, "WROTE", role, v2
     except Exception:
         return None
 
@@ -1658,7 +1665,7 @@ def direct_insert(text: str) -> float:
         # Разблокировку пропускаем для приложений, где она уже не помогла.
         app, st, role, val = _ax_smart_insert(text, try_unlock=True)
         focus_hint = (app or "").lower()
-        readable = st in ("WROTE", "WRITEFAIL")
+        readable = st in ("WROTE", "WRITEFAIL", "SWALLOWED")
         before = val if readable else None
         if st == "UNREADABLE":
             _ax_unlock_failed.add(focus_hint)
@@ -1685,6 +1692,12 @@ def direct_insert(text: str) -> float:
                       "поле уже изменилось — без повторной вставки")
         elif st == "WRITEFAIL":
             reason = f"поле отклонило прямую запись ({app or '?'})"
+            print(f"[insert] {reason} — буферный путь")
+        elif st == "SWALLOWED":
+            # Поле приняло AXValue, но текст не отобразился (редакторы на
+            # contenteditable — YouGile и т.п.): не «поле изменилось», а
+            # проглоченная запись. Идём дальше — Cmd+V там работает.
+            reason = f"запись принята полем, но текст не появился ({app or '?'})"
             print(f"[insert] {reason} — буферный путь")
 
         # ── Ступень 2: нечитаемое поле — JS-путь браузера (проверяемая вставка)
