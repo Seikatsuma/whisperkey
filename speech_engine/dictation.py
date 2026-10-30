@@ -554,7 +554,7 @@ def recognize(audio: np.ndarray | None, dur: float | None, ctx: Context, *,
                         g_words = []
                     ins: list = []
                     dg_words = ctx.deepgram_state.last_words
-                    if g_words and dur and dur > 5.0 and dg_words and                             len(dg_words) / dur < 1.0 and                             len(g_words) > len(dg_words):
+                    if g_words and dur and dur > 5.0 and dg_words and                             len(dg_words) / dur < 0.5 and                             len(g_words) > len(dg_words):
                         merged = [w["word"] for w in g_words]
                         ins = []
                         logger.warning("bimodel: dg скудный (%d слов за %.1fс) — "
