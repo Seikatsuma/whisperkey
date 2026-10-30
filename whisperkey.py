@@ -122,13 +122,16 @@ def load_env_file(path: str = ".env") -> None:
 SAMPLE_RATE = 16000
 TRIGGER_KEY = keyboard.Key.alt_r
 MODEL_PATH  = "small" # CEO Upgrade: 'base' -> 'small' for significantly better Russian accuracy
-TAIL_CAPTURE_SECONDS = 1.0  # Захват хвоста после отпускания клавиши.
-# Поднято с 0.6 до 1.0 (07.08.26) по жалобе: последнее слово не попадает
-# в запись, хотя клавиша отпущена позже. Прежние 0.6 с ставились ради
-# скорости, но диктовка идёт в облако 2-4 секунды, и лишние 0.4 с на фоне
-# этого не заметны, а потерянное слово заметно всегда.
-# Проверить это замером нельзя: корпус эталонов содержит УЖЕ записанный
-# звук, и то, что не попало в файл, в нём отсутствует у всех одинаково.
+# Умный хвост после отпускания клавиши: пишем не фиксированную секунду,
+# а до первой паузы в речи (с потолком). Фраза закончилась до отпускания —
+# стоп через ~0.4 с, БЫСТРЕЕ прежней секунды. Отпустили посреди слова —
+# дожидаемся конца слова, не дольше потолка, иначе модель получает
+# обрубок и угадывает/теряет окончание (замерено по eval-записям 06.08.26:
+# у 3 из 10 файлов речь громкая до самого конца = срез на живую).
+TAIL_MAX_SECONDS = 2.0      # Потолок хвоста — больше не ждём никогда.
+TAIL_SILENCE_SECONDS = 0.35 # Пауза тишины, после которой слово точно кончилось.
+TAIL_MIN_SECONDS = 0.15     # Минимальный хвост — всегда хоть немного дозаписать.
+TAIL_SILENCE_RATIO = 0.18   # Тишина = RMS < 18% от уровня последних 1.5 с речи.
 # Проверка — на калибровочном тексте, где известно, что было сказано.
 RESTORE_CLIPBOARD = True
 
@@ -2273,6 +2276,58 @@ def _cancel_recording():
     schedule_idle_close()
 
 
+def _smart_tail_wait():
+    """Пишет хвост после отпускания клавиши до первой паузы в речи.
+
+    Раньше была фиксированная секунда: медленно при законченной фразе и всё
+    равно резало слово, отпущенное на половине. Теперь порог тишины считается
+    от уровня последних полутора секунд самой записи — под любой микрофон.
+    Если по потолку речь ещё идёт, последние 0.2 с затихаем плавно: резкий
+    срез в конце сэмпла модель тоже читает как «слово оборвалось».
+    """
+    block_sec = 512.0 / SAMPLE_RATE
+    ref = recording_data[-int(1.5 / block_sec):] or recording_data
+    if ref:
+        seg = np.concatenate([b.astype(np.float32).ravel() for b in ref])
+        ref_rms = float(np.sqrt(np.mean(seg * seg))) if seg.size else 0.0
+    else:
+        ref_rms = 0.0
+    floor = max(0.004, ref_rms * TAIL_SILENCE_RATIO)
+
+    t0 = time.time()
+    prev = len(recording_data)
+    quiet = 0.0
+    while time.time() - t0 < TAIL_MAX_SECONDS:
+        time.sleep(0.05)
+        n = len(recording_data)
+        if n <= prev:
+            continue
+        blocks = recording_data[prev:n]
+        prev = n
+        seg = np.concatenate([b.astype(np.float32).ravel() for b in blocks])
+        rms = float(np.sqrt(np.mean(seg * seg))) if seg.size else 0.0
+        if rms < floor:
+            quiet += len(blocks) * block_sec
+            if quiet >= TAIL_SILENCE_SECONDS and time.time() - t0 >= TAIL_MIN_SECONDS:
+                print(f"[rec] Хвост: пауза {time.time() - t0:.2f} с")
+                return
+        else:
+            quiet = 0.0
+
+    if recording_data:
+        fade_n = max(1, int(0.20 / block_sec))
+        tail = recording_data[-fade_n:]
+        total = sum(len(b) for b in tail)
+        pos = 0
+        for b in tail:
+            w = np.linspace(1.0 - pos / total,
+                            max(0.0, 1.0 - (pos + len(b)) / total),
+                            len(b), dtype=np.float32)
+            b *= w[:, None] if b.ndim > 1 else w
+            pos += len(b)
+    print(f"[rec] Хвост: потолок {TAIL_MAX_SECONDS} с, срез сглажен")
+
+
 def _begin_stop():
     """Финализ записи — общий для двух путей: истекло окно двойного касания
     (обычный «нажал-отпустил») либо при залипании пришло завершающее нажатие."""
@@ -2294,7 +2349,7 @@ def _begin_stop():
         # выходил по первой же проверке. Итог: одно случайное короткое
         # касание правого Option намертво выключало диктовку до перезапуска.
         global is_recording, processing, session_phase
-        time.sleep(TAIL_CAPTURE_SECONDS)
+        _smart_tail_wait()
         is_recording = False
         _end_live_stream(current_session_id)
         # При включённой предзаписи поток остаётся открытым — иначе следующее
