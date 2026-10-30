@@ -2371,11 +2371,6 @@ def _smart_tail_wait():
     prev = len(recording_data)
     quiet = 0.0
     while time.time() - t0 < TAIL_MAX_SECONDS:
-        if _tail_abort.is_set():
-            # Новое нажатие в фазе обработки — хвост отдан прошлой диктовке,
-            # обрываем и стартуем следующую запись (_maybe_pending_start).
-            print("[rec] Хвост прерван новым нажатием")
-            return True
         time.sleep(0.05)
         n = len(recording_data)
         if n <= prev:
@@ -2511,7 +2506,6 @@ def _start_recording() -> bool:
         session_counter += 1
         active_session_id = session_counter
         session_phase = "recording"
-        _tail_abort.clear()
         _tlog("  → старт записи")
         try:
             if PREROLL_ENABLED:
@@ -2577,7 +2571,6 @@ def _start_recording() -> bool:
 # ограничена — протухший флаг не должен всплыть фантомной записью позже.
 _pending_rec_start = False
 _pending_rec_ts = 0.0
-_tail_abort = threading.Event()   # обрыв умного хвоста новым нажатием
 
 def _maybe_pending_start():
     global _pending_rec_start, latch_active, _latch_started_ts
@@ -2676,14 +2669,14 @@ def on_press(key):
             return
         with state_lock:
             if session_phase != "idle":
-                # Нажатие в фазе обработки не глушим: хвост прошлой диктовки
-                # обрываем, старт запоминаем — сработает на ближайшей
-                # безопасной точке (конец захвата / конец распознавания).
+                # Нажатие в фазе обработки не глушим: старт запоминаем —
+                # сработает на ближайшей безопасной точке (конец захвата /
+                # конец распознавания). Хвост прошлой диктовки НЕ трогаем —
+                # там может быть конец слова.
                 global _pending_rec_start, _pending_rec_ts
                 _pending_rec_start = True
                 _pending_rec_ts = now
-                _tail_abort.set()
-                _tlog(f"  → фаза {session_phase}: ждущий старт, хвост оборван")
+                _tlog(f"  → фаза {session_phase}: ждущий старт")
                 return
         if not _start_recording():
             return
