@@ -2310,22 +2310,30 @@ def _smart_tail_wait():
             quiet += len(blocks) * block_sec
             if quiet >= TAIL_SILENCE_SECONDS and time.time() - t0 >= TAIL_MIN_SECONDS:
                 print(f"[rec] Хвост: пауза {time.time() - t0:.2f} с")
-                return
+                return False
         else:
             quiet = 0.0
-
-    if recording_data:
-        fade_n = max(1, int(0.20 / block_sec))
-        tail = recording_data[-fade_n:]
-        total = sum(len(b) for b in tail)
-        pos = 0
-        for b in tail:
-            w = np.linspace(1.0 - pos / total,
-                            max(0.0, 1.0 - (pos + len(b)) / total),
-                            len(b), dtype=np.float32)
-            b *= w[:, None] if b.ndim > 1 else w
-            pos += len(b)
     print(f"[rec] Хвост: потолок {TAIL_MAX_SECONDS} с, срез сглажен")
+    return True
+
+
+def _tail_fade():
+    """Плавное затихание последних 0.2 с записи — вызывать ПОСЛЕ
+    is_recording=False, чтобы гасить настоящий конец, а не гасить середину
+    с громким обрубком после неё."""
+    block_sec = 512.0 / SAMPLE_RATE
+    if not recording_data:
+        return
+    fade_n = max(1, int(0.20 / block_sec))
+    tail = recording_data[-fade_n:]
+    total = sum(len(b) for b in tail)
+    pos = 0
+    for b in tail:
+        w = np.linspace(1.0 - pos / total,
+                        max(0.0, 1.0 - (pos + len(b)) / total),
+                        len(b), dtype=np.float32)
+        b *= w[:, None] if b.ndim > 1 else w
+        pos += len(b)
 
 
 def _begin_stop():
@@ -2349,8 +2357,10 @@ def _begin_stop():
         # выходил по первой же проверке. Итог: одно случайное короткое
         # касание правого Option намертво выключало диктовку до перезапуска.
         global is_recording, processing, session_phase
-        _smart_tail_wait()
+        capped = _smart_tail_wait()
         is_recording = False
+        if capped:
+            _tail_fade()
         _end_live_stream(current_session_id)
         # При включённой предзаписи поток остаётся открытым — иначе следующее
         # нажатие снова начнётся с холодного старта и срежет первое слово.
