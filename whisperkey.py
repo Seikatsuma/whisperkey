@@ -2229,6 +2229,9 @@ def process_audio(audio_snapshot: list, session_id: int):
             with state_lock:
                 if active_session_id == session_id:
                     pill.set_state("idle")
+            # Распознавание кончилось — отложенное нажатие может стартовать
+            # уже здесь, не дожидаясь вставки (захват закрыт, снимок взят).
+            _maybe_pending_start()
             ins_sec = direct_insert(text + " ") or 0.0
             # Раздельный замер: «стало дольше» почти всегда жило на стороне
             # вставки, а не ASR — путать их нельзя.
@@ -2292,6 +2295,7 @@ def process_audio(audio_snapshot: list, session_id: int):
         # Диктовка закончена — заводим отсчёт до освобождения микрофона.
         # Новое нажатие таймер сбросит, так что при серии диктовок поток живёт.
         schedule_idle_close()
+        _maybe_pending_start()
 
 # ─── Обработка клавиш ─────────────────────────────────────────────────────────
 
@@ -2367,6 +2371,11 @@ def _smart_tail_wait():
     prev = len(recording_data)
     quiet = 0.0
     while time.time() - t0 < TAIL_MAX_SECONDS:
+        if _tail_abort.is_set():
+            # Новое нажатие в фазе обработки — хвост отдан прошлой диктовке,
+            # обрываем и стартуем следующую запись (_maybe_pending_start).
+            print("[rec] Хвост прерван новым нажатием")
+            return True
         time.sleep(0.05)
         n = len(recording_data)
         if n <= prev:
@@ -2451,12 +2460,16 @@ def _begin_stop():
                     session_phase = "idle"
                     pill.set_state("idle")
             schedule_idle_close()
+            _maybe_pending_start()
             return
 
         if not pill.active:
             notify("WhisperKey", "⏹ Распознаю...")
         print(f"[rec] Остановлена (хвост захвачен)")
         threading.Thread(target=process_audio, args=(audio_snapshot, current_session_id), daemon=True).start()
+        # Захват прошлой диктовки завершён, снимок взят — безопасная точка
+        # для отложенного старта (нажатие пришло, пока дожимали хвост).
+        _maybe_pending_start()
 
     processing = True
     threading.Thread(target=delayed_stop, daemon=True).start()
@@ -2485,6 +2498,105 @@ def _latch_watchdog(sid: int) -> None:
         print(f"[rec] Залипание: потолок {LATCH_MAX_SEC // 60} мин — останавливаю")
         _tlog("  → сторож 15 мин, стоп")
         _begin_stop()
+
+
+def _start_recording() -> bool:
+    """Фактический старт захвата под state_lock. Вызывается из on_press в фазе
+    idle и из _maybe_pending_start на безопасной точке фазы processing
+    (захват прошлой диктовки уже завершён, снимок взят)."""
+    global is_recording, recording_data, trigger_held, last_trigger_ts, session_counter, active_session_id, session_phase
+    with state_lock:
+        last_trigger_ts = time.time()
+        trigger_held = True
+        session_counter += 1
+        active_session_id = session_counter
+        session_phase = "recording"
+        _tail_abort.clear()
+        _tlog("  → старт записи")
+        try:
+            if PREROLL_ENABLED:
+                cancel_idle_close()
+                # Поток мог закрыться по простою или умереть от смены устройства.
+                if not ensure_audio_stream():
+                    session_phase = "idle"
+                    pill.set_state("error")
+                    return False
+                # Порядок важен: буфер заполняется ДО поднятия is_recording,
+                # иначе колбэк успевает дописать в старый список.
+                recording_data = list(preroll_buffer)
+                preroll_buffer.clear()
+            else:
+                if not start_audio_stream():
+                    session_phase = "idle"
+                    pill.set_state("error")
+                    return False
+                recording_data = []
+
+            audio_dropouts.clear()
+            _start_live_stream(active_session_id, recording_data)
+            is_recording = True
+            # Уведомление ПОСЛЕ фактического начала захвата: раньше «говори»
+            # выдавалось до того, как микрофон отдавал первый сэмпл.
+            pill.set_state("recording")
+            if not pill.active:
+                notify("WhisperKey", "🎙 Запись...")
+            if PREROLL_ENABLED:
+                pre = len(recording_data) * 512 / SAMPLE_RATE
+                # Нулевая предзапись при включённом режиме — признак того, что
+                # поток был мёртв. Молчать об этом нельзя: дальше запись уйдёт
+                # в никуда, а пользователь увидит «слишком короткая запись».
+                if pre <= 0:
+                    print("[audio] ВНИМАНИЕ: предзапись пуста, поток был неисправен")
+                else:
+                    print(f"[rec] Начата (предзапись {pre * 1000:.0f} мс)")
+            else:
+                print("[rec] Начата")
+
+            if USE_CLOUD:
+                def warm_groq():
+                    try: http_session.options("https://api.groq.com/openai/v1/audio/transcriptions", timeout=1.0)
+                    except: pass
+                threading.Thread(target=warm_groq, daemon=True).start()
+
+        except Exception as e:
+            print(f"[audio error] {e}")
+            notify("WhisperKey — микрофон недоступен", str(e)[:120])
+            is_recording = False
+            _end_live_stream(active_session_id, abort=True)
+            session_phase = "idle"
+            pill.set_state("error")
+            return False
+    return True
+
+
+# Отложенный старт: нажатие пришло в фазе processing — пока прошлая диктовка
+# дожимала хвост, распознавалась или вставлялась — и раньше глушилось
+# («плашка угасла, а запись не пошла», Егор 31.10). Флаг ставит on_press,
+# срабатывает на первой безопасной точке: конец захвата в delayed_stop,
+# конец распознавания до вставки и в finally process_audio. Свежесть
+# ограничена — протухший флаг не должен всплыть фантомной записью позже.
+_pending_rec_start = False
+_pending_rec_ts = 0.0
+_tail_abort = threading.Event()   # обрыв умного хвоста новым нажатием
+
+def _maybe_pending_start():
+    global _pending_rec_start, latch_active, _latch_started_ts
+    if not _pending_rec_start or time.time() - _pending_rec_ts > 3.0:
+        _pending_rec_start = False
+        return
+    _pending_rec_start = False
+    if not _start_recording():
+        return
+    if _option_is_down():
+        print("[rec] старт по отложенному нажатию")
+    else:
+        # Тап уже отпущен — отпускание прошло в фазе processing и потерялось:
+        # без залипания запись висела бы без завершающего триггера.
+        latch_active = True
+        _latch_started_ts = time.time()
+        threading.Thread(target=_latch_watchdog,
+                         args=(active_session_id,), daemon=True).start()
+        print("[rec] старт по отложенному нажатию — тап прошёл, залипание")
 
 
 def on_press(key):
@@ -2564,66 +2676,17 @@ def on_press(key):
             return
         with state_lock:
             if session_phase != "idle":
-                _tlog(f"  → пропуск, фаза {session_phase}")
+                # Нажатие в фазе обработки не глушим: хвост прошлой диктовки
+                # обрываем, старт запоминаем — сработает на ближайшей
+                # безопасной точке (конец захвата / конец распознавания).
+                global _pending_rec_start, _pending_rec_ts
+                _pending_rec_start = True
+                _pending_rec_ts = now
+                _tail_abort.set()
+                _tlog(f"  → фаза {session_phase}: ждущий старт, хвост оборван")
                 return
-            last_trigger_ts = now
-            trigger_held = True
-            session_counter += 1
-            active_session_id = session_counter
-            session_phase = "recording"
-            _tlog("  → старт записи")
-            try:
-                if PREROLL_ENABLED:
-                    cancel_idle_close()
-                    # Поток мог закрыться по простою или умереть от смены устройства.
-                    if not ensure_audio_stream():
-                        session_phase = "idle"
-                        pill.set_state("error")
-                        return
-                    # Порядок важен: буфер заполняется ДО поднятия is_recording,
-                    # иначе колбэк успевает дописать в старый список.
-                    recording_data = list(preroll_buffer)
-                    preroll_buffer.clear()
-                else:
-                    if not start_audio_stream():
-                        session_phase = "idle"
-                        pill.set_state("error")
-                        return
-                    recording_data = []
-
-                audio_dropouts.clear()
-                _start_live_stream(active_session_id, recording_data)
-                is_recording = True
-                # Уведомление ПОСЛЕ фактического начала захвата: раньше «говори»
-                # выдавалось до того, как микрофон отдавал первый сэмпл.
-                pill.set_state("recording")
-                if not pill.active:
-                    notify("WhisperKey", "🎙 Запись...")
-                if PREROLL_ENABLED:
-                    pre = len(recording_data) * 512 / SAMPLE_RATE
-                    # Нулевая предзапись при включённом режиме — признак того, что
-                    # поток был мёртв. Молчать об этом нельзя: дальше запись уйдёт
-                    # в никуда, а пользователь увидит «слишком короткая запись».
-                    if pre <= 0:
-                        print("[audio] ВНИМАНИЕ: предзапись пуста, поток был неисправен")
-                    else:
-                        print(f"[rec] Начата (предзапись {pre * 1000:.0f} мс)")
-                else:
-                    print("[rec] Начата")
-
-                if USE_CLOUD:
-                    def warm_groq():
-                        try: http_session.options("https://api.groq.com/openai/v1/audio/transcriptions", timeout=1.0)
-                        except: pass
-                    threading.Thread(target=warm_groq, daemon=True).start()
-
-            except Exception as e:
-                print(f"[audio error] {e}")
-                notify("WhisperKey — микрофон недоступен", str(e)[:120])
-                is_recording = False
-                _end_live_stream(active_session_id, abort=True)
-                session_phase = "idle"
-                pill.set_state("error")
+        if not _start_recording():
+            return
 
 def on_release(key):
     global is_recording, processing, trigger_held, session_counter, session_phase, _latch_deadline, _last_release_ts, _release_seq
