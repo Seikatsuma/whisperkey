@@ -1149,17 +1149,11 @@ _ax_unlock_failed: set = set()
 # contenteditable). Для них AX-писать снова нельзя: запись всплывает с
 # задержкой рядом со вставленным через буфер текстом — живой дубль,
 # «текст дважды» (Егор 30.10). Помеченное приложение пропускает ступень
-# AX-записи и идёт сразу в проверяемые транспорты (JS/буфер). Список
-# хранится на диске — перезапуск WhisperKey не должен стоить ещё один дубль.
+# AX-записи и идёт сразу в проверяемые транспорты (JS/буфер).
+# Список — ТОЛЬКО в памяти сессии: разовый SWALLOWED в нетекстовом поле
+# (омнибокс и т.п.) не должен навсегда отключать AX-запись целому
+# приложению — живой случай «Brave перестал принимать текст» (Егор 31.10).
 _ax_swallowed_apps: set = set()
-_AX_SWALLOWED_FILE = os.path.expanduser("~/.whisperkey_ax_swallowed.json")
-
-def _ax_swallow_load() -> None:
-    try:
-        with open(_AX_SWALLOWED_FILE, "r", encoding="utf-8") as f:
-            _ax_swallowed_apps.update(x for x in json.load(f) if isinstance(x, str))
-    except Exception:
-        pass
 
 def _ax_swallow_learn(app: str) -> None:
     key = (app or "").strip().lower()
@@ -1167,13 +1161,6 @@ def _ax_swallow_learn(app: str) -> None:
         return
     _ax_swallowed_apps.add(key)
     print(f"[insert] {app} помечен: поля глотают AX-запись — дальше без неё")
-    try:
-        with open(_AX_SWALLOWED_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(_ax_swallowed_apps), f, ensure_ascii=False)
-    except Exception:
-        pass
-
-_ax_swallow_load()
 
 def _frontmost_app_name() -> str:
     """Имя frontmost-приложения быстрым вызовом — до решения, писать ли AX."""
