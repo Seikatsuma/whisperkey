@@ -1137,6 +1137,46 @@ end run'''
 # (жалоба «долго жду вставки», 19.10.26).
 _ax_unlock_failed: set = set()
 
+# Приложения, чьи поля ПРОГЛОТИЛИ AX-запись (SWALLOWED — YouGile и прочие
+# contenteditable). Для них AX-писать снова нельзя: запись всплывает с
+# задержкой рядом со вставленным через буфер текстом — живой дубль,
+# «текст дважды» (Егор 30.10). Помеченное приложение пропускает ступень
+# AX-записи и идёт сразу в проверяемые транспорты (JS/буфер). Список
+# хранится на диске — перезапуск WhisperKey не должен стоить ещё один дубль.
+_ax_swallowed_apps: set = set()
+_AX_SWALLOWED_FILE = os.path.expanduser("~/.whisperkey_ax_swallowed.json")
+
+def _ax_swallow_load() -> None:
+    try:
+        with open(_AX_SWALLOWED_FILE, "r", encoding="utf-8") as f:
+            _ax_swallowed_apps.update(x for x in json.load(f) if isinstance(x, str))
+    except Exception:
+        pass
+
+def _ax_swallow_learn(app: str) -> None:
+    key = (app or "").strip().lower()
+    if not key or key in _ax_swallowed_apps:
+        return
+    _ax_swallowed_apps.add(key)
+    print(f"[insert] {app} помечен: поля глотают AX-запись — дальше без неё")
+    try:
+        with open(_AX_SWALLOWED_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(_ax_swallowed_apps), f, ensure_ascii=False)
+    except Exception:
+        pass
+
+_ax_swallow_load()
+
+def _frontmost_app_name() -> str:
+    """Имя frontmost-приложения быстрым вызовом — до решения, писать ли AX."""
+    if _NSWorkspace is None:
+        return ""
+    try:
+        fa = _NSWorkspace.sharedWorkspace().frontmostApplication()
+        return (fa.localizedName() or "") if fa else ""
+    except Exception:
+        return ""
+
 def _ax_get(el, attr):
     """(ok, value) для AX-атрибута в обёртке — pyobjc возвращает (err, val)."""
     try:
@@ -1666,10 +1706,23 @@ def direct_insert(text: str) -> float:
         # ── Ступень 1: прямая AX-запись с verify одним вызовом ───────────────
         # Цель — текущее поле на момент вставки, не на момент начала записи.
         # Разблокировку пропускаем для приложений, где она уже не помогла.
-        app, st, role, val = _ax_smart_insert(text, try_unlock=True)
+        # Для приложений, помеченных как глотающие AX-запись (YouGile и т.п.),
+        # ступень пропускается целиком: их поле принимает запись «в стол», и она
+        # всплывает с задержкой РЯДОМ со вставленным буфером — это и есть дубль.
+        fapp = _frontmost_app_name()
+        if fapp and fapp.lower() in _ax_swallowed_apps:
+            app, st, role, val = fapp, "SKIPAX", "", None
+            print(f"[insert] AX-запись пропущена ({app} глотает её) — "
+                  "сразу проверяемый путь")
+        else:
+            app, st, role, val = _ax_smart_insert(text, try_unlock=True)
         focus_hint = (app or "").lower()
         readable = st in ("WROTE", "WRITEFAIL", "SWALLOWED")
-        before = val if readable else None
+        if st == "SKIPAX":
+            before, _, _ = _ax_focused_value()
+            readable = before is not None
+        else:
+            before = val if readable else None
         if st == "UNREADABLE":
             _ax_unlock_failed.add(focus_hint)
 
@@ -1698,22 +1751,30 @@ def direct_insert(text: str) -> float:
             print(f"[insert] {reason} — буферный путь")
         elif st == "SWALLOWED":
             # Поле приняло AXValue, но текст не отобразился (редакторы на
-            # contenteditable — YouGile и т.п.). Перед запасным ударом ждём
-            # и перечитываем: у части полей AXValue отражает запись с
-            # задержкой — без паузы Cmd+V продублирует уже дошедший текст
-            # (живой дубль Егора 30.10).
-            time.sleep(0.25)
-            snap, _, _ = _ax_focused_value()
-            if _insert_verified(text, val, snap) is True:
-                sent, via = True, "ax-write"
-                verdict = True
-                print("[insert] AX-запись дошла с задержкой — проверено")
-            else:
+            # contenteditable — YouGile и т.п.). Запоминаем приложение:
+            # следующие диктовки пропустят AX-запись вовсе — иначе её
+            # отложенное проявление печатает вторую копию рядом со
+            # вставленной через буфер (дубль «очень часто», Егор 30.10).
+            _ax_swallow_learn(app)
+            # А сейчас ждём и перечитываем до ~0.7с: у части полей AXValue
+            # отражает запись с задержкой — ранний Cmd+V продублирует текст.
+            deadline = time.time() + 0.7
+            while time.time() < deadline:
+                time.sleep(0.12)
+                snap, _, _ = _ax_focused_value()
+                if _insert_verified(text, val, snap) is True:
+                    sent, via = True, "ax-write"
+                    verdict = True
+                    print("[insert] AX-запись дошла с задержкой — проверено")
+                    break
+            if verdict is not True:
                 reason = f"запись принята полем, но текст не появился ({app or '?'})"
                 print(f"[insert] {reason} — буферный путь")
 
         # ── Ступень 2: нечитаемое поле — JS-путь браузера (проверяемая вставка)
-        if verdict is not True and st in ("UNREADABLE", "NOFOCUS") \
+        # SKIPAX — приложение, помеченное как глотающее AX: в браузере JS
+        # вставляет в contenteditable с проверкой и без буфера.
+        if verdict is not True and st in ("UNREADABLE", "NOFOCUS", "SKIPAX") \
                 and _is_browser(app):
             st2, det = _js_insert(app, text)
             if st2 == "VERIFIED":
