@@ -1695,10 +1695,19 @@ def direct_insert(text: str) -> float:
             print(f"[insert] {reason} — буферный путь")
         elif st == "SWALLOWED":
             # Поле приняло AXValue, но текст не отобразился (редакторы на
-            # contenteditable — YouGile и т.п.): не «поле изменилось», а
-            # проглоченная запись. Идём дальше — Cmd+V там работает.
-            reason = f"запись принята полем, но текст не появился ({app or '?'})"
-            print(f"[insert] {reason} — буферный путь")
+            # contenteditable — YouGile и т.п.). Перед запасным ударом ждём
+            # и перечитываем: у части полей AXValue отражает запись с
+            # задержкой — без паузы Cmd+V продублирует уже дошедший текст
+            # (живой дубль Егора 30.10).
+            time.sleep(0.25)
+            snap, _, _ = _ax_focused_value()
+            if _insert_verified(text, val, snap) is True:
+                sent, via = True, "ax-write"
+                verdict = True
+                print("[insert] AX-запись дошла с задержкой — проверено")
+            else:
+                reason = f"запись принята полем, но текст не появился ({app or '?'})"
+                print(f"[insert] {reason} — буферный путь")
 
         # ── Ступень 2: нечитаемое поле — JS-путь браузера (проверяемая вставка)
         if verdict is not True and st in ("UNREADABLE", "NOFOCUS") \
