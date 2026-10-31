@@ -729,7 +729,7 @@ def _close_idle_stream():
 def schedule_idle_close():
     """Заводит таймер освобождения микрофона, сбрасывая предыдущий."""
     global _idle_timer
-    if not PREROLL_ENABLED or PREROLL_IDLE_TIMEOUT <= 0:
+    if PREROLL_IDLE_TIMEOUT <= 0:
         return
     with _idle_timer_lock:
         if _idle_timer is not None:
@@ -2430,10 +2430,10 @@ def _begin_stop():
         if capped:
             _tail_fade()
         _end_live_stream(current_session_id)
-        # При включённой предзаписи поток остаётся открытым — иначе следующее
-        # нажатие снова начнётся с холодного старта и срежет первое слово.
-        if not PREROLL_ENABLED:
-            stop_audio_stream()
+        # Поток микрофона НЕ закрываем сразу — следующее нажатие должно
+        # стартовать мгновенно (холодный старт CoreAudio 1–2 с давал
+        # «нажал — тишина — через 2 с плашка», Егор 31.10). Освобождение —
+        # по таймеру простоя через schedule_idle_close в finally.
 
         audio_snapshot = list(recording_data)
         if len(audio_snapshot) < 10:
@@ -2515,9 +2515,13 @@ def _start_recording() -> bool:
                 recording_data = list(preroll_buffer)
                 preroll_buffer.clear()
             else:
-                if not start_audio_stream():
+                # Живой поток переиспользуем без переоткрытия — он держится
+                # тёплым PREROLL_IDLE_TIMEOUT после диктовки; холодный старт
+                # только после реального простоя.
+                if not ensure_audio_stream():
                     session_phase = "idle"
                     pill.set_state("error")
+                    trigger_held = False
                     return False
                 recording_data = []
 
