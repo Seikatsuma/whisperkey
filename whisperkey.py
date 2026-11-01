@@ -1698,19 +1698,44 @@ def direct_insert(text: str) -> float:
         via = ""
         reason = ""
 
+        # ── Ступень 0: в браузере — JS-вставка в активную вкладку ПЕРВОЙ ────
+        # Единственный транспорт, который проверяет факт внутри самого
+        # веб-поля (contenteditable включительно). AX-запись в браузере может
+        # рапортовать «записал», уйдя не в тот элемент React — текст терялся
+        # при доверенном sent («в браузер не всегда вставляется», Егор 01.11).
+        # NOFOCUS/NOEL — поле не веб-редактируемое (строка адреса, канвас):
+        # продолжаем обычную лестницу, она закроет и их.
+        fapp = _frontmost_app_name()
+        if fapp and _is_browser(fapp):
+            st0, det0 = _js_insert(fapp, text)
+            if st0 == "VERIFIED":
+                verdict, via = True, "js"
+                print("[insert] JS-вставка в активную вкладку — проверено")
+            elif st0 == "OK":
+                sent, via = True, "js"
+                print("[insert] JS вставил, чтение назад не подтвердило")
+            elif st0 == "DISABLED":
+                _js_flag_notify_once(fapp)
+                print(f"[insert] JS в {fapp} выключен — обычная лестница")
+            else:
+                print(f"[insert] JS-путь: {st0} — обычная лестница")
+
         # ── Ступень 1: прямая AX-запись с verify одним вызовом ───────────────
         # Цель — текущее поле на момент вставки, не на момент начала записи.
         # Разблокировку пропускаем для приложений, где она уже не помогла.
         # Для приложений, помеченных как глотающие AX-запись (YouGile и т.п.),
         # ступень пропускается целиком: их поле принимает запись «в стол», и она
         # всплывает с задержкой РЯДОМ со вставленным буфером — это и есть дубль.
-        fapp = _frontmost_app_name()
-        if fapp and fapp.lower() in _ax_swallowed_apps:
-            app, st, role, val = fapp, "SKIPAX", "", None
-            print(f"[insert] AX-запись пропущена ({app} глотает её) — "
-                  "сразу проверяемый путь")
+        # JS-ступень выше уже вставила (браузер) — AX не вызываем, иначе дубль.
+        if verdict is not True and not sent:
+            if fapp and fapp.lower() in _ax_swallowed_apps:
+                app, st, role, val = fapp, "SKIPAX", "", None
+                print(f"[insert] AX-запись пропущена ({app} глотает её) — "
+                      "сразу проверяемый путь")
+            else:
+                app, st, role, val = _ax_smart_insert(text, try_unlock=True)
         else:
-            app, st, role, val = _ax_smart_insert(text, try_unlock=True)
+            app, st, role, val = fapp, "", "", None
         focus_hint = (app or "").lower()
         readable = st in ("WROTE", "WRITEFAIL", "SWALLOWED")
         if st == "SKIPAX":
