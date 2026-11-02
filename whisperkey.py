@@ -1020,10 +1020,36 @@ _AX_FOCUS_SCRIPT = '''tell application "System Events"
     end try
 end tell'''
 
+def _ax_focused_value_fast():
+    """Чтение фокусного поля прямыми AX-вызовами (~мс против ~0.2с osascript).
+    Именно из-за подпроцесса опросы вставки были редкими и медленными.
+    None — быстрый путь недоступен, работает _osa."""
+    if _AXAPI is None or _NSWorkspace is None:
+        return None
+    try:
+        fa = _NSWorkspace.sharedWorkspace().frontmostApplication()
+        if fa is None:
+            return None, "", ""
+        app = fa.localizedName() or ""
+        sw = _AXAPI.AXUIElementCreateSystemWide()
+        ok, el = _ax_get(sw, "AXFocusedUIElement")
+        if not ok or el is None:
+            return None, app, ""
+        _, role = _ax_get(el, "AXRole")
+        ok, v = _ax_get(el, "AXValue")
+        if not ok or not isinstance(v, str):
+            return None, app, role or ""
+        return v, app, role or ""
+    except Exception:
+        return None
+
 def _ax_focused_value() -> tuple:
     """(текст поля | None, приложение, роль). None — поле через AX не читается."""
     if not _IS_MAC:
         return None, "", ""
+    fast = _ax_focused_value_fast()
+    if fast is not None:
+        return fast
     ok, out = _osa(_AX_FOCUS_SCRIPT, timeout=3.0)
     if not ok or not out:
         return None, "", ""
@@ -1044,6 +1070,11 @@ def _insert_verified(inserted: str, before, after) -> bool | None:
     поле читается, а текста в нём нет; None — поле нечитаемо (ни успех, ни провал)."""
     if after is None:
         return None
+    # Поле не изменилось — вставки не было, даже если хвост уже лежал там
+    # раньше (диктовка повторяет текст, который поле уже содержит: ложный
+    # «успех» глушил SWALLOWED-детектор и терял вторую копию молча).
+    if before is not None and after == before:
+        return False
     tail = _norm_for_cmp(inserted)[-24:]
     if tail and tail in _norm_for_cmp(after):
         return True
@@ -1130,7 +1161,12 @@ _AX_SMART_SCRIPT = '''on run argv
         try
             set v2 to value of attribute "AXValue" of el
             set v2t to v2 as text
-            if v2t is equal to curText and v2t does not contain ins then
+            if v2t is equal to curText then
+                -- Поле не изменилось = запись проглочена. Условие «и текста
+                -- нет» убрано: если поле УЖЕ содержало такой же текст, старый
+                -- вариант отвечал WROTE, verify врёт «успех», и SWALLOWED-
+                -- детектор никогда не учится — повторные диктовки того же
+                -- текста в это поле терялись молча.
                 return appName & linefeed & "SWALLOWED" & linefeed & r & linefeed & v2t
             end if
             return appName & linefeed & "WROTE" & linefeed & r & linefeed & v2t
@@ -1242,7 +1278,9 @@ def _ax_smart_insert_fast(text: str, try_unlock: bool = True):
             pass
         okv2, v2 = _ax_get(el, "AXValue")
         v2 = v2 if okv2 and isinstance(v2, str) else ""
-        if okv2 and v2 == cur and text not in v2:
+        if okv2 and v2 == cur:
+            # Поле не изменилось = запись проглочена, даже если такой текст
+            # там уже лежал (см. комментарий в _AX_SMART_SCRIPT).
             return app, "SWALLOWED", role, v2
         return app, "WROTE", role, v2
     except Exception:
@@ -1362,6 +1400,69 @@ _BLIND_STRIKE_SCRIPT = '''on run argv
     return "ERR"
 end run'''
 
+_AX_SETVALUE_SCRIPT = '''on run argv
+    set v to item 1 of argv
+    tell application "System Events"
+        set fp to first application process whose frontmost is true
+        try
+            set el to value of attribute "AXFocusedUIElement" of fp
+            set value of attribute "AXValue" of el to v
+            return "OK"
+        on error
+            return "ERR"
+        end try
+    end tell
+end run'''
+
+def _ax_set_value(value: str) -> bool:
+    """Перезапись AXValue фокусного поля целиком (зачистка второй копии)."""
+    if not _IS_MAC:
+        return False
+    if _AXAPI is not None:
+        try:
+            sw = _AXAPI.AXUIElementCreateSystemWide()
+            ok, el = _ax_get(sw, "AXFocusedUIElement")
+            if ok and el is not None:
+                return _AXAPI.AXUIElementSetAttributeValue(
+                    el, "AXValue", value) == 0
+        except Exception:
+            pass
+    try:
+        r = subprocess.run(["/usr/bin/osascript", "-e", _AX_SETVALUE_SCRIPT,
+                            value], capture_output=True, timeout=3, text=True)
+        return (r.stdout or "").strip() == "OK"
+    except Exception:
+        return False
+
+def _dedupe_late_insert(text: str, before) -> None:
+    """Фоновая зачистка дубля от запоздалой AX-записи.
+
+    Поле, проглотившее AX-запись (SWALLOWED), может отразить её ПОСЛЕ того,
+    как тот же текст вставлен буферным путём, — две копии подряд (живой баг
+    «текст дважды», Егор 30.10). Через ~1.3 с перечитываем поле: если копий
+    нашего текста ровно на две больше, чем было до вставки, убираем одну.
+    Строгий счёт — человек мог уже править поле, тогда ничего не трогаем.
+    Только читаемые поля: нечитаемое не проверить, а слепая перезапись
+    опаснее дубля."""
+    def _work():
+        try:
+            time.sleep(1.3)
+            after, _app, _role = _ax_focused_value()
+            if after is None or not text:
+                return
+            base = before.count(text) if isinstance(before, str) else 0
+            if after.count(text) - base != 2:
+                return
+            pos = after.rfind(text)
+            if pos < 0:
+                return
+            if _ax_set_value(after[:pos] + after[pos + len(text):]):
+                print("[insert] запоздалая AX-запись дала вторую копию — "
+                      "убрана автоматически")
+        except Exception:
+            pass
+    threading.Thread(target=_work, daemon=True).start()
+
 def _pid_of_app(app: str) -> int:
     """pid приложения по имени (для точечных AX/CGEvent); 0 — не нашли."""
     if _NSWorkspace is None:
@@ -1411,6 +1512,32 @@ def _menu_paste_press(pid: int) -> bool:
                 # и добивка Cmd+V поверх давала дубль (скрин Егора 19.10.26).
                 _AXAPI.AXUIElementPerformAction(it, "AXPress")
                 return True
+        # Языконезависимый запасной проход: пункт меню с AXMenuItemCmdChar
+        # «V» и голым Cmd (VoiceInk issue #1000 — то же решение). Ловит
+        # меню на любой локали, а не только en/ru.
+        def _find_paste(el, depth):
+            if depth > 6:
+                return None
+            _, r = _ax_get(el, "AXRole")
+            if r == "AXMenuItem":
+                _, ch = _ax_get(el, "AXMenuItemCmdChar")
+                _, mod = _ax_get(el, "AXMenuItemCmdModifiers")
+                if isinstance(ch, str) and ch.upper() == "V" \
+                        and (mod is None or mod == 0):
+                    return el
+            _, chs = _ax_get(el, "AXChildren")
+            for c in chs or []:
+                hit = _find_paste(c, depth + 1)
+                if hit is not None:
+                    return hit
+            return None
+        for bi in bar_items:
+            hit = _find_paste(bi, 0)
+            if hit is not None:
+                _, en = _ax_get(hit, "AXEnabled")
+                if en is not False:
+                    _AXAPI.AXUIElementPerformAction(hit, "AXPress")
+                    return True
         return False
     except Exception:
         return False
@@ -1504,7 +1631,15 @@ def _secure_input_active() -> bool:
     except Exception:
         return False
 
-_JS_INSERT_TEMPLATE = '''(function(){var t=decodeURIComponent(escape(window.atob("__B64__")));var el=document.activeElement;if(!el||el===document.body)return "NOFOCUS";var ce=el.isContentEditable===true;var fld=(el.tagName==="INPUT"||el.tagName==="TEXTAREA")&&typeof el.value==="string";if(!ce&&!fld)return "NOEL";var ok=false;try{ok=document.execCommand("insertText",false,t);}catch(e){}if(!ok&&typeof el.setRangeText==="function"){try{var s=el.selectionStart==null?0:el.selectionStart;var d=el.selectionEnd==null?s:el.selectionEnd;el.setRangeText(t,s,d,"end");el.dispatchEvent(new Event("input",{bubbles:true}));ok=true;}catch(e){}}var a=ce?(el.textContent||""):(el.value||"");var tail=t.replace(/\\s+$/,"").slice(-24);var seen=tail&&a.indexOf(tail)>=0;if(!ok)return seen?"OKVER":"FAIL";return seen?"OKVER":"OK";})()'''
+# Поиск редактируемой цели с проникновением в shadow DOM и iframe:
+# document.activeElement отдаёт хост/iframe, а не сам редактор (Claude UI
+# и часть веб-редакторов прячут contenteditable глубже).
+_JS_FOCUS = 'var el=document.activeElement;while(el&&el.shadowRoot&&el.shadowRoot.activeElement)el=el.shadowRoot.activeElement;try{while(el&&el.tagName==="IFRAME"&&el.contentDocument&&el.contentDocument.activeElement)el=el.contentDocument.activeElement;}catch(e){}if(!el||el===document.body)return "NOFOCUS";var ce=el.isContentEditable===true;if(!ce&&el.closest){var h=el.closest("[contenteditable=true]");if(h){el=h;ce=true;}}var fld=(el.tagName==="INPUT"||el.tagName==="TEXTAREA")&&typeof el.value==="string";if(!ce&&!fld)return "NOEL";'
+
+_JS_INSERT_TEMPLATE = '''(function(){var t=decodeURIComponent(escape(window.atob("__B64__")));''' + _JS_FOCUS + '''var ok=false;try{ok=document.execCommand("insertText",false,t);}catch(e){}if(!ok&&typeof el.setRangeText==="function"){try{var s=el.selectionStart==null?0:el.selectionStart;var d=el.selectionEnd==null?s:el.selectionEnd;el.setRangeText(t,s,d,"end");el.dispatchEvent(new Event("input",{bubbles:true}));ok=true;}catch(e){}}var a=ce?(el.textContent||""):(el.value||"");var tail=t.replace(/\\s+$/,"").slice(-24);var seen=tail&&a.indexOf(tail)>=0;if(!ok)return seen?"OKVER":"FAIL";return seen?"OKVER":"OK";})()'''
+
+# Только чтение — для отложенной перепроверки вставленного текста.
+_JS_VERIFY_TEMPLATE = '''(function(){var t=decodeURIComponent(escape(window.atob("__B64__")));''' + _JS_FOCUS + '''var a=ce?(el.textContent||""):(el.value||"");var tail=t.replace(/\\s+$/,"").slice(-24);return tail&&a.indexOf(tail)>=0?"YES":"NO";})()'''
 
 def _js_insert(app: str, text: str) -> tuple:
     """(status, detail): VERIFIED | OK | FAIL | DISABLED | SKIP."""
@@ -1535,7 +1670,28 @@ def _js_insert(app: str, text: str) -> tuple:
     if out == "OKVER":
         return "VERIFIED", ""
     if out == "OK":
-        return "OK", ""
+        # execCommand заявил успех, но read-back хвост не видит: редактор
+        # мог принять ввод и снести его при перерисовке (React/Lexical
+        # пересобирает DOM из своей модели) — или вставка ушла не в тот
+        # узел. Это живой класс «курсор в поле, текста нет» (Claude UI в
+        # Brave). Отложенная перепроверка ~0.4с только чтением: хвост не
+        # появился — это отказ транспорта, не «sent».
+        js_v = _JS_VERIFY_TEMPLATE.replace("__B64__", b64)
+        js_vq = '"' + js_v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        vscript = (f'tell application "{safe_app}" to execute '
+                   f"front window's active tab javascript {js_vq}")
+        time.sleep(0.4)
+        try:
+            r2 = subprocess.run(["/usr/bin/osascript", "-e", vscript],
+                                capture_output=True, timeout=3, text=True)
+            vout = (r2.stdout or "").strip()
+        except Exception:
+            vout = ""
+        if vout == "YES":
+            return "VERIFIED", ""
+        if vout == "NO":
+            return "FAIL", "execCommand ок, но текста в поле нет"
+        return "OK", ""   # проверить не вышло — честный непроверяемый sent
     return "FAIL", out or "пустой ответ"
 
 def _js_flag_notify_once(app: str) -> None:
@@ -1563,10 +1719,17 @@ def _send_paste_keystroke_pynput() -> bool:
 def _poll_insert(text: str, before, timeout: float = INSERT_VERIFY_SEC):
     """Опрашивает AX-значение фокусного поля после отправки вставки.
     Поле, которое за ~0.35с ни разу не отдало значение, нечитаемо — дальше
-    крутить опрос бессмысленно и это лишняя задержка перед ответом."""
+    крутить опрос бессмысленно и это лишняя задержка перед ответом.
+
+    Вердикты: True — текст виден; "UNCHANGED" — поле читается и НИ РАЗУ не
+    изменилось за окно (удар доказанно не дошёл — это отказ транспорта, и
+    следующий по лестнице законен: дубля нет, ничего не встало); False —
+    поле менялось, но нашего текста в нём нет (вероятно, человек успел
+    отправить сообщение — повторная вставка запрещена); None — нечитаемо."""
     deadline = time.time() + timeout
     unreadable_deadline = time.time() + 0.35
     saw_readable = False
+    saw_change = before is None     # без «до» различить изменение нельзя
     first = True
     while time.time() < deadline:
         # Вставка обычно видна через ~30-80 мс — первый опрос пораньше.
@@ -1580,7 +1743,11 @@ def _poll_insert(text: str, before, timeout: float = INSERT_VERIFY_SEC):
         saw_readable = True
         if _insert_verified(text, before, after):
             return True
-    return False if saw_readable else None
+        if after != before:
+            saw_change = True
+    if not saw_readable:
+        return None
+    return False if saw_change else "UNCHANGED"
 
 def _send_paste_keystroke(target_app: str = "") -> bool:
     """Ровно один Cmd+V в целевой процесс; True — событие отправлено."""
@@ -1653,6 +1820,19 @@ except Exception:
 _kCGFlagAlternate = 0x00080000    # kCGEventFlagMaskAlternate — бит Option
 _kCGHIDState = 1                  # kCGEventSourceStateHIDSystemState
 
+def _modifiers_held() -> bool | None:
+    """Зажат ли хоть один модификатор (Cmd/Shift/Ctrl/Option) по HID-флагам.
+    Зажатый модификатор искажает Cmd+V (Cmd+Opt+V = «со стилем», у части
+    приложений — вообще ничего); VoiceInk ждёт отпускания ВСЕХ четырёх по
+    той же причине (issue #1000). None — прочитать не удалось."""
+    if _Quartz is None or not _IS_MAC:
+        return None
+    try:
+        flags = _Quartz.CGEventSourceFlagsState(_kCGHIDState)
+        return bool(flags & 0x001E0000)
+    except Exception:
+        return None
+
 def _option_physically_down() -> bool | None:
     """Реальное состояние Option по HID-флагам — в отличие от _opt_down не
     залипает, когда событие отпускания потерялось в дороге. None — прочитать
@@ -1678,16 +1858,37 @@ def _wait_option_release() -> bool:
     «курсор стоит, текста нет». Читаем физическое состояние через Quartz:
     _opt_down может застрять True при потерянном событии отпускания, и тогда
     КАЖДАЯ вставка ждала бы 1.5 с и уходила в медленный посимвольный набор."""
-    if not _option_is_down():
+    held = _modifiers_held()
+    if held is False:
+        return True
+    if held is None and not _option_is_down():
         return True
     deadline = time.time() + OPTION_WAIT_SEC
-    while _option_is_down() and time.time() < deadline:
+    while time.time() < deadline:
         time.sleep(0.05)
-    return not _option_is_down()
+        held = _modifiers_held()
+        if held is False:
+            return True
+        if held is None and not _option_is_down():
+            return True
+    return False
+
+# Одна вставка в момент времени. session_phase отпускается в idle ДО
+# direct_insert, поэтому новая диктовка может стартовать, пока прежняя ещё
+# добивает вставку — и тогда две вставки дерутся за ОБЩИЙ буфер обмена и
+# фокусное поле: удар A вставляет текст B, удар B — текст B же (живой баг
+# «текст дважды / текст потерян» при быстрой серии диктовок). Вторая
+# вставка просто ждёт добивку первой — порядок текстов сохраняется.
+_insert_lock = threading.Lock()
 
 def direct_insert(text: str) -> float:
     """Лестница транспортов с проверкой факта на каждой ступени.
     Возвращает длительность вставки, сек (для строки [timing])."""
+    locked = _insert_lock.acquire(timeout=30)
+    if not locked:
+        # Прошлая вставка зависла — идём параллельно, риск гонки лучше
+        # вечного ожидания: без замка работали всегда.
+        print("[insert] предыдущая вставка держится >30с — иду без замка")
     t_ins0 = time.time()
     try:
         text_bytes = text.encode('utf-8')
@@ -1706,6 +1907,10 @@ def direct_insert(text: str) -> float:
         # NOFOCUS/NOEL — поле не веб-редактируемое (строка адреса, канвас):
         # продолжаем обычную лестницу, она закроет и их.
         fapp = _frontmost_app_name()
+        if not fapp:
+            # pyobjc нет — имя frontmost берём osascript-путём, иначе ни
+            # JS-ступень, ни чёрный список SWALLOWED не сработают.
+            fapp = _frontmost_app()
         if fapp and _is_browser(fapp):
             st0, det0 = _js_insert(fapp, text)
             if st0 == "VERIFIED":
@@ -1727,13 +1932,20 @@ def direct_insert(text: str) -> float:
         # ступень пропускается целиком: их поле принимает запись «в стол», и она
         # всплывает с задержкой РЯДОМ со вставленным буфером — это и есть дубль.
         # JS-ступень выше уже вставила (браузер) — AX не вызываем, иначе дубль.
+        # Браузер с недоступным JS (_js_off) — тот же пропуск: веб-поля
+        # проглатывают AX-запись или принимают её не в тот элемент, а
+        # буферные транспорты для Chromium доказанно работают (VoiceInk #1000).
         if verdict is not True and not sent:
-            if fapp and fapp.lower() in _ax_swallowed_apps:
+            fapp_key = (fapp or "").lower()
+            if fapp_key in _ax_swallowed_apps or fapp_key in _js_off:
                 app, st, role, val = fapp, "SKIPAX", "", None
-                print(f"[insert] AX-запись пропущена ({app} глотает её) — "
+                print(f"[insert] AX-запись пропущена ({app}) — "
                       "сразу проверяемый путь")
             else:
-                app, st, role, val = _ax_smart_insert(text, try_unlock=True)
+                # Разблокировку пропускаем для приложений, где она уже не
+                # помогла в этой сессии (кэш _ax_unlock_failed).
+                app, st, role, val = _ax_smart_insert(
+                    text, try_unlock=fapp_key not in _ax_unlock_failed)
         else:
             app, st, role, val = fapp, "", "", None
         focus_hint = (app or "").lower()
@@ -1745,6 +1957,11 @@ def direct_insert(text: str) -> float:
             before = val if readable else None
         if st == "UNREADABLE":
             _ax_unlock_failed.add(focus_hint)
+
+        # Запись была проглочена — её отложенное проявление даст вторую
+        # копию поверх вставленной буфером. Флаг взводит _dedupe_late_insert
+        # в конце: через ~1.3с после вставки лишняя копия вырезается.
+        swallow_seen = (st == "SWALLOWED")
 
         if st == "WROTE":
             # WROTE означает, что AXSetValue уже выполнился. Текст может исчезнуть
@@ -1821,7 +2038,7 @@ def direct_insert(text: str) -> float:
                         if v2 is True:
                             verdict = True
                             print("[insert] вставка набором текста")
-                        elif v2 is False:
+                        elif v2 is not None:
                             verdict = False
                             reason = "поле не приняло посимвольный ввод"
                 except Exception as e:
@@ -1829,56 +2046,59 @@ def direct_insert(text: str) -> float:
             else:
                 old_clipboard = _clipboard_now()
                 if readable:
-                    # Один отправленный транспорт на диктовку. Пустое поле после
-                    # Cmd+V может означать, что пользователь уже отправил текст.
+                    # Удары по списку: следующий транспорт законен только после
+                    # ДОКАЗАННОГО промаха предыдущего (поле читается и не
+                    # изменилось — «UNCHANGED»). «Поле менялось без нашего
+                    # текста» — вероятно, человек отправил сообщение: стоп,
+                    # повтор запрещён (живой дубль 20.10.26).
+                    # Порядок: терминал/Secure Input и браузеры — меню первым
+                    # (Chromium глотает синтетический Cmd+V в веб-полях —
+                    # VoiceInk #1000: первый доходит, следующие теряются
+                    # молча; меню идёт по обычному пути приложения). Прочие —
+                    # Cmd+V первым (быстрее), меню при доказанном промахе.
                     if not _put_clipboard(text_bytes):
                         reason = "буфер не записался"
                     else:
                         clipboard_touched = True
-                        if (_is_terminal(app) or _secure_input_active()):
-                            # Терминал и Secure Keyboard Entry: синтетические
-                            # клавиши теряются молча — идём сразу в меню
-                            # «Вставить», это не клавиша и не блокируется.
-                            ok_m, m_err = _send_paste_via_menu(app)
-                            if ok_m:
-                                sent, via = True, "menu"
-                                verdict = _poll_insert(text, before)
-                                if verdict is True:
-                                    print("[insert] меню «Вставить» — проверено")
-                                else:
-                                    verdict = None
-                            elif _send_paste_keystroke(app):
-                                # Меню не нашлось/не кликнулось — всё равно
-                                # бьём клавишей: если Secure Input неактивен,
-                                # это рабочий транспорт.
-                                sent, via = True, "paste"
-                                verdict = _poll_insert(text, before)
-                                if verdict is not True:
-                                    verdict = None
-                            else:
-                                reason = f"меню «Вставить» не сработало: {m_err}"
-                                print(f"[insert] {reason}")
-                        elif _send_paste_keystroke(app):
-                            sent, via = True, "paste"
-                            verdict = _poll_insert(text, before)
-                            if verdict is True:
-                                print("[insert] Cmd+V — проверено")
-                            else:
-                                verdict = None
-                                print("[insert] Cmd+V отправлен; поле уже изменилось — "
-                                      "без повторной вставки")
-                        else:
-                            reason = ("клавиша Cmd+V не отправлена — проверь права "
-                                      "Accessibility/Input Monitoring у Терминала")
-                            ok_m, m_err = _send_paste_via_menu(app)
-                            if ok_m:
-                                sent, via = True, "menu"
-                                verdict = _poll_insert(text, before)
-                                if verdict is not True:
-                                    verdict = None
-                            else:
-                                print(f"[insert] меню «Вставить» не сработало: {m_err}")
-                                reason = reason or f"меню: {m_err}"
+                        menu_first = (_is_terminal(app)
+                                      or _secure_input_active()
+                                      or _is_browser(app))
+                        def _m(a):
+                            return _send_paste_via_menu(a)[0]
+                        strikes = ([("menu", _m), ("paste", _send_paste_keystroke)]
+                                   if menu_first else
+                                   [("paste", _send_paste_keystroke), ("menu", _m)])
+                        last_poll = None
+                        refused = []
+                        for sname, sfn in strikes:
+                            if not sfn(app):
+                                refused.append(sname)
+                                continue
+                            sent, via = True, sname
+                            last_poll = _poll_insert(text, before)
+                            if last_poll is True:
+                                verdict = True
+                                print(f"[insert] {sname} — проверено")
+                                break
+                            if last_poll == "UNCHANGED":
+                                # Удар ушёл, поле не изменилось — не дошёл.
+                                print(f"[insert] {sname} не дошёл "
+                                      "(поле не изменилось) — другой транспорт")
+                                continue
+                            verdict = None
+                            print(f"[insert] {sname} отправлен; поле уже "
+                                  "изменилось — без повторной вставки")
+                            break
+                        if verdict is not True and last_poll == "UNCHANGED":
+                            # Все удары доказанно не дошли — это отказ, а не
+                            # «sent»: посимвольный ввод или честный FAILED.
+                            verdict = False
+                            sent = False
+                            reason = f"поле не приняло вставку ({via})"
+                        elif not sent and refused:
+                            reason = (f"вставка не ушла ({', '.join(refused)}) — "
+                                      "проверь права Accessibility у Терминала")
+                            print(f"[insert] {reason}")
                 else:
                     # Нечитаемое поле: РОВНО ОДИН слепой удар одним вызовом —
                     # меню «Вставить», при отказе точечный Cmd+V, во frontmost —
@@ -1911,11 +2131,16 @@ def direct_insert(text: str) -> float:
                     if v2 is True:
                         verdict = True
                         print("[insert] вставка набором текста")
-                    elif v2 is False:
+                    elif v2 is not None:
                         verdict = False
                         reason = "поле не приняло ни вставку, ни посимвольный ввод"
             except Exception as e:
                 reason = f"посимвольный ввод не прошёл ({type(e).__name__})"
+
+        # Поле проглотило AX-запись и текст дошёл другим транспортом:
+        # запись может всплыть позже второй копией — фоновая зачистка.
+        if swallow_seen and (verdict is True or sent):
+            _dedupe_late_insert(text, before)
 
         dt = time.time() - t_ins0
         if verdict is True:
@@ -1947,6 +2172,9 @@ def direct_insert(text: str) -> float:
         print(f"[insert error] {e}")
         notify("WhisperKey — вставка не удалась", "Текст в буфере, нажми Cmd+V")
         return time.time() - t_ins0
+    finally:
+        if locked:
+            _insert_lock.release()
 
 artifacts_removed: list[str] = []   # что вырезали в последней обработке — для уведомления
 audio_dropouts: list[str] = []      # переполнения входного буфера за время записи
