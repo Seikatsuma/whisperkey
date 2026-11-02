@@ -19,6 +19,7 @@ import io
 import os
 import re
 import sys
+import threading
 import time
 from contextlib import redirect_stdout
 
@@ -26,7 +27,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "..", "whisperkey.py")
 
 tree = ast.parse(open(SRC, encoding="utf-8").read())
-WANTED = {"direct_insert", "_insert_verified", "_norm_for_cmp", "_is_browser"}
+WANTED = {"direct_insert", "_insert_verified", "_norm_for_cmp", "_is_browser",
+          "_is_terminal", "_ax_swallow_learn"}
 fns = [n for n in tree.body
        if isinstance(n, ast.FunctionDef) and n.name in WANTED]
 
@@ -40,10 +42,21 @@ class Kb:
 
 ns = {
     "time": time, "print": print, "kb": Kb(), "re": re,
+    "threading": threading,
     "_JS_BROWSERS": ("brave", "chrome", "chromium", "edge",
                      "vivaldi", "opera", "arc"),
+    "_TERMINALS": ("terminal", "терминал", "iterm", "warp"),
     "RESTORE_CLIPBOARD": True,
     "_ax_unlock_failed": set(),
+    "_ax_swallowed_apps": set(),
+    "_insert_lock": threading.Lock(),
+    "_frontmost_app_name": lambda: SC.get("fapp", ""),
+    "_frontmost_app": lambda: SC.get("fapp", ""),
+    "_ax_focused_value": lambda: SC.get("fv", (None, "", "")),
+    "_ax_set_value": lambda v: False,
+    "_dedupe_late_insert": lambda t, b: None,
+    "_modifiers_held": lambda: False,
+    "_secure_input_active": lambda: False,
     "_ax_smart_insert": lambda t, try_unlock=True: SC["ax"](t),
     "_js_insert": lambda a, t: SC["js"](a, t),
     "_js_flag_notify_once": lambda a: calls.__setitem__(
@@ -80,6 +93,8 @@ def run(name, scenario, want_lines, checks):
     global SC
     calls.update({k: 0 for k in calls})
     ns["_focus_app_at_start"] = scenario.get("focus_start", "")
+    ns["_js_off"].clear()
+    ns["_ax_swallowed_apps"].clear()
     SC = scenario
     buf = io.StringIO()
     err = None
@@ -175,19 +190,27 @@ run("blind-nonbrowser", dict(
     [("js", 0), ("put", 1), ("blind", 1), ("paste", 0), ("menu", 0),
      ("type", 0), ("restore", 1)])
 
-# 7. Нечитаемое поле в браузере: JS вставил и проверил → success без буфера
+# 7. Браузер: JS-first вставил и проверил → success без AX и буфера
+def JS_DISABLED(a, t):
+    calls.__setitem__("js", calls["js"] + 1)
+    if a.lower() in ns["_js_off"]:
+        return "SKIP", "js выключен (кэш)"
+    ns["_js_off"].add(a.lower())
+    return "DISABLED", "flag off"
 run("js-verified", dict(
+    fapp="Brave Browser",
     ax=UNREAD,
     js=lambda a, t: calls.__setitem__("js", calls["js"] + 1) or ("VERIFIED", ""),
     option=OPT_OK, put=PUT_OK, paste=PASTE_OK,
     blind=BLIND_ERR, poll=lambda t, b: None, menu=MENU_ERR, activate=NOACT),
-    ["через JS вкладки", "[insert success]", "js"],
-    [("js", 1), ("put", 0), ("blind", 0), ("restore", 0)])
+    ["JS-вставка в активную вкладку", "[insert success]", "js"],
+    [("js", 1), ("ax", 0), ("put", 0), ("blind", 0), ("restore", 0)])
 
 # 8. КЛЮЧЕВОЙ: нечитаемое поле, JS выключен → ОДИН удар (blind=MENU)
 run("blind-single-menu", dict(
+    fapp="Brave Browser",
     ax=UNREAD,
-    js=lambda a, t: calls.__setitem__("js", calls["js"] + 1) or ("DISABLED", "flag off"),
+    js=JS_DISABLED,
     option=OPT_OK, put=PUT_OK, paste=PASTE_OK,
     blind=BLIND_MENU, poll=lambda t, b: None, menu=MENU_ERR, activate=NOACT),
     ["один удар", "[insert sent]"],
@@ -267,6 +290,37 @@ run("blind-put-fail", dict(
     blind=BLIND_ERR, poll=lambda t, b: None, menu=MENU_ERR, activate=NOACT),
     ["[insert sent]", "type"],
     [("blind", 0), ("type", 1)])
+
+# 18. UNCHANGED: Cmd+V ушёл, но поле не изменилось → меню доказанно спасает
+run("unchanged-escalates-menu", dict(
+    ax=lambda t: ("TextEdit", "WRITEFAIL", "AXTextArea", "старый"),
+    js=JS_SKIP, option=OPT_OK, put=PUT_OK,
+    paste=PASTE_OK, menu=MENU_OK,
+    poll=lambda t, b: "UNCHANGED" if calls["menu"] == 0 else True,
+    blind=BLIND_ERR, activate=NOACT),
+    ["не дошёл", "[insert success]"],
+    [("paste", 1), ("menu", 1), ("type", 0)])
+
+# 19. Все удары не дошли → посимвольный ввод → честный FAILED
+run("unchanged-all-type-fail", dict(
+    ax=lambda t: ("TextEdit", "WRITEFAIL", "AXTextArea", "старый"),
+    js=JS_SKIP, option=OPT_OK, put=PUT_OK,
+    paste=PASTE_OK, menu=MENU_OK,
+    poll=lambda t, b: "UNCHANGED",
+    blind=BLIND_ERR, activate=NOACT),
+    ["[insert FAILED]"],
+    [("paste", 1), ("menu", 1), ("type", 1), ("notify", 1)])
+
+# 20. Браузер без JS: AX пропускается, меню первым (Chromium глотает Cmd+V)
+run("browser-menu-first", dict(
+    fapp="Brave Browser", fv=("старый", "Brave Browser", "AXTextArea"),
+    ax=UNREAD, js=JS_DISABLED,
+    option=OPT_OK, put=PUT_OK,
+    paste=PASTE_ERR, menu=MENU_OK,
+    poll=lambda t, b: True,
+    blind=BLIND_ERR, activate=NOACT),
+    ["AX-запись пропущена", "menu — проверено", "[insert success]"],
+    [("ax", 0), ("menu", 1), ("paste", 0), ("type", 0)])
 
 send_node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
                  and n.name == "_send_paste_keystroke")
