@@ -18,26 +18,20 @@ import re
 
 # Белый список: ТОЛЬКО эти слова могут приехать из второго прохода в текст.
 TERM_CANON = {
-    "claude": "Claude", "code": "Code", "design": "Design",
-    "whisperkey": "WhisperKey", "notebook": "Notebook", "lm": "LM",
-    "github": "GitHub", "telegram": "Telegram", "groq": "Groq",
+    "claude": "Claude", "whisperkey": "WhisperKey", "github": "GitHub", "telegram": "Telegram", "groq": "Groq",
     "deepgram": "DeepGram", "ceo": "CEO", "ipad": "iPad",
     "ozon": "Ozon", "wildberries": "Wildberries",
     # Словарь Егора 20.10.26 — его имена и названия, чтобы whisper/Deepgram
     # писали их точно (юджайл, qlotui, мест система и т.п. со скриншотов).
     "yougile": "YouGile", "ui": "UI", "salutespeech": "SaluteSpeech",
-    "telemost": "Телемост", "wispr": "Wispr", "flow": "Flow",
-    "brave": "Brave", "zoom": "Zoom", "miro": "Miro",
+    "telemost": "Телемост", "wispr": "Wispr", "miro": "Miro",
     "termius": "Termius", "ideogram": "Ideogram", "devin": "Devin",
-    "sonnet": "Sonnet", "opus": "Opus", "haiku": "Haiku",
     "camoufox": "Camoufox", "patchright": "Patchright",
     "amocrm": "amoCRM",
 }
 
 TERM_FIX = [
     (r"\b(?:виспер\s?кей|висперкей|виспро[\s.]?кей|wispro[\s.]?ke[yй]|wisperk|whisper\s?key|wisper\s?key|visperkey)\b", "WhisperKey"),
-    (r"\bвиспр[оа]\b", "WhisperKey"),
-    (r"\bвиспер\b", "WhisperKey"),
     (r"\bwhisperer[-\s]?k(?:ey)?\b", "WhisperKey"),
     (r"\b(?:jiminy|джимм?и|джемини|гемини)\b", "Gemini"),
     # «клод юай» → модель слышит CloudUI/code UI (архив 20-23.10: обе формы
@@ -73,7 +67,7 @@ TERM_FIX = [
     (r"\b(?:брейв|brave)\b", "Brave"),
     (r"\b(?:текст\s*едит|textedit)\b", "TextEdit"),
     (r"\bдевин\w*\b", "Devin"),
-    (r"\b(?:мира|miro)\b", "Miro"),
+    (r"\bmiro\b", "Miro"),
     (r"\b(?:зум|zoom)\b", "Zoom"),
     (r"\b(?:термиус|termius)\b", "Termius"),
     (r"\b(?:идеограм|ideogram)\w*\b", "Ideogram"),
@@ -97,6 +91,8 @@ _TERM_FIX_RX: list = []   # компилируется при первом вы�
 _LEARNED_FIX = {"mtime": 0.0, "rx": []}  # data/term_fixes.json, кэш по mtime
 
 
+_LEARNED_BLOCKLIST = {"clause", "codes", "donate"}  # живые англ. слова (03.11)
+
 def _learned_fixes():
     """Авто-правки наблюдаемых искажений из tools/build_reference.py —
     cloudui→Claude UI, amacrm→amoCRM. Файл обновляется ночным сборщиком;
@@ -112,7 +108,7 @@ def _learned_fixes():
         rx = []
         try:
             for k, v in _json.loads(path.read_text(encoding="utf-8"))["fixes"].items():
-                if len(k) >= 5:
+                if len(k) >= 5 and k.lower() not in _LEARNED_BLOCKLIST:
                     rx.append((re.compile(r"\b" + re.escape(k) + r"\b", re.IGNORECASE), v["fix"]))
         except (OSError, _json.JSONDecodeError, KeyError):
             pass
