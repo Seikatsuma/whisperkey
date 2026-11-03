@@ -56,6 +56,13 @@ _NOISE_ANNOTATION = re.compile(
     r'[\[\(]\s*(?:музыка|аплодисменты|смех|кашель|шум|тишина|вздох|вскрик|звук|молчание)[^\]\)]*[\]\)]',
     flags=re.IGNORECASE)
 
+# Метки неуверенности ASR: Deepgram/Whisper помечают сомнительное слово как
+# "[unsure слово]" или обрезанным "[unsure ". Метка — не речь диктующего;
+# вырезается вместе с помеченным словом (это гадание модели, не verbatim).
+_UNSURE_MARK = re.compile(
+    r'\[\s*unsure[^\]\[]*\]?',
+    flags=re.IGNORECASE)
+
 
 def boilerplate_only(text: str) -> bool:
     """Вставлять нечего: текст пуст либо целиком состоит из субтитровых
@@ -121,6 +128,11 @@ def strip_asr_artifacts(text: str) -> tuple[str, list[str]]:
             cleaned = (cleaned[:match.start(1)] + ' ' + cleaned[match.end(1):]).strip()
             cleaned = re.sub(r'^\s*[.!?…]+\s*', '', cleaned)
             removed.append(marker)
+
+    unsure_marks = _UNSURE_MARK.findall(cleaned)
+    if unsure_marks:
+        cleaned = _UNSURE_MARK.sub(' ', cleaned)
+        removed.append(f"метка неуверенности ({len(unsure_marks)})")
 
     return re.sub(r'\s{2,}', ' ', cleaned).strip(), removed
 
