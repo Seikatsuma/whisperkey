@@ -104,13 +104,16 @@ DICTATION = Profile(
         # requests кодирует список как keyterm=a&keyterm=b. Лимит API — 500
         # токенов на запрос, держимся в районе 20-50 терминов.
         "keyterm": [
+            # Только уникальные по звучанию названия, которые nova-3 реально
+            # теряет. Каждый keyterm — буст: модель начинает слышать эти слова
+            # там, где их не было (живые случаи Егора 03.11: «созвон»→Ozon,
+            # «мира»→Miro, SEO/Domate/ZOom/Brave/TextEdit/CEO/Wildberries/
+            # Яндекс Маркет — сняты как общие/неоднозначные слова).
             "Deepgram", "WhisperKey", "Wispr Flow", "Claude Code",
             "Claude Design", "Claude UI", "GitHub", "Telegram", "Groq",
-            "API", "CEO", "YouGile", "iPad", "Zoom", "Miro", "Devin",
+            "API", "YouGile", "iPad", "Devin",
             "Termius", "Ideogram", "Sonnet", "Opus", "Haiku", "Camoufox",
-            "Patchright", "Brave", "TextEdit", "SaluteSpeech", "Телемост",
-            "Ozon", "Wildberries", "Яндекс Маркет", "NotebookLM", "SEO",
-            "Domate",
+            "Patchright", "SaluteSpeech", "Телемост", "NotebookLM",
             "amoCRM",
         ],
     },
