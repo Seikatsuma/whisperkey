@@ -307,7 +307,8 @@ PREROLL_SECONDS = 0.5
 # 04.11.26 Егор: постоянно горящий индикатор мешает — возвращаем 90с,
 # достаточно для серии диктовок подряд; длинные паузы = микрофон свободен.
 # Переопределение: WHISPERKEY_IDLE_TIMEOUT=сек (0 — закрывать сразу после диктовки).
-PREROLL_IDLE_TIMEOUT = float(os.environ.get("WHISPERKEY_IDLE_TIMEOUT", "90"))
+# 04.11.26 Егор уточнил: достаточно 15с — серия подряд живая, пауза = микрофон свободен.
+PREROLL_IDLE_TIMEOUT = float(os.environ.get("WHISPERKEY_IDLE_TIMEOUT", "15"))
 _PREROLL_BLOCKS = max(1, int(PREROLL_SECONDS * SAMPLE_RATE / 512))
 preroll_buffer: deque = deque(maxlen=_PREROLL_BLOCKS)
 TRIGGER_DEBOUNCE_SEC = 0.35
