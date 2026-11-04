@@ -304,7 +304,10 @@ PREROLL_SECONDS = 0.5
 # темп диктовки почти всегда попадал в холодный запуск. Держим тёплым
 # 10 минут: худший случай — прежний холодный старт (мёртвый поток
 # переоткрывает ensure_audio_stream), цена — индикатор микрофона дольше.
-PREROLL_IDLE_TIMEOUT = 600.0
+# 04.11.26 Егор: постоянно горящий индикатор мешает — возвращаем 90с,
+# достаточно для серии диктовок подряд; длинные паузы = микрофон свободен.
+# Переопределение: WHISPERKEY_IDLE_TIMEOUT=сек (0 — закрывать сразу после диктовки).
+PREROLL_IDLE_TIMEOUT = float(os.environ.get("WHISPERKEY_IDLE_TIMEOUT", "90"))
 _PREROLL_BLOCKS = max(1, int(PREROLL_SECONDS * SAMPLE_RATE / 512))
 preroll_buffer: deque = deque(maxlen=_PREROLL_BLOCKS)
 TRIGGER_DEBOUNCE_SEC = 0.35
