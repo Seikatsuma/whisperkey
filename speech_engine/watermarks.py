@@ -75,8 +75,16 @@ def boilerplate_only(text: str) -> bool:
     if not text or not text.strip():
         return True
     stripped = _NOISE_ANNOTATION.sub(" ", text.lower())
+    had_marker = False
     for marker in SILENCE_BOILERPLATE:
-        stripped = stripped.replace(marker, " ")
+        if marker in stripped:
+            had_marker = True
+            stripped = stripped.replace(marker, " ")
+    if had_marker:
+        # «Спасибо. Продолжение следует…» — типовая галлюцинация на тишине:
+        # голое «спасибо» после вырезанной заглушки тоже артефакт. Одиночная
+        # диктовка «Спасибо.» НЕ гасится (had_marker=False → слово живёт).
+        stripped = re.sub(r'\bспасибо\b', ' ', stripped)
     return not re.sub(r'[\W_]+', '', stripped, flags=re.UNICODE)
 
 
