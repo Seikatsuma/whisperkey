@@ -330,10 +330,19 @@ LATCH_TAP_MAX_SEC = 1.3    # первое нажатие короче — «та
 # второе касание приходило позже дедлайна и считалось одиночным нажатием.
 # 1.2 с — под живой ритм; переопределение WHISPERKEY_LATCH_WINDOW=сек.
 LATCH_WINDOW_SEC = float(os.environ.get("WHISPERKEY_LATCH_WINDOW", "0.9"))  # окно второго касания после отпускания тапа
+# 07.11.26: второй тап у Егора приходит ПОЗДНЕЕ окна — между отпусканием
+# первого и нажатием второго ~1–1.5 с. Окно успевало истечь, запись
+# обрывалась дожимом хвоста и уходила в распознавание («слушал 3–4 с и
+# начал транскрибацию»). Теперь нажатие в пределах LATCH_CANDIDATE_SEC —
+# «кандидат»: ждём его отпускание; короткое = залипание (даже если дожим
+# уже пошёл — запись ещё жива, обрыв отменяем), длинное = обычный стоп.
+LATCH_CANDIDATE_SEC = LATCH_WINDOW_SEC + TAIL_MAX_SECONDS + 0.3
 LATCH_CANCEL_SEC = 0.5     # нажатие в первые 0.5 с залипания — отмена без текста
 LATCH_MAX_SEC = 900        # потолок залипшей записи — страховка от «забыл включённым»
 latch_active = False       # запись «залипла»: следующее нажатие завершит её
-_latch_deadline = 0.0      # конец окна второго касания (= отпускание тапа + 0.7 с)
+_latch_deadline = 0.0      # конец окна второго касания (= отпускание тапа + LATCH_WINDOW_SEC)
+_latch_candidate_ts = 0.0  # нажатие-кандидат на второй тап — ждём его отпускание
+_tap_press_ts = 0.0        # press текущего касания — hold меряем от него, а не от старого last_trigger_ts
 _latch_started_ts = 0.0    # когда залипание вступило — для окна отмены
 _last_release_ts = 0.0     # время отпускания — для диагностики окна залипания
 _release_seq = 0           # поколение отпускания; отменяет просроченный финализ
@@ -2692,8 +2701,25 @@ def _begin_stop():
         # фаза навсегда оставалась "processing" — и on_press с этого момента
         # выходил по первой же проверке. Итог: одно случайное короткое
         # касание правого Option намертво выключало диктовку до перезапуска.
-        global is_recording, processing, session_phase
+        global is_recording, processing, session_phase, _latch_candidate_ts
         capped = _smart_tail_wait()
+        with state_lock:
+            if latch_active or _latch_candidate_ts:
+                # Залипание поднято задним числом (второй тап пришёл, пока
+                # дожимали хвост) или кандидат ждёт своё отпускание — запись
+                # продолжается, захват не обрываем.
+                session_phase = "recording"
+                processing = False
+                abort_stop = True
+            else:
+                abort_stop = False
+                _latch_candidate_ts = 0.0
+        if abort_stop:
+            pill.set_state("recording")
+            _tlog("  → дожим отменён (залипание/кандидат тапа)")
+            threading.Thread(target=_candidate_backstop,
+                             args=(current_session_id,), daemon=True).start()
+            return
         is_recording = False
         if capped:
             _tail_fade()
@@ -2745,6 +2771,22 @@ def _latch_window_then_stop(seq: int) -> None:
         _latch_deadline = 0.0
     _tlog("  → окно истекло, стоп")
     _begin_stop()
+
+
+def _candidate_backstop(sid: int) -> None:
+    """Кандидат второго тапа остался без release (событие потерялось): запись
+    не должна висеть — через LATCH_TAP_MAX_SEC с запасом обычный стоп."""
+    global _latch_candidate_ts, trigger_held
+    time.sleep(LATCH_TAP_MAX_SEC + 0.5)
+    with state_lock:
+        stop = (_latch_candidate_ts > 0 and not latch_active
+                and session_phase == "recording" and active_session_id == sid)
+        if stop:
+            _latch_candidate_ts = 0.0
+            trigger_held = False
+    if stop:
+        _tlog("  → кандидат без отпускания, стоп")
+        _begin_stop()
 
 
 def _latch_watchdog(sid: int) -> None:
@@ -2903,7 +2945,7 @@ def _maybe_pending_start():
 def on_press(key):
     global is_recording, recording_data, processing, trigger_held, last_trigger_ts, session_counter, active_session_id, session_phase
     global latch_active, _latch_deadline, _latch_started_ts, _last_release_ts, _release_seq
-    global _opt_down
+    global _opt_down, _latch_candidate_ts, _tap_press_ts
     now = time.time()
     if _fam(key):
         _opt_down = True
@@ -2933,6 +2975,8 @@ def on_press(key):
         # обычным путём старта.
         _tlog(f"  → held залип в фазе {session_phase}: отпускание потерялось")
         trigger_held = False
+    if is_trigger(key):
+        _tap_press_ts = now
     if is_trigger(key) and not trigger_held:
         # Сначала — режимы, которые не стартуют новую запись и потому идут до
         # дебаунса: второй тап приходит раньше дебаунс-порога и съедается им.
@@ -2948,6 +2992,7 @@ def on_press(key):
             else:
                 end_by_press = False
                 cancel_by_press = False
+            candidate = False
             if (not end_by_press and session_phase == "recording"
                     and now < _latch_deadline):
                 # Второе касание в окне после отпускания — запись «залипает».
@@ -2960,14 +3005,23 @@ def on_press(key):
                 armed = True
             else:
                 armed = False
-                if (not end_by_press and session_phase == "recording"
-                        and _last_release_ts > 0):
-                    # Касание при живой записи, но мимо окна залипания — пишем,
-                    # чтобы по журналу было видно, почему тап-тап не сработал.
-                    print(f"[rec] касание мимо окна залипания "
-                          f"(после отпускания {int((now - _last_release_ts) * 1000)} мс, "
-                          f"до конца окна {int((_latch_deadline - now) * 1000)} мс)")
-                    _tlog("  → касание мимо окна")
+                if (not end_by_press and is_recording and _last_release_ts > 0
+                        and not _latch_candidate_ts
+                        and now - _last_release_ts < LATCH_CANDIDATE_SEC):
+                    # Второй тап с опозданием: запись ещё жива (окно истекло,
+                    # но дожим хвоста идёт). Ждём отпускание этого нажатия —
+                    # короткое станет залипанием, длинное — обычным стопом.
+                    _latch_candidate_ts = now
+                    trigger_held = True
+                    candidate = True
+                elif (not end_by_press and session_phase == "recording"
+                            and _last_release_ts > 0):
+                        # Касание при живой записи, но мимо окна залипания — пишем,
+                        # чтобы по журналу было видно, почему тап-тап не сработал.
+                        print(f"[rec] касание мимо окна залипания "
+                              f"(после отпускания {int((now - _last_release_ts) * 1000)} мс, "
+                              f"до конца окна {int((_latch_deadline - now) * 1000)} мс)")
+                        _tlog("  → касание мимо окна")
         if end_by_press:
             _tlog("  → стоп залипания нажатием" + (" (отмена)" if cancel_by_press else ""))
             if cancel_by_press:
@@ -2979,6 +3033,9 @@ def on_press(key):
             _tlog("  → LATCH")
             print("[rec] Залипание: запись без удержания — Option завершит")
             threading.Thread(target=_latch_watchdog, args=(armed_sid,), daemon=True).start()
+            return
+        if candidate:
+            _tlog("  → кандидат второго тапа, жду отпускание")
             return
         if now - last_trigger_ts < TRIGGER_DEBOUNCE_SEC:
             _tlog("  → дебаунс, пропуск")
@@ -2999,13 +3056,36 @@ def on_press(key):
 
 def on_release(key):
     global is_recording, processing, trigger_held, session_counter, session_phase, _latch_deadline, _last_release_ts, _release_seq
-    global _opt_down
+    global _opt_down, _latch_candidate_ts, latch_active, _latch_started_ts
     if _fam(key):
         _opt_down = False
         _tlog(f"R {key} trig={is_trigger(key)} latch={int(latch_active)} "
               f"rec={int(is_recording)} ph={session_phase}")
     if is_trigger(key):
         trigger_held = False
+        cand_ts = _latch_candidate_ts
+        if cand_ts:
+            _latch_candidate_ts = 0.0
+            hold = time.time() - cand_ts
+            if hold < LATCH_TAP_MAX_SEC and is_recording:
+                # Короткий повторный тап — залипание, даже задним числом:
+                # дожим хвоста отменяется в delayed_stop по latch_active.
+                with state_lock:
+                    latch_active = True
+                    _latch_started_ts = time.time()
+                    _latch_deadline = 0.0
+                    _release_seq += 1
+                    session_phase = "recording"
+                    processing = False
+                    sid = active_session_id
+                pill.set_state("recording")
+                print(f"[rec] Залипание: второй тап {int(hold * 1000)} мс "
+                      f"— запись без удержания, Option завершит")
+                _tlog("  → LATCH (поздний тап)")
+                threading.Thread(target=_latch_watchdog, args=(sid,), daemon=True).start()
+                return
+            # Держали долго — не тап: идём в обычный путь отпускания
+            # (hold ниже посчитается от _tap_press_ts этого нажатия).
         if latch_active or not is_recording:
             # Залипшая запись заканчивается нажатием (в on_press), отпускание
             # здесь просто игнорируется — как у Wispr.
@@ -3013,14 +3093,14 @@ def on_release(key):
         with state_lock:
             if session_phase != "recording":
                 return
-            # Окно двойного касания — от ОТПУСКАНИЯ короткого тапа (0.7 с):
+            # Окно двойного касания — от ОТПУСКАНИЯ короткого тапа:
             # второе касание в нём «залипает». Клавишу держали дольше
             # LATCH_TAP_MAX_SEC — это уже «нажал-держи-говори», стоп мгновенный,
             # без всякой задержки и без окна.
             _last_release_ts = time.time()
             _release_seq += 1
             seq = _release_seq
-            hold = _last_release_ts - last_trigger_ts
+            hold = _last_release_ts - _tap_press_ts
             if hold >= LATCH_TAP_MAX_SEC:
                 _tlog(f"  → стоп сразу (держали {hold:.3f} с)")
                 finalize_now = True
