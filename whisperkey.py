@@ -300,15 +300,16 @@ last_trigger_ts = 0.0
 PREROLL_ENABLED = False
 PREROLL_SECONDS = 0.5
 # Холодный старт CoreAudio ~1с — та самая «нажал, а слушать начал через
-# секунду» (Егор 02.11). 90с простоя покрывало только серию подряд — обычный
-# темп диктовки почти всегда попадал в холодный запуск. Держим тёплым
-# 10 минут: худший случай — прежний холодный старт (мёртвый поток
-# переоткрывает ensure_audio_stream), цена — индикатор микрофона дольше.
-# 04.11.26 Егор: постоянно горящий индикатор мешает — возвращаем 90с,
-# достаточно для серии диктовок подряд; длинные паузы = микрофон свободен.
-# Переопределение: WHISPERKEY_IDLE_TIMEOUT=сек (0 — закрывать сразу после диктовки).
-# 04.11.26 Егор уточнил: достаточно 15с — серия подряд живая, пауза = микрофон свободен.
-PREROLL_IDLE_TIMEOUT = float(os.environ.get("WHISPERKEY_IDLE_TIMEOUT", "15"))
+# секунду» (Егор 02.11). Тёплый поток закрывал эту дыру, но с коротким тапом
+# давал баг: отпускание приходило раньше готовности микрофона, терялось —
+# и запись сама собой залипала/«не реагировала» (журнал 08.11: каждый такой
+# эпизод — сразу после «Микрофон освобождён после 15с простоя»).
+# 08.11.26 Егор: тёплый микрофон убрать вовсе — диктовки скопом редки,
+# а горящий индикатор мешает. 0 = освобождать сразу после диктовки.
+# Цена — холодный старт ~1–2 с до плашки «Запись» на каждой диктовке;
+# семантика тапа при холодном старте восстановлена через _release_before_start.
+# Переопределение: WHISPERKEY_IDLE_TIMEOUT=сек (вернуть тёплый при желании).
+PREROLL_IDLE_TIMEOUT = float(os.environ.get("WHISPERKEY_IDLE_TIMEOUT", "0"))
 _PREROLL_BLOCKS = max(1, int(PREROLL_SECONDS * SAMPLE_RATE / 512))
 preroll_buffer: deque = deque(maxlen=_PREROLL_BLOCKS)
 TRIGGER_DEBOUNCE_SEC = 0.35
@@ -748,9 +749,11 @@ def _close_idle_stream():
         preroll_buffer.clear()
 
 def schedule_idle_close():
-    """Заводит таймер освобождения микрофона, сбрасывая предыдущий."""
+    """Заводит таймер освобождения микрофона, сбрасывая предыдущий.
+    Таймаут 0 — освобождаем сразу после диктовки, без таймера."""
     global _idle_timer
     if PREROLL_IDLE_TIMEOUT <= 0:
+        _close_idle_stream()
         return
     with _idle_timer_lock:
         if _idle_timer is not None:
@@ -2874,6 +2877,30 @@ def _start_recording() -> bool:
     return True
 
 
+def _release_before_start() -> None:
+    """Клавишу отпустили, пока запись только открывалась (холодный микрофон
+    ~1–2 с или ждущий старт в фазе processing): отпускание ушло мимо
+    on_release — там is_recording ещё False. Повторяем семантику обычного
+    отпускания вручную: долго держали — стоп сразу, тап — окно второго
+    касания (тап-тап залипнет, одиночный тап финализируется по таймеру).
+    Раньше здесь стояло безусловное залипание — отсюда фантомные «записал
+    3–4 с и ушло в распознавание» и «не реагирует» (08.11.26)."""
+    global _last_release_ts, _release_seq, _latch_deadline
+    hold = time.time() - _tap_press_ts
+    if hold >= LATCH_TAP_MAX_SEC:
+        print(f"[rec] держали {hold:.1f} с до готовности микрофона — стоп")
+        _begin_stop()
+        return
+    with state_lock:
+        _last_release_ts = time.time()
+        _release_seq += 1
+        seq = _release_seq
+        _latch_deadline = _last_release_ts + LATCH_WINDOW_SEC
+    print(f"[rec] тап {int(hold * 1000)} мс до готовности микрофона — "
+          f"жду второе касание {int(LATCH_WINDOW_SEC * 1000)} мс")
+    threading.Thread(target=_latch_window_then_stop, args=(seq,), daemon=True).start()
+
+
 # Старт записи из слушателя клавиш — асинхронно. Раньше _start_recording
 # выполнялся прямо в потоке pynput: холодный старт CoreAudio (микрофон
 # освобождался после каждой диктовки, PREROLL_ENABLED=False) занимал 1–2 с,
@@ -2902,11 +2929,9 @@ def _start_recording_async() -> bool:
             ok = _start_recording()
             if ok and not _option_is_down():
                 # Клавишу отпустили раньше, чем открылся микрофон — отпускание
-                # уже прошло и до записи не дошло бы: без залипания запись
-                # висела бы без завершающего триггера.
-                latch_active = True
-                _latch_started_ts = time.time()
-                print("[rec] залипание: клавиша отпущена до готовности микрофона")
+                # уже прошло и до записи не дошло бы. Семантика обычного
+                # отпускания восстанавливается вручную (тап → окно, холд → стоп).
+                _release_before_start()
         finally:
             _rec_starting = False
     threading.Thread(target=_go, daemon=True).start()
@@ -2934,12 +2959,9 @@ def _maybe_pending_start():
         print("[rec] старт по отложенному нажатию")
     else:
         # Тап уже отпущен — отпускание прошло в фазе processing и потерялось:
-        # без залипания запись висела бы без завершающего триггера.
-        latch_active = True
-        _latch_started_ts = time.time()
-        threading.Thread(target=_latch_watchdog,
-                         args=(active_session_id,), daemon=True).start()
-        print("[rec] старт по отложенному нажатию — тап прошёл, залипание")
+        # повторяем семантику отпускания вручную (тап → окно, холд → стоп).
+        print("[rec] старт по отложенному нажатию — тап прошёл")
+        _release_before_start()
 
 
 def on_press(key):
