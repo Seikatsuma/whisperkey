@@ -330,20 +330,21 @@ LATCH_TAP_MAX_SEC = 1.3    # первое нажатие короче — «та
 # 05.11.26: окно 0.7 с промахивалось — тап Егора ~720 мс по журналу тапов,
 # второе касание приходило позже дедлайна и считалось одиночным нажатием.
 # 1.2 с — под живой ритм; переопределение WHISPERKEY_LATCH_WINDOW=сек.
-LATCH_WINDOW_SEC = float(os.environ.get("WHISPERKEY_LATCH_WINDOW", "0.9"))  # окно второго касания после отпускания тапа
-# 07.11.26: второй тап у Егора приходит ПОЗДНЕЕ окна — между отпусканием
-# первого и нажатием второго ~1–1.5 с. Окно успевало истечь, запись
-# обрывалась дожимом хвоста и уходила в распознавание («слушал 3–4 с и
-# начал транскрибацию»). Теперь нажатие в пределах LATCH_CANDIDATE_SEC —
-# «кандидат»: ждём его отпускание; короткое = залипание (даже если дожим
-# уже пошёл — запись ещё жива, обрыв отменяем), длинное = обычный стоп.
-LATCH_CANDIDATE_SEC = LATCH_WINDOW_SEC + TAIL_MAX_SECONDS + 0.3
+LATCH_WINDOW_SEC = float(os.environ.get("WHISPERKEY_LATCH_WINDOW", "0.9"))  # таймаут одиночного тапа до финализации
+# 13.11.26: второе касание переведено на press-to-press семантику Wispr/
+# double-click — любое нажатие в фазе recording при отпущенной клавише
+# становится кандидатом, исход решает ЕГО отпускание: короткое = залипание,
+# длинное = обычный стоп по удержанию. Окно теперь только таймаут
+# одиночного тапа; проверки свежести release и «попал ли в окно» убраны —
+# именно они теряли события при холодном микрофоне и давали «быстрый
+# тап-тап → мгновенная транскрибация».
 LATCH_CANCEL_SEC = 0.5     # нажатие в первые 0.5 с залипания — отмена без текста
 LATCH_MAX_SEC = 900        # потолок залипшей записи — страховка от «забыл включённым»
 latch_active = False       # запись «залипла»: следующее нажатие завершит её
 _latch_deadline = 0.0      # конец окна второго касания (= отпускание тапа + LATCH_WINDOW_SEC)
 _latch_candidate_ts = 0.0  # нажатие-кандидат на второй тап — ждём его отпускание
 _tap_press_ts = 0.0        # press текущего касания — hold меряем от него, а не от старого last_trigger_ts
+_session_press_ts = 0.0    # press, начавший сессию записи — для hold при холодном старте
 _latch_started_ts = 0.0    # когда залипание вступило — для окна отмены
 _last_release_ts = 0.0     # время отпускания — для диагностики окна залипания
 _release_seq = 0           # поколение отпускания; отменяет просроченный финализ
@@ -2807,10 +2808,11 @@ def _start_recording() -> bool:
     """Фактический старт захвата под state_lock. Вызывается из on_press в фазе
     idle и из _maybe_pending_start на безопасной точке фазы processing
     (захват прошлой диктовки уже завершён, снимок взят)."""
-    global is_recording, recording_data, trigger_held, last_trigger_ts, session_counter, active_session_id, session_phase
+    global is_recording, recording_data, trigger_held, last_trigger_ts, session_counter, active_session_id, session_phase, _session_press_ts
     with state_lock:
         last_trigger_ts = time.time()
         trigger_held = True
+        _session_press_ts = _tap_press_ts
         session_counter += 1
         active_session_id = session_counter
         session_phase = "recording"
@@ -2886,7 +2888,11 @@ def _release_before_start() -> None:
     Раньше здесь стояло безусловное залипание — отсюда фантомные «записал
     3–4 с и ушло в распознавание» и «не реагирует» (08.11.26)."""
     global _last_release_ts, _release_seq, _latch_deadline
-    hold = time.time() - _tap_press_ts
+    if latch_active or _latch_candidate_ts:
+        # Залипание уже взведено или второе касание ждёт своё отпускание —
+        # окно не открываем, иначе его истечение убьёт их запись.
+        return
+    hold = time.time() - _session_press_ts
     if hold >= LATCH_TAP_MAX_SEC:
         print(f"[rec] держали {hold:.1f} с до готовности микрофона — стоп")
         _begin_stop()
@@ -2948,11 +2954,13 @@ _pending_rec_start = False
 _pending_rec_ts = 0.0
 
 def _maybe_pending_start():
-    global _pending_rec_start, latch_active, _latch_started_ts
+    global _pending_rec_start, latch_active, _latch_started_ts, _session_press_ts
     if not _pending_rec_start or time.time() - _pending_rec_ts > 3.0:
         _pending_rec_start = False
         return
     _pending_rec_start = False
+    with state_lock:
+        _session_press_ts = _pending_rec_ts
     if not _start_recording():
         return
     if _option_is_down():
@@ -2985,10 +2993,9 @@ def on_press(key):
         with state_lock:
             _last_release_ts = now
             _release_seq += 1
-            if not latch_active:
-                # Дедлайн только когда залипание ещё не включено — иначе
-                # протухшее окно переживёт эту запись и ложно поймает следующий тап.
-                _latch_deadline = now + LATCH_WINDOW_SEC
+            # Окно здесь НЕ открываем: это нажатие само и есть второе касание —
+            # ниже оно станет кандидатом, и его отпускание решит исход
+            # (короткое → залипание, длинное → обычный стоп по удержанию).
     elif is_trigger(key) and trigger_held:
         # Тот же потерянный release, но вне записи: залипший held раньше
         # глушил нажатие МОЛЧА — обе ветки ниже требуют not trigger_held
@@ -3016,34 +3023,23 @@ def on_press(key):
                 cancel_by_press = False
             candidate = False
             if (not end_by_press and session_phase == "recording"
-                    and now < _latch_deadline):
-                # Второе касание в окне после отпускания — запись «залипает».
-                latch_active = True
-                _latch_started_ts = now
-                _latch_deadline = 0.0
+                    and not _latch_candidate_ts):
+                # Любое нажатие при живой записи и отпущенной клавише — второе
+                # касание (в фазе recording с trigger_held=False это может быть
+                # только оно). Становимся кандидатом и ждём ЕГО отпускание:
+                # короткое — залипание, длинное — обычный стоп по удержанию
+                # (зажал-надиктовал-отпустил = холд, а не залипание). Именно
+                # press-to-press семантика Wispr/double-click: быстрый второй
+                # тап ловится всегда, независимо от того, дошло ли до нас
+                # отпускание первого и открылся ли микрофон — баг «быстрый
+                # тап-тап уходит в транскрибацию» (Егор 13.11) жил именно в
+                # проверках свежести release и дедлайна, которые терялись при
+                # холодном микрофоне.
+                _latch_candidate_ts = now
+                _latch_deadline = 0.0  # окно первого тапа поглощено кандидатом
                 trigger_held = True
-                last_trigger_ts = now
-                armed_sid = active_session_id
-                armed = True
-            else:
-                armed = False
-                if (not end_by_press and is_recording and _last_release_ts > 0
-                        and not _latch_candidate_ts
-                        and now - _last_release_ts < LATCH_CANDIDATE_SEC):
-                    # Второй тап с опозданием: запись ещё жива (окно истекло,
-                    # но дожим хвоста идёт). Ждём отпускание этого нажатия —
-                    # короткое станет залипанием, длинное — обычным стопом.
-                    _latch_candidate_ts = now
-                    trigger_held = True
-                    candidate = True
-                elif (not end_by_press and session_phase == "recording"
-                            and _last_release_ts > 0):
-                        # Касание при живой записи, но мимо окна залипания — пишем,
-                        # чтобы по журналу было видно, почему тап-тап не сработал.
-                        print(f"[rec] касание мимо окна залипания "
-                              f"(после отпускания {int((now - _last_release_ts) * 1000)} мс, "
-                              f"до конца окна {int((_latch_deadline - now) * 1000)} мс)")
-                        _tlog("  → касание мимо окна")
+                candidate = True
+                cand_sid = active_session_id
         if end_by_press:
             _tlog("  → стоп залипания нажатием" + (" (отмена)" if cancel_by_press else ""))
             if cancel_by_press:
@@ -3051,13 +3047,12 @@ def on_press(key):
             else:
                 _begin_stop()
             return
-        if armed:
-            _tlog("  → LATCH")
-            print("[rec] Залипание: запись без удержания — Option завершит")
-            threading.Thread(target=_latch_watchdog, args=(armed_sid,), daemon=True).start()
-            return
         if candidate:
             _tlog("  → кандидат второго тапа, жду отпускание")
+            # Страховка на потерянное отпускание кандидата: без неё запись
+            # повисла бы до потолка. Раньше бэкстоп запускался только из
+            # отменённого дожима — для обычного кандидата его не было вовсе.
+            threading.Thread(target=_candidate_backstop, args=(cand_sid,), daemon=True).start()
             return
         if now - last_trigger_ts < TRIGGER_DEBOUNCE_SEC:
             _tlog("  → дебаунс, пропуск")
@@ -3089,7 +3084,8 @@ def on_release(key):
         if cand_ts:
             _latch_candidate_ts = 0.0
             hold = time.time() - cand_ts
-            if hold < LATCH_TAP_MAX_SEC and is_recording:
+            if hold < LATCH_TAP_MAX_SEC and (is_recording
+                                           or session_phase == "recording"):
                 # Короткий повторный тап — залипание, даже задним числом:
                 # дожим хвоста отменяется в delayed_stop по latch_active.
                 with state_lock:
@@ -3109,6 +3105,14 @@ def on_release(key):
             # Держали долго — не тап: идём в обычный путь отпускания
             # (hold ниже посчитается от _tap_press_ts этого нажатия).
         if latch_active or not is_recording:
+            if not is_recording and session_phase == "recording":
+                # Отпускание пришло до поднятия микрофона и было проглочено:
+                # фиксируем его, иначе второй тап при прогреве не отличить от
+                # холда — окно залипания не открывается и тап-тап слетал в
+                # мгновенную расшифровку (журнал Егора 12.11.26).
+                with state_lock:
+                    _last_release_ts = time.time()
+                    _release_seq += 1
             # Залипшая запись заканчивается нажатием (в on_press), отпускание
             # здесь просто игнорируется — как у Wispr.
             return
